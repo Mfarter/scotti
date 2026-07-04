@@ -28,6 +28,7 @@ const D_LOW: u64 = 1_000_000_000; // 1 SOL
 const D_MID: u64 = 10_000_000_000; // 10 SOL
 const D_HIGH: u64 = 100_000_000_000; // 100 SOL
 const EXPO_BP: u64 = 100; // 1%
+const EPOCH_LENGTH: u64 = 1_000; // slots per withdrawal epoch (test scale)
 fn window() -> u64 { hm::SMOOTH_WINDOW_SLOTS }
 
 // -------------------- tx plumbing --------------------
@@ -82,7 +83,7 @@ fn ix_create(id: [u8; 16], admin: &Pubkey, curator: Pubkey) -> Instruction {
         pid(),
         &house::instruction::CreateMachine {
             machine_id: id, d_low: D_LOW, d_mid: D_MID, d_high: D_HIGH,
-            max_exposure_bp: EXPO_BP, smooth_window: window(), curator,
+            max_exposure_bp: EXPO_BP, smooth_window: window(), epoch_length: EPOCH_LENGTH, curator,
         }.data(),
         house::accounts::CreateMachine { config: config_pda(), machine: machine_pda(&id), admin: *admin, system_program: system_program::ID }
             .to_account_metas(None),
@@ -145,6 +146,35 @@ fn ix_fill(id: [u8; 16], authority: &Pubkey, bytes: [u8; 32]) -> Instruction {
             .to_account_metas(None),
     )
 }
+fn ix_request_withdraw(id: [u8; 16], owner: &Pubkey, shares: u128) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::RequestWithdraw { shares }.data(),
+        house::accounts::RequestWithdraw { machine: m, position: lp_pda(&m, owner), owner: *owner }.to_account_metas(None),
+    )
+}
+fn ix_cancel_withdraw(id: [u8; 16], owner: &Pubkey) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::CancelWithdraw {}.data(),
+        house::accounts::CancelWithdraw { machine: m, position: lp_pda(&m, owner), owner: *owner }.to_account_metas(None),
+    )
+}
+fn ix_process(id: [u8; 16], owner: &Pubkey, cranker: &Pubkey) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::ProcessWithdrawals {}.data(),
+        house::accounts::ProcessWithdrawals {
+            machine: m, position: lp_pda(&m, owner), owner: *owner, cranker: *cranker, system_program: system_program::ID,
+        }.to_account_metas(None),
+    )
+}
+fn position_closed(svm: &LiteSVM, machine: &Pubkey, owner: &Pubkey) -> bool {
+    lamports(svm, &lp_pda(machine, owner)) == 0
+}
 
 // -------------------- account readers --------------------
 
@@ -177,6 +207,16 @@ fn converged_snapshot(depth: u128) -> (bool, u128, u128) {
     (is_deep, k, max_bet)
 }
 fn tier_of(is_deep: bool) -> &'static hm::Tier { if is_deep { &hm::DEEP } else { &hm::SHALLOW } }
+
+/// Mirror of the program's process_withdrawals share/lamport math — the test's
+/// oracle for exact reconciliation. Returns (fill_shares, payout).
+fn expected_process(pool: u128, reserved: u128, total: u128, pending: u128) -> (u128, u128) {
+    let free = pool.saturating_sub(reserved);
+    let free_shares = free * total / pool;
+    let fill = pending.min(free_shares);
+    let payout = fill * pool / total;
+    (fill, payout)
+}
 
 /// Boot an initialized machine funded to `pool` lamports, warped past the
 /// smoothing window so the next commit's snapshot reads smoothed == pool.
@@ -504,4 +544,346 @@ fn h_pause_blocks_commit_only() {
     assert!(send(&mut svm, ix_expire(id, &player.pubkey(), 1, &cranker.pubkey()), &cranker, &[&cranker]),
         "expire must never be blocked by pause");
     assert!(spin_closed(&svm, &m, &player.pubkey(), 1));
+}
+
+// ============================================================================
+// (cold-start fix) a fresh machine offers full max_bet immediately after
+// seeding — smoothed depth is initialized to the founding bankroll, not zero.
+// ============================================================================
+#[test]
+fn coldstart_fresh_machine_has_full_max_bet() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let curator = funded(&mut svm);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let id = [0xC0; 16];
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    // production-scale smoothing window (ix_create uses window() = 9000)
+    assert!(send(&mut svm, ix_create(id, &admin.pubkey(), curator.pubkey()), &admin, &[&admin]));
+    let m = machine_pda(&id);
+
+    let pool = 50_000_000_000u64; // 50 SOL -> DEEP
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), pool), &lp, &[&lp]));
+    // the founding deposit seats smoothed depth at the pool, NOT zero
+    assert_eq!(read_machine(&svm, &id).smoothed_value, pool as u128, "smoothed seeded to founding bankroll");
+
+    // only a handful of slots later (far inside the window) the snapshot already
+    // reads full depth: a max-bet-sized wager is accepted right away.
+    svm.warp_to_slot(50);
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let player2 = &player;
+    assert!(send(&mut svm, ix_commit(id, &player2.pubkey(), Pubkey::new_unique(), max_bet as u64, 0), player2, &[player2]),
+        "fresh machine must accept a full max_bet wager without waiting a window");
+    let s = read_spin(&svm, &m, &player2.pubkey(), 0);
+    // snapshot equals the CONVERGED (full-depth) snapshot, not a near-zero one
+    assert_eq!(s.k_bp, _k);
+    assert_eq!(s.tier_is_deep, _d);
+}
+
+// helpers for the withdrawal matrix — all machines start at slot 27000 (epoch
+// 27000/1000 = 27) via boot_converged; requests stamp epoch 27.
+const E0_SLOT: u64 = 27_000;
+const E1_SLOT: u64 = 28_000; // epoch 28
+
+// ============================================================================
+// (w-a) full withdrawal request while a spin is pending — the crank leaves
+// reserved exposure untouched (capped at free), spin settles, remainder then
+// withdrawable, position closes.
+// ============================================================================
+#[test]
+fn w_a_reserved_untouched_during_pending_spin() {
+    let pool = 50_000_000_000u64; // DEEP
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xE1, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+
+    // a pending spin reserves exposure (house win outcome, but we don't settle yet)
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 2) as u64;
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    let reserved = read_machine(&svm, &id).reserved_exposure;
+    assert!(reserved > 0);
+
+    // LP requests the full withdrawal
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+
+    // process after the epoch boundary — capped at free = pool - reserved
+    let mb = read_machine(&svm, &id);
+    let free = mb.pool_value - mb.reserved_exposure;
+    let (_fill1, payout1) = expected_process(mb.pool_value as u128, mb.reserved_exposure as u128, mb.total_shares, shares);
+    svm.warp_to_slot(E1_SLOT);
+    let lp_before = lamports(&svm, &lp.pubkey());
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+
+    let ma = read_machine(&svm, &id);
+    assert_eq!(ma.reserved_exposure, reserved, "reserved exposure untouched by withdrawal");
+    assert_eq!(lamports(&svm, &lp.pubkey()) - lp_before, payout1 as u64, "exact payout, capped at free");
+    assert!(payout1 as u64 <= free);
+    assert!(read_position(&svm, &m, &lp.pubkey()).pending_shares > 0, "remainder stays queued behind the floor");
+
+    // the spin settles fine afterward — reserve releases
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+    assert_eq!(read_machine(&svm, &id).reserved_exposure, 0);
+
+    // now the remainder is withdrawable; position closes
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    assert!(position_closed(&svm, &m, &lp.pubkey()), "fully withdrawn — position closed");
+    let mf = read_machine(&svm, &id);
+    assert_eq!(mf.total_shares, 0);
+    assert_eq!(mf.pool_value, 0, "sole LP withdrew all principal + edge");
+}
+
+// ============================================================================
+// (w-b) jackpot between request and processing — LP eats the share-price drop
+// (priced at processing, not request).
+// ============================================================================
+#[test]
+fn w_b_lp_eats_price_drop_from_jackpot() {
+    let pool = 50_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xE2, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    let request_time_value = shares * pool as u128 / read_machine(&svm, &id).total_shares; // == pool
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+
+    // JACKPOT^3 lands (player wins max_payout) — pool drops
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 2) as u64;
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+    let pool2 = read_machine(&svm, &id).pool_value;
+    assert!((pool2 as u128) < request_time_value, "jackpot dropped the pool");
+
+    // process at the LOWER (processing-time) price
+    let mb = read_machine(&svm, &id);
+    let (_f, payout) = expected_process(mb.pool_value as u128, 0, mb.total_shares, shares);
+    svm.warp_to_slot(E1_SLOT);
+    let vault_before = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    // vault delta isolates the payout from the LpPosition rent returned on close
+    assert_eq!(vault_before - lamports(&svm, &m), payout as u64, "priced at processing time");
+    assert_eq!(payout, pool2 as u128, "sole LP receives the post-jackpot pool exactly");
+    assert!(payout < request_time_value, "LP ate the drop — anti-pool-hopping");
+    assert!(position_closed(&svm, &m, &lp.pubkey()));
+}
+
+// ============================================================================
+// (w-c) pool grows between request and processing — LP gains (same mechanism).
+// ============================================================================
+#[test]
+fn w_c_lp_gains_from_pool_growth() {
+    let pool = 50_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xE3, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    let request_time_value = shares * pool as u128 / read_machine(&svm, &id).total_shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+
+    // a losing spin (3 blanks) grows the pool by the full wager
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 2) as u64;
+    let blanks = { let mut b = [0u8; 32]; b[0] = 22; b[1] = 23; b[2] = 24; b };
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), blanks), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+    let pool2 = read_machine(&svm, &id).pool_value;
+    assert_eq!(pool2, pool + wager, "losing spin grew the pool");
+
+    let mb = read_machine(&svm, &id);
+    let (_f, payout) = expected_process(mb.pool_value as u128, 0, mb.total_shares, shares);
+    svm.warp_to_slot(E1_SLOT);
+    let vault_before = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    assert_eq!(vault_before - lamports(&svm, &m), payout as u64);
+    assert!(payout > request_time_value, "LP gained the edge accrued after the request");
+    assert_eq!(payout, pool2 as u128, "sole LP receives the grown pool exactly");
+}
+
+// ============================================================================
+// (w-d) two LPs same epoch — order honored, second fill priced after the first.
+// ============================================================================
+#[test]
+fn w_d_two_lps_sequential_pricing() {
+    let pool = 40_000_000_000u64;
+    let (mut svm, id, _a, _c, lp1) = boot_converged(0xE4, pool);
+    let m = machine_pda(&id);
+    let lp2 = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    // second LP deposits the same amount in the same epoch
+    assert!(send(&mut svm, ix_deposit(id, &lp2.pubkey(), pool), &lp2, &[&lp2]));
+
+    let s1 = read_position(&svm, &m, &lp1.pubkey()).shares;
+    let s2 = read_position(&svm, &m, &lp2.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp1.pubkey(), s1), &lp1, &[&lp1]));
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp2.pubkey(), s2), &lp2, &[&lp2]));
+
+    svm.warp_to_slot(E1_SLOT);
+    // process lp1 first
+    let m1 = read_machine(&svm, &id);
+    let (_f1, pay1) = expected_process(m1.pool_value as u128, 0, m1.total_shares, s1);
+    let v1 = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp1.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    assert_eq!(v1 - lamports(&svm, &m), pay1 as u64);
+
+    // lp2 priced at the state LEFT BY lp1 (read machine after lp1's fill)
+    let m2 = read_machine(&svm, &id);
+    let (_f2, pay2) = expected_process(m2.pool_value as u128, 0, m2.total_shares, s2);
+    let v2 = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp2.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    assert_eq!(v2 - lamports(&svm, &m), pay2 as u64, "second fill priced after the first");
+    // both equal LPs recover ~their deposit; pool fully drained
+    assert_eq!(read_machine(&svm, &id).pool_value, 0);
+}
+
+// ============================================================================
+// (w-e) withdrawal to exactly zero shares closes cleanly (rent back to owner).
+// ============================================================================
+#[test]
+fn w_e_full_withdraw_closes_position() {
+    let pool = 30_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xE5, pool);
+    let m = machine_pda(&id);
+    let cranker = funded(&mut svm);
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+
+    svm.warp_to_slot(E1_SLOT);
+    let pos_rent = lamports(&svm, &lp_pda(&m, &lp.pubkey()));
+    let lp_before = lamports(&svm, &lp.pubkey());
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    // sole LP, no spins: payout == pool; plus the position rent on close
+    assert_eq!(lamports(&svm, &lp.pubkey()) - lp_before, pool + pos_rent, "payout + reclaimed rent");
+    assert!(position_closed(&svm, &m, &lp.pubkey()));
+}
+
+// ============================================================================
+// (w-f) a request in epoch N cannot process in epoch N — must cross a boundary.
+// ============================================================================
+#[test]
+fn w_f_epoch_boundary_enforced() {
+    let pool = 20_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xE6, pool);
+    let m = machine_pda(&id);
+    let cranker = funded(&mut svm);
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+
+    // same epoch (slot 27000, epoch 27): rejected
+    let err = try_send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]).unwrap_err();
+    assert!(err.contains("EpochNotElapsed"), "same-epoch process must fail, got {err}");
+
+    // after the boundary: allowed
+    svm.warp_to_slot(E1_SLOT);
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+}
+
+// ============================================================================
+// (w-g) cancel before processing restores shares exactly.
+// ============================================================================
+#[test]
+fn w_g_cancel_restores_shares() {
+    let pool = 20_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xE7, pool);
+    let m = machine_pda(&id);
+    let cranker = funded(&mut svm);
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+
+    // request a portion, then cancel
+    let part = shares / 3;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), part), &lp, &[&lp]));
+    let p = read_position(&svm, &m, &lp.pubkey());
+    assert_eq!(p.shares, shares - part);
+    assert_eq!(p.pending_shares, part);
+
+    assert!(send(&mut svm, ix_cancel_withdraw(id, &lp.pubkey()), &lp, &[&lp]));
+    let p = read_position(&svm, &m, &lp.pubkey());
+    assert_eq!(p.shares, shares, "cancel restored shares exactly");
+    assert_eq!(p.pending_shares, 0);
+
+    // a cancelled request cannot be processed
+    svm.warp_to_slot(E1_SLOT);
+    assert!(!send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+}
+
+// ============================================================================
+// (w-h) books balance across a full lifecycle: seed -> spins (win + loss) ->
+// partial withdraw -> more spins -> full withdraw. Every lamport accounted:
+// the vault returns to rent-only and the pool empties.
+// ============================================================================
+#[test]
+fn w_h_books_balance_full_lifecycle() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let curator = funded(&mut svm);
+    let lp = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    let id = [0xE8; 16];
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create(id, &admin.pubkey(), curator.pubkey()), &admin, &[&admin]));
+    let m = machine_pda(&id);
+    let vault_rent = lamports(&svm, &m); // Machine PDA rent, before any deposit
+
+    let pool = 40_000_000_000u64;
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), pool), &lp, &[&lp]));
+    svm.warp_to_slot(E0_SLOT);
+
+    // helper closure would need &mut svm borrow gymnastics; inline the spins.
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 4) as u64;
+
+    // spin 1: a loss (3 blanks) — pool grows
+    let p1 = funded(&mut svm);
+    let blanks = { let mut b = [0u8; 32]; b[0] = 22; b[1] = 23; b[2] = 24; b };
+    assert!(send(&mut svm, ix_fill(id, &p1.pubkey(), blanks), &p1, &[&p1]));
+    assert!(send(&mut svm, ix_commit(id, &p1.pubkey(), mock_pda(&id), wager, 0), &p1, &[&p1]));
+    assert!(send(&mut svm, ix_settle(id, &p1.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // spin 2: a win (3 cherries) — pool shrinks
+    let p2 = funded(&mut svm);
+    let cherries = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 13; b[2] = 13; b };
+    assert!(send(&mut svm, ix_fill(id, &p2.pubkey(), cherries), &p2, &[&p2]));
+    assert!(send(&mut svm, ix_commit(id, &p2.pubkey(), mock_pda(&id), wager, 1), &p2, &[&p2]));
+    assert!(send(&mut svm, ix_settle(id, &p2.pubkey(), mock_pda(&id), 1, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // partial withdraw (a third of shares)
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares / 3), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT);
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // one more spin (loss) after the partial withdraw
+    let p3 = funded(&mut svm);
+    assert!(send(&mut svm, ix_fill(id, &p3.pubkey(), blanks), &p3, &[&p3]));
+    assert!(send(&mut svm, ix_commit(id, &p3.pubkey(), mock_pda(&id), wager, 2), &p3, &[&p3]));
+    assert!(send(&mut svm, ix_settle(id, &p3.pubkey(), mock_pda(&id), 2, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // full withdraw of the remainder
+    let rest = read_position(&svm, &m, &lp.pubkey()).shares;
+    svm.warp_to_slot(E1_SLOT + 2_000); // a later epoch
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), rest), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT + 4_000);
+    svm.expire_blockhash(); // this process ix is byte-identical to the partial one above
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // books balance: the sole LP has withdrawn every share; the pool is empty
+    // and the vault holds only its rent — no lamport is stranded.
+    assert!(position_closed(&svm, &m, &lp.pubkey()));
+    let mf = read_machine(&svm, &id);
+    assert_eq!(mf.total_shares, 0, "all shares burned");
+    assert_eq!(mf.pool_value, 0, "pool fully drained");
+    assert_eq!(lamports(&svm, &m), vault_rent, "vault back to rent-only — books balance to the lamport");
 }

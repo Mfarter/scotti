@@ -13,14 +13,16 @@ licensed-casino activity *and* a pooled investment product — out of scope by d
 |---|---|---|
 | `HOUSE-SPEC.md` | module design v0 | draft for review |
 | `crates/house-math` | exact machine math: paytables, RTP curve `k(D)`, exposure cap, depth smoothing, books-balance — all integer-exact, with full 32³ enumeration proofs | tested (11 proofs, `cargo test`) |
-| `programs/house` | House program: config/machine/LP/spin accounts, LP share minting, spin commit/settle/expire | **H2 shipped** — deployed to devnet, live Switchboard On-Demand randomness |
-| `scripts` | devnet ops: config/machine/LP bootstrap, live spin, independent spin verifier | live on devnet (see below) |
+| `programs/house` | House program: config/machine/LP/spin accounts, LP share minting, spin commit/settle/expire, epoch-gated withdrawals | **H3 shipped** — upgraded in place on devnet |
+| `scripts` | devnet ops: bootstrap, live spin + verifier, machine/LP status read layer, live withdrawal | live on devnet (see below) |
 
-H1 shipped the on-chain skeleton settling against a **mock randomness account**.
-**H2 replaces the seam's stub with real Switchboard On-Demand randomness, deploys
-to devnet, and settles live spins** (see the Devnet section). LP epoch withdrawals
-are H3. The mock backend remains a non-default, test-only feature — absent from
-the deployed program and IDL (`tests/test_mock_gate.rs`).
+H1 shipped the on-chain skeleton (mock randomness); **H2** wired in real
+Switchboard On-Demand randomness on devnet; **H3** adds the LP withdrawal side
+(epoch-gated `request_withdraw` / `cancel_withdraw` / `process_withdrawals`), a
+cold-start smoothing fix, and the `machineStatus` / `lpStatus` read layer for the
+frontend, upgraded in place on devnet. The mock backend remains a non-default,
+test-only feature — absent from the deployed program and IDL
+(`tests/test_mock_gate.rs`).
 
 ## The house-math contract
 
@@ -118,11 +120,13 @@ The program is deployed and live on **devnet** (upgrade authority
 | Switchboard On-Demand (devnet) | `Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2` |
 
 Demo machine params: `d_low/d_mid/d_high = 0.5 / 2 / 10 SOL`, `max_exposure_bp =
-100` (1%), founding LP bankroll **1 SOL**. Its `smooth_window` is **150 slots**
-(~1 min) rather than the production ~9000 (~1h): a fresh machine's *smoothed*
-depth starts at zero and would otherwise force near-zero max bets for an hour —
-a small window lets the devnet demo reach meaningful bets in a minute. The curve
-math is identical; only how fast smoothing converges differs.
+100` (1%), founding LP bankroll **1 SOL**. It keeps its H2 `smooth_window` of 150
+slots, but **that hack is no longer needed**: H3's cold-start fix seeds the
+smoothed depth to the founding bankroll at the first deposit, so new machines
+created with the production ~9000-slot (~1h) window offer full `max_bet`
+immediately. The machine also predates H3's `epoch_length` field and so reads it
+as 0, falling back to the default (1350 slots ≈ 9 min) — no migration; the H2
+spins and this machine keep working.
 
 ### Run a spin (and audit it)
 
@@ -133,7 +137,14 @@ SMOOTH_WINDOW=150 npm run create-machine
 npm run seed-lp                # deposit ~1 SOL as the founding LP
 npm run spin                   # a throwaway player: commit → reveal → settle
 npm run verify spins/<sig>.json  # recompute the outcome from chain data
+npm run status [lpOwnerPubkey] # live machine status (the frontend data contract)
+npm run withdraw               # throwaway LP: deposit → request → epoch wait → crank
 ```
+
+`status` prints `machineStatus` (pool + smoothed depth, k, tier, realized RTP,
+max_bet, reserved, free liquidity, share price, epoch + next boundary) — the
+exact data contract H4's floor UI renders — plus `lpStatus` for an owner. These
+live in `scripts/common.ts`, promoted toward SDK shape.
 
 `spin` bundles the Switchboard create+commit with `spin_commit` in one tx, waits
 for the oracle reveal (~2–4 s observed), then bundles reveal + `spin_settle`, and
@@ -158,3 +169,28 @@ Full commit/settle signatures and the revealed randomness for each are in
 `scripts/spins/`. `spin_expire` (the reveal-never-arrives refund) needs a
 ~9000-slot (~1h) abandonment, impractical to stage live in one session — it is
 covered by the LiteSVM test `e_expiry_refunds_and_releases`.
+
+### H3 upgrade + live withdrawal
+
+The withdrawal side and read layer were shipped as an **in-place program upgrade**
+(same program id). The binary grew 289,128 → 318,176 bytes, so the ProgramData
+account was `solana program extend`-ed by 40,960 bytes first (cost **0.285 SOL**);
+the upgrade itself then cost ~0.0016 SOL (the buffer rent is reclaimed).
+
+- extend + upgrade tx: [`2owZ3p…njnrC3L`](https://solscan.io/tx/2owZ3pt5HFdjPeUFeAQaiJnnrKu7taaHfskwSVcC4YjvgfEfqGiqBFiJboxWnmFgW5ijQMQpiCLLxdjSonjnrC3L?cluster=devnet)
+
+The pre-H3 demo machine account keeps working unchanged: it predates the
+`epoch_length` field, reads it as 0, and falls back to the default (1350 slots).
+
+Live withdrawal on the demo machine — a throwaway LP deposited 0.05 SOL
+(50,000,000 lamports → 50,050,090,931,806 shares, worth 49,999,999 at the drifted
+price), issued a full `request_withdraw`, waited a real epoch boundary (~9 min),
+and a permissionless `process_withdrawals` (cranked by the deploy wallet) paid:
+
+| predicted (price at processing) | vault debited | LP received (payout + rent) | position |
+|---|---|---|---|
+| 49,999,999 | 49,999,999 ✓ | 51,900,079 | closed, rent reclaimed |
+
+Exact to the lamport; the 1-lamport gap vs the deposit is flooring dust that
+stays in the pool (accrues to the remaining LP). Process tx:
+[`3BT9ez…fjAfPe`](https://solscan.io/tx/3BT9ezJT6kV5eag8ypLc7WaedcyKBdrgHZUHrBfRUrrVJ6tyXjs18ju7fPM5vRZztvxFDN1i2eJ3zaR8s4fjAfPe?cluster=devnet).

@@ -127,8 +127,11 @@ export interface Machine {
   maxExposureBp: bigint; smoothWindow: bigint;
   poolValue: bigint; reservedExposure: bigint; totalShares: bigint;
   smoothedValue: bigint; smoothedLastSlot: bigint;
-  paused: boolean;
+  paused: boolean; epochLength: bigint;
 }
+/// Legacy sentinel: machines created before H3 store epoch_length 0 and fall
+/// back to this default (mirrors the program's DEFAULT_EPOCH_LENGTH_SLOTS).
+export const DEFAULT_EPOCH_LENGTH_SLOTS = 1_350n;
 export function decodeMachine(data: Buffer): Machine {
   let o = 8; // discriminator
   const rd8 = () => { const v = data.subarray(o, o + 8); o += 8; return v; };
@@ -139,8 +142,23 @@ export function decodeMachine(data: Buffer): Machine {
   const dLow = rdU64(), dMid = rdU64(), dHigh = rdU64(), maxExposureBp = rdU64(), smoothWindow = rdU64();
   const poolValue = rdU64(), reservedExposure = rdU64(), totalShares = rdU128();
   const smoothedValue = rdU128(), smoothedLastSlot = rdU64();
-  const paused = data[o] !== 0;
-  return { machineId, curator, dLow, dMid, dHigh, maxExposureBp, smoothWindow, poolValue, reservedExposure, totalShares, smoothedValue, smoothedLastSlot, paused };
+  const paused = data[o] !== 0; o += 1;
+  o += 1; // bump
+  const epochLength = rdU64();
+  return { machineId, curator, dLow, dMid, dHigh, maxExposureBp, smoothWindow, poolValue, reservedExposure, totalShares, smoothedValue, smoothedLastSlot, paused, epochLength };
+}
+export function epochLengthEff(m: Machine): bigint { return m.epochLength === 0n ? DEFAULT_EPOCH_LENGTH_SLOTS : m.epochLength; }
+
+export interface LpPosition { machine: PublicKey; owner: PublicKey; shares: bigint; pendingShares: bigint; pendingEpoch: bigint; }
+export function decodeLpPosition(data: Buffer): LpPosition {
+  let o = 8;
+  const machine = new PublicKey(data.subarray(o, o + 32)); o += 32;
+  const owner = new PublicKey(data.subarray(o, o + 32)); o += 32;
+  const rdU128 = () => { const lo = Buffer.from(data.subarray(o, o + 8)).readBigUInt64LE(); const hi = Buffer.from(data.subarray(o + 8, o + 16)).readBigUInt64LE(); o += 16; return (hi << 64n) | lo; };
+  const shares = rdU128();
+  const pendingShares = rdU128();
+  const pendingEpoch = Buffer.from(data.subarray(o, o + 8)).readBigUInt64LE(); o += 8;
+  return { machine, owner, shares, pendingShares, pendingEpoch };
 }
 
 export interface PendingSpin {
@@ -250,4 +268,101 @@ export function convergedSnapshot(m: Machine): { isDeep: boolean; k: bigint; tie
   const [kMin, kMax] = kBoundsConst(isDeep);
   const k = kOfDepth(depth, m.dLow, m.dHigh, kMin, kMax);
   return { isDeep, k, tier, maxBet: maxBet(depth, m.maxExposureBp, tier, k) };
+}
+
+// ============================================================================
+// Read layer (SDK-shape) — the data contract H4's frontend renders.
+// ============================================================================
+
+export const SHALLOW_NUM = 301_132_000n;
+export const DEEP_NUM = 302_901_000n;
+/** Realized RTP in bp for a tier at scaler k: base_rtp * k / BP (house-math). */
+export function realizedRtpBp(isDeep: boolean, k: bigint): bigint {
+  const num = isDeep ? DEEP_NUM : SHALLOW_NUM;
+  const total = STOPS * STOPS * STOPS;
+  return (num * k) / (total * BP);
+}
+
+export interface MachineStatus {
+  machine: string;
+  poolValue: bigint;         // internal accounting depth the curve reads
+  reservedExposure: bigint;  // escrowed pending-spin liability
+  freeLiquidity: bigint;     // pool_value - reserved_exposure (withdrawal floor)
+  smoothedDepth: bigint;     // anti-snipe depth k reads, at `slot`
+  tier: string;
+  kBp: bigint;
+  realizedRtpBp: bigint;     // = base_rtp * k / BP
+  maxBet: bigint;
+  totalShares: bigint;
+  sharePrice1e12: bigint;    // pool_value * 1e12 / total_shares
+  paused: boolean;
+  epochLength: bigint;       // effective (default-substituted for legacy)
+  epochNow: bigint;
+  nextBoundarySlot: bigint;
+  slot: bigint;
+}
+
+/** Everything the machine floor UI renders, computed at the current slot. */
+export async function machineStatus(conn: Connection, machine: PublicKey): Promise<MachineStatus> {
+  const info = await conn.getAccountInfo(machine);
+  if (!info) throw new Error(`machine ${machine.toBase58()} not found`);
+  const m = decodeMachine(info.data);
+  const slot = BigInt(await conn.getSlot("confirmed"));
+  const smoothed = smoothedUpdate(m.smoothedValue, m.smoothedLastSlot, m.poolValue, slot, m.smoothWindow);
+  const isDeep = smoothed >= m.dMid;
+  const tier = isDeep ? DEEP : SHALLOW;
+  const [kMin, kMax] = kBoundsConst(isDeep);
+  const k = kOfDepth(smoothed, m.dLow, m.dHigh, kMin, kMax);
+  const elen = epochLengthEff(m);
+  const epochNow = slot / elen;
+  const sharePrice1e12 = m.totalShares === 0n ? 0n : (m.poolValue * 1_000_000_000_000n) / m.totalShares;
+  return {
+    machine: machine.toBase58(),
+    poolValue: m.poolValue,
+    reservedExposure: m.reservedExposure,
+    freeLiquidity: m.poolValue > m.reservedExposure ? m.poolValue - m.reservedExposure : 0n,
+    smoothedDepth: smoothed,
+    tier: tier.name,
+    kBp: k,
+    realizedRtpBp: realizedRtpBp(isDeep, k),
+    maxBet: maxBet(smoothed, m.maxExposureBp, tier, k),
+    totalShares: m.totalShares,
+    sharePrice1e12,
+    paused: m.paused,
+    epochLength: elen,
+    epochNow,
+    nextBoundarySlot: (epochNow + 1n) * elen,
+    slot,
+  };
+}
+
+export interface LpStatus {
+  exists: boolean;
+  shares: bigint;
+  valueLamports: bigint;      // shares at the current share price
+  pendingShares: bigint;
+  pendingValueLamports: bigint;
+  pendingEpoch: bigint;
+  processableNow: boolean;    // epoch elapsed AND there is a pending request
+}
+
+/** An LP's position rendered for the dashboard. */
+export async function lpStatus(conn: Connection, machine: PublicKey, owner: PublicKey): Promise<LpStatus> {
+  const posPda = lpPda(machine, owner);
+  const info = await conn.getAccountInfo(posPda);
+  if (!info) return { exists: false, shares: 0n, valueLamports: 0n, pendingShares: 0n, pendingValueLamports: 0n, pendingEpoch: 0n, processableNow: false };
+  const p = decodeLpPosition(info.data);
+  const m = decodeMachine((await conn.getAccountInfo(machine))!.data);
+  const price = (sh: bigint) => m.totalShares === 0n ? 0n : (sh * m.poolValue) / m.totalShares;
+  const slot = BigInt(await conn.getSlot("confirmed"));
+  const epochNow = slot / epochLengthEff(m);
+  return {
+    exists: true,
+    shares: p.shares,
+    valueLamports: price(p.shares),
+    pendingShares: p.pendingShares,
+    pendingValueLamports: price(p.pendingShares),
+    pendingEpoch: p.pendingEpoch,
+    processableNow: p.pendingShares > 0n && epochNow > p.pendingEpoch,
+  };
 }

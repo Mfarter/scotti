@@ -13,6 +13,7 @@ const D_MID = BigInt(process.env.D_MID ?? (2n * SOL).toString());   // 2 SOL
 const D_HIGH = BigInt(process.env.D_HIGH ?? (10n * SOL).toString()); // 10 SOL
 const MAX_EXPOSURE_BP = BigInt(process.env.MAX_EXPOSURE_BP ?? "100"); // 1%
 const SMOOTH_WINDOW = BigInt(process.env.SMOOTH_WINDOW ?? "9000");
+const EPOCH_LENGTH = BigInt(process.env.EPOCH_LENGTH ?? "1350"); // ~9 min on devnet
 
 const id = machineId(LABEL);
 const machine = machinePda(id);
@@ -28,7 +29,7 @@ if (existing) {
 const data = Buffer.concat([
   ixDisc("create_machine"),
   id, // machine_id [u8;16]
-  u64(D_LOW), u64(D_MID), u64(D_HIGH), u64(MAX_EXPOSURE_BP), u64(SMOOTH_WINDOW),
+  u64(D_LOW), u64(D_MID), u64(D_HIGH), u64(MAX_EXPOSURE_BP), u64(SMOOTH_WINDOW), u64(EPOCH_LENGTH),
   wallet.publicKey.toBuffer(), // curator = admin
 ]);
 const ix = new TransactionInstruction({
@@ -46,7 +47,7 @@ const sig = await sendTx(conn, [ix], [wallet], "create-machine");
 console.log(`Machine "${LABEL}" created: ${machine.toBase58()}`);
 console.log(`  id (hex)       = ${id.toString("hex")}`);
 console.log(`  d_low/mid/high = ${D_LOW} / ${D_MID} / ${D_HIGH} lamports`);
-console.log(`  max_exposure   = ${MAX_EXPOSURE_BP} bp, smooth_window = ${SMOOTH_WINDOW} slots`);
+console.log(`  max_exposure   = ${MAX_EXPOSURE_BP} bp, smooth_window = ${SMOOTH_WINDOW} slots, epoch_length = ${EPOCH_LENGTH} slots`);
 console.log(`  curator        = ${wallet.publicKey.toBase58()}`);
 console.log(`  account        = ${solscanAcct(machine)}`);
 console.log(`  tx             = ${solscanTx(sig)}`);

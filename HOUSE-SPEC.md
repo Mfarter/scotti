@@ -113,11 +113,31 @@ alone. The SDK ships `verifySpin(spinPda)` doing exactly that.
 ## 5. LP mechanics
 
 - **Deposit:** mint `shares = amount × total_shares / D` (first deposit 1:1 at a 1e6 scale).
-  Share price `P = D / total_shares` (fixed-point 1e12 in accounting).
-- **Withdraw (epoch-gated):** `request_withdraw(shares)` queues; at epoch boundary (devnet: 6h)
-  a permissionless crank processes the queue at **that moment's** share price, capped by the
-  liquidity floor `free = D − reserved_exposure` (unfilled remainder stays queued). Epochs are
-  the anti-pool-hopping and anti-bank-run mechanism in one.
+  Share price `P = D / total_shares` (fixed-point 1e12 in accounting). The founding deposit also
+  seeds the smoothed depth to the bankroll (a machine's founding state is not a change to damp), so
+  a fresh machine offers a meaningful `max_bet` immediately rather than ramping up over a window.
+- **Withdraw (epoch-gated), as implemented (H3):**
+  - `request_withdraw(shares)` moves shares from active to a **pending** state on the LpPosition
+    (so they can't be double-spent or re-requested) and stamps the current epoch
+    (`slot / epoch_length`, `epoch_length` a Machine param; devnet default 1350 slots ≈ 9 min,
+    production the spec's 6h). Requesting again adds to the pending amount and re-stamps the epoch,
+    so the whole pending balance waits at least one full boundary. Shares stay part of
+    `total_shares` while pending — the price is untouched until they are actually processed.
+  - `cancel_withdraw()` returns the pending shares to the active balance exactly, any time before
+    processing.
+  - `process_withdrawals()` is a **permissionless** crank, processable only once the request's
+    epoch has strictly elapsed (`epoch_of(now) > pending_epoch`). It processes one position at the
+    share price **at processing time** (`D / total_shares`) — never the request-time price; that
+    repricing is the anti-pool-hopping mechanism (a jackpot between request and processing is borne
+    by the withdrawing LP; growth accrues to them). The fill is capped by the liquidity floor
+    `free = D − reserved_exposure`, so pending spins are never starved; any **remainder stays
+    queued** for a later crank once liquidity frees up. Processed shares are burned
+    (`total_shares −= filled`, `D −= payout`); flooring dust stays in the pool and accrues to the
+    remaining LPs. A position emptied to zero (no active, no pending) is closed and its rent
+    returned to the owner.
+  - **Ordering across LPs:** each crank prices at the current pool state, so a batch cranked in
+    sequence prices each fill at the state left by the previous one; there is no separate global
+    FIFO structure. Epochs remain the anti-pool-hopping and anti-bank-run mechanism.
 - **Yield display (frontend obligation):** trailing share-price change (7d/30d, annualized) AND
   expected-value math (`edge × projected volume / D`) AND historical drawdown — never a fixed
   "APY". A $1M pool at 5% avg edge and $20k daily volume expects ~36%/yr with whole-percent
@@ -176,7 +196,16 @@ anything.
   `scripts/verify-spin.ts` produced three public, independently-audited spins (see README Devnet).
   Reveal latency observed ~2–4 s. (The `verifySpin` TypeScript SDK export is folded into H3's SDK
   work; the standalone `verify-spin.ts` delivers the runnable audit now.)
-- **H3:** Epoch withdrawal crank hardening + curve UX endpoints (SDK reads: current k, tier,
-  max bet, share price series).
+- **H3 (shipped):** LP withdrawal side — `request_withdraw` / `cancel_withdraw` /
+  `process_withdrawals` (epoch-gated, permissionless, priced at processing, floor-capped; see §5
+  as-implemented) — plus the cold-start smoothing fix (seed smoothed depth at the founding deposit)
+  and the read layer H4 needs (`machineStatus` / `lpStatus` in `scripts/common.ts`:
+  pool/smoothed depth, k, tier, realized RTP, max_bet, reserved, free liquidity, share price,
+  epoch + next boundary). LiteSVM covers the solvency-interaction matrix (reserved untouched during
+  a pending spin, price-at-processing on jackpot/growth, sequential multi-LP pricing, zero-share
+  close, epoch-boundary enforcement, cancel, and a full-lifecycle books-balance). Program upgraded
+  in place on devnet (same id) — the pre-H3 demo machine keeps working via the epoch_length=0
+  legacy default. Live-verified: a throwaway LP deposit → request → epoch wait → crank, exact
+  lamports.
 - **H4:** Frontend — machine floor UI (each machine showing live RTP/k, depth, tier), spin flow,
   LP dashboard with the three-number yield display.

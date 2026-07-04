@@ -39,6 +39,12 @@ pub const SHARE_SCALE: u128 = 1_000_000;
 /// (HOUSE-SPEC §4.3). Matches the smoothing window by construction.
 pub const EXPIRE_SLOTS: u64 = hm::SMOOTH_WINDOW_SLOTS;
 
+/// Epoch length (slots) used by machines whose `epoch_length` is 0 — i.e. those
+/// created before H3 added the field (it reads 0 out of the old `reserved`
+/// tail). ~9 min at ~0.4s/slot on devnet, so withdrawals are testable live;
+/// production machines set a larger value (the spec's 6h) at creation.
+pub const DEFAULT_EPOCH_LENGTH_SLOTS: u64 = 1_350;
+
 const JACKPOT_SYMBOLS: [u8; hm::REELS] = [hm::JACKPOT, hm::JACKPOT, hm::JACKPOT];
 
 #[program]
@@ -75,6 +81,7 @@ pub mod house {
         d_high: u64,
         max_exposure_bp: u64,
         smooth_window: u64,
+        epoch_length: u64,
         curator: Pubkey,
     ) -> Result<()> {
         // d_low < d_mid < d_high, all positive; the curve and tier split are
@@ -83,6 +90,8 @@ pub mod house {
         // exposure in (0, 100%]; the spec's governance default is 100 bp (1%).
         require!(max_exposure_bp > 0 && max_exposure_bp <= hm::BP as u64, HouseError::InvalidParams);
         require!(smooth_window > 0, HouseError::InvalidParams);
+        // epoch_length must be > 0 (0 is the legacy sentinel meaning "default").
+        require!(epoch_length > 0, HouseError::InvalidParams);
 
         let now = Clock::get()?.slot;
         let m = &mut ctx.accounts.machine;
@@ -93,9 +102,12 @@ pub mod house {
         m.d_high = d_high;
         m.max_exposure_bp = max_exposure_bp;
         m.smooth_window = smooth_window;
+        m.epoch_length = epoch_length;
         m.pool_value = 0;
         m.reserved_exposure = 0;
         m.total_shares = 0;
+        // smoothed depth is seeded at the FIRST deposit (cold-start fix); a
+        // machine with no bankroll has no depth to read.
         m.smoothed_value = 0;
         m.smoothed_last_slot = now;
         m.paused = false;
@@ -121,7 +133,8 @@ pub mod house {
         require!(amount > 0, HouseError::InvalidWager);
 
         let m = &ctx.accounts.machine;
-        let shares: u128 = if m.total_shares == 0 {
+        let first_deposit = m.total_shares == 0;
+        let shares: u128 = if first_deposit {
             // first deposit: 1:1 at 1e6 scale.
             (amount as u128).checked_mul(SHARE_SCALE).ok_or(HouseError::MathOverflow)?
         } else {
@@ -145,12 +158,96 @@ pub mod house {
         let m = &mut ctx.accounts.machine;
         m.pool_value = m.pool_value.checked_add(amount).ok_or(HouseError::MathOverflow)?;
         m.total_shares = m.total_shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
+        // Cold-start fix (H3): a machine's FOUNDING bankroll is not a change to
+        // damp — seed the smoothed depth to it directly so max_bet is meaningful
+        // immediately, instead of ramping from zero over the whole window.
+        if first_deposit {
+            m.smoothed_value = amount as u128;
+            m.smoothed_last_slot = Clock::get()?.slot;
+        }
 
         let pos = &mut ctx.accounts.position;
         pos.machine = ctx.accounts.machine.key();
         pos.owner = ctx.accounts.owner.key();
         pos.shares = pos.shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
         pos.bump = ctx.bumps.position;
+        Ok(())
+    }
+
+    /// Queue `shares` for epoch-gated withdrawal (HOUSE-SPEC §5). The shares
+    /// move from active to pending so they can't be double-requested; the
+    /// position keeps owning them (total_shares/pool_value unchanged, so the
+    /// share price is untouched until they are actually processed and burned).
+    /// Requesting again adds to the queue and (re)stamps the current epoch, so
+    /// the whole pending amount waits at least one epoch boundary.
+    pub fn request_withdraw(ctx: Context<RequestWithdraw>, shares: u128) -> Result<()> {
+        require!(shares > 0, HouseError::InvalidWithdrawAmount);
+        let now = Clock::get()?.slot;
+        let epoch = ctx.accounts.machine.epoch_of(now);
+        let pos = &mut ctx.accounts.position;
+        require!(pos.shares >= shares, HouseError::InsufficientShares);
+        pos.shares -= shares;
+        pos.pending_shares = pos.pending_shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
+        pos.pending_epoch = epoch;
+        Ok(())
+    }
+
+    /// Cancel a pending request before it is processed, restoring the shares to
+    /// the active balance exactly (HOUSE-SPEC §5).
+    pub fn cancel_withdraw(ctx: Context<CancelWithdraw>) -> Result<()> {
+        let pos = &mut ctx.accounts.position;
+        require!(pos.pending_shares > 0, HouseError::NothingToWithdraw);
+        pos.shares = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        pos.pending_shares = 0;
+        pos.pending_epoch = 0;
+        Ok(())
+    }
+
+    /// Permissionless epoch crank (HOUSE-SPEC §5). Processes ONE position's
+    /// pending request, once its epoch has fully elapsed, at the share price AT
+    /// THIS MOMENT (pool_value / total_shares) — never the request-time price;
+    /// that repricing is the anti-pool-hopping mechanism. The fill is capped by
+    /// the liquidity floor `free = pool_value - reserved_exposure`, so pending
+    /// spins stay funded; any remainder stays queued. Call once per position;
+    /// cranking several in one tx prices each at the state left by the previous.
+    pub fn process_withdrawals(ctx: Context<ProcessWithdrawals>) -> Result<()> {
+        let now = Clock::get()?.slot;
+        let m = &ctx.accounts.machine;
+        let pending = ctx.accounts.position.pending_shares;
+        require!(pending > 0, HouseError::NothingToWithdraw);
+        // the request's epoch must be strictly in the past (waited a boundary).
+        require!(m.epoch_of(now) > ctx.accounts.position.pending_epoch, HouseError::EpochNotElapsed);
+        require!(m.total_shares > 0 && m.pool_value > 0, HouseError::MathOverflow);
+
+        let total_shares = m.total_shares;
+        let pool_value = m.pool_value as u128;
+        let free = m.free_liquidity() as u128;
+
+        // shares the free liquidity can cover at the current price, capped by
+        // the pending amount; then the exact lamport payout for those shares.
+        let free_shares = free.checked_mul(total_shares).ok_or(HouseError::MathOverflow)? / pool_value;
+        let fill_shares = pending.min(free_shares);
+        let payout_u128 = fill_shares.checked_mul(pool_value).ok_or(HouseError::MathOverflow)? / total_shares;
+        let payout = u64::try_from(payout_u128).map_err(|_| HouseError::MathOverflow)?;
+
+        // burn the filled shares and remove the paid lamports from pool depth;
+        // flooring dust stays in the pool (accrues to remaining LPs).
+        let m = &mut ctx.accounts.machine;
+        m.total_shares -= fill_shares;
+        m.pool_value -= payout;
+
+        let pos = &mut ctx.accounts.position;
+        pos.pending_shares -= fill_shares;
+
+        if payout > 0 {
+            debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.owner, payout)?;
+        }
+
+        // fully-emptied position (no active, no pending) closes; rent to owner.
+        let pos = &ctx.accounts.position;
+        if pos.shares == 0 && pos.pending_shares == 0 {
+            ctx.accounts.position.close(ctx.accounts.owner.to_account_info())?;
+        }
         Ok(())
     }
 
@@ -429,11 +526,28 @@ pub struct Machine {
     pub smoothed_last_slot: u64,
     pub paused: bool,
     pub bump: u8,
+    /// Epoch length in slots for the withdrawal crank (HOUSE-SPEC §5). Carved
+    /// from the former 32→ (now 56)-byte reserved tail so the account size is
+    /// unchanged: machines created before H3 read 0 here and fall back to
+    /// DEFAULT_EPOCH_LENGTH_SLOTS via `epoch_length_eff()`.
+    pub epoch_length: u64,
     pub reserved: [u8; Machine::RESERVED_LEN],
 }
 impl Machine {
-    pub const RESERVED_LEN: usize = 64;
-    pub const SIZE: usize = 8 + 16 + 32 + (5 * 8) + 8 + 8 + 16 + 16 + 8 + 1 + 1 + Self::RESERVED_LEN;
+    // epoch_length(8) carved out of the former 64-byte reserved; size unchanged.
+    pub const RESERVED_LEN: usize = 56;
+    pub const SIZE: usize = 8 + 16 + 32 + (5 * 8) + 8 + 8 + 16 + 16 + 8 + 1 + 1 + 8 + Self::RESERVED_LEN;
+
+    /// Effective epoch length: the stored value, or the default for legacy
+    /// (pre-H3) machines that stored 0. `create_machine` forbids 0 for new ones.
+    pub fn epoch_length_eff(&self) -> u64 {
+        if self.epoch_length == 0 { DEFAULT_EPOCH_LENGTH_SLOTS } else { self.epoch_length }
+    }
+    /// The epoch index a slot falls in (HOUSE-SPEC §5, `slot / epoch_length`).
+    pub fn epoch_of(&self, slot: u64) -> u64 { slot / self.epoch_length_eff() }
+    /// Free liquidity available to withdrawals: pool depth minus escrowed spin
+    /// exposure. Withdrawals are capped here so pending spins always stay funded.
+    pub fn free_liquidity(&self) -> u64 { self.pool_value.saturating_sub(self.reserved_exposure) }
 }
 
 /// An LP's stake in a machine. PDA `["lp", machine, owner]`. The pending-
@@ -553,6 +667,41 @@ pub struct LpDeposit<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RequestWithdraw<'info> {
+    #[account(seeds = [b"machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Account<'info, Machine>,
+    #[account(mut, has_one = owner, has_one = machine,
+              seeds = [b"lp", machine.key().as_ref(), owner.key().as_ref()], bump = position.bump)]
+    pub position: Account<'info, LpPosition>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelWithdraw<'info> {
+    #[account(seeds = [b"machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Account<'info, Machine>,
+    #[account(mut, has_one = owner, has_one = machine,
+              seeds = [b"lp", machine.key().as_ref(), owner.key().as_ref()], bump = position.bump)]
+    pub position: Account<'info, LpPosition>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ProcessWithdrawals<'info> {
+    #[account(mut, seeds = [b"machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Account<'info, Machine>,
+    #[account(mut, has_one = machine,
+              seeds = [b"lp", machine.key().as_ref(), position.owner.as_ref()], bump = position.bump)]
+    pub position: Account<'info, LpPosition>,
+    /// CHECK: receives the payout and (on a fully-emptied position) the rent;
+    /// constrained to equal position.owner.
+    #[account(mut, address = position.owner)]
+    pub owner: UncheckedAccount<'info>,
+    pub cranker: Signer<'info>, // literally anyone
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(wager: u64, nonce: u64)]
 pub struct SpinCommit<'info> {
     #[account(mut, seeds = [b"machine", machine.machine_id.as_ref()], bump = machine.bump)]
@@ -631,6 +780,10 @@ pub enum HouseError {
     #[msg("Randomness not yet resolved (reveal not landed this slot)")] RandomnessNotResolved,
     #[msg("Spin has not passed its expiry window")] SpinNotExpired,
     #[msg("Settlement would make the pool insolvent")] InsolventSettlement,
+    #[msg("Withdrawal share amount must be > 0")] InvalidWithdrawAmount,
+    #[msg("Not enough active shares to withdraw")] InsufficientShares,
+    #[msg("No pending withdrawal to process or cancel")] NothingToWithdraw,
+    #[msg("Withdrawal epoch has not elapsed yet")] EpochNotElapsed,
 }
 
 // ---------------------------------------------------------------------------

@@ -429,6 +429,21 @@ mod smoothing_proofs {
         assert!(k_full > k_before, "curve failed to respond over the window");
     }
 
+    /// PROOF (cold-start): a machine's FOUNDING state is not a change to damp.
+    /// `new(depth)` reads the full depth immediately and stays there under
+    /// constant depth, so a freshly-seeded machine offers full max_bet at once
+    /// — the H3 fix is to seed SmoothedDepth with the first deposit rather than
+    /// let it ramp up from zero over a window.
+    #[test]
+    fn founding_state_reads_full_depth() {
+        let d = 5_000_000_000u128;
+        let mut s = SmoothedDepth::new(d, 100);
+        assert_eq!(s.value, d, "new() seeds value = depth");
+        assert_eq!(s.update(d, 100, SMOOTH_WINDOW_SLOTS), d, "zero elapsed is identity");
+        assert_eq!(s.update(d, 100 + SMOOTH_WINDOW_SLOTS, SMOOTH_WINDOW_SLOTS), d, "constant depth stays");
+        assert_eq!(s.update(d, 100 + 10 * SMOOTH_WINDOW_SLOTS, SMOOTH_WINDOW_SLOTS), d);
+    }
+
     /// PROOF: elapsed beyond one window clamps (no overshoot past target).
     #[test]
     fn long_gaps_clamp_never_overshoot() {
