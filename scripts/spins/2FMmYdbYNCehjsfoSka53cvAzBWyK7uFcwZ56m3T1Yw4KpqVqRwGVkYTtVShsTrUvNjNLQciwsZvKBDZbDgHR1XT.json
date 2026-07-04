@@ -1,0 +1,28 @@
+{
+  "machine": "9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1",
+  "label": "house-demo-1",
+  "player": "2SsSuQMKWxU3KbhdfTUoM1TnyrNSSEx8ZBE1Yrg2UhQF",
+  "nonce": "1783203379023",
+  "wager": "94994",
+  "snapshot": {
+    "kBp": "10527",
+    "tierIsDeep": false,
+    "tier": "shallow",
+    "maxPayout": "5000009",
+    "randSeedSlot": "474012503"
+  },
+  "randomnessAccount": "D33m6ABsbdSYtdgQ3idA6NBTbAKZsZ1rK95AJYTekaa3",
+  "revealedValueHex": "fa096a6491154181d8a0e12ff9e0050cb09cc3d419a3829d9c960b23ad03b86a",
+  "reels": [
+    "BLANK",
+    "BAR",
+    "BAR"
+  ],
+  "payout": "0",
+  "poolBefore": "1000009302",
+  "poolAfter": "1000104296",
+  "commitSig": "53Aes8NuNBNuvdfh261Zo5cNuWFnyyuPbZdpV41EPpdGDqYYagYSfEuKjdFDAE8e81nGSV8Bm7QWdNXGVrsyyC8f",
+  "settleSig": "2FMmYdbYNCehjsfoSka53cvAzBWyK7uFcwZ56m3T1Yw4KpqVqRwGVkYTtVShsTrUvNjNLQciwsZvKBDZbDgHR1XT",
+  "commitUrl": "https://solscan.io/tx/53Aes8NuNBNuvdfh261Zo5cNuWFnyyuPbZdpV41EPpdGDqYYagYSfEuKjdFDAE8e81nGSV8Bm7QWdNXGVrsyyC8f?cluster=devnet",
+  "settleUrl": "https://solscan.io/tx/2FMmYdbYNCehjsfoSka53cvAzBWyK7uFcwZ56m3T1Yw4KpqVqRwGVkYTtVShsTrUvNjNLQciwsZvKBDZbDgHR1XT?cluster=devnet"
+}

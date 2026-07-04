@@ -27,6 +27,16 @@ mock-randomness = []
 [dependencies]
 anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }
 yvone-house-math = { path = "../../crates/house-math" }
+# On-chain only: RandomnessAccountData parsing. default-features off drops the
+# solana-v2 path and the client crates (solana-sdk/client/account-decoder);
+# solana-v3 matches our Agave-3.x tree, anchor-lang for the account reader.
+switchboard-on-demand = { version = "0.13.0", default-features = false, features = ["solana-v3", "anchor-lang"] }
+# switchboard-on-demand hard-depends on switchboard-protos, which drags getrandom
+# 0.2 into the normal tree with its default OS backend — unsupported on the
+# Solana (sbf) target. The `custom` feature swaps in a registrable backend so it
+# compiles; on-chain code never calls it (it lives only in switchboard's client
+# path), so no handler is registered. Standard Solana-program workaround.
+getrandom = { version = "0.2", features = ["custom"] }
 
 [dev-dependencies]
 yvone-house-math = { path = "../../crates/house-math" }

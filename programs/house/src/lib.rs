@@ -6,13 +6,14 @@
 //! arithmetic is delegated to the `yvone-house-math` crate (the H0 artifact
 //! with the enumeration solvency proofs) — this program never reimplements it.
 //!
-//! Randomness is abstracted behind a narrow seam (`revealed_bytes`) with two
-//! implementations selected at compile time:
+//! Randomness is abstracted behind a narrow seam (`commit_seed_slot` +
+//! `revealed_bytes`) with two implementations selected at compile time:
 //!   * `mock-randomness` feature ON  → reads a program-owned MockRandomness
 //!     account (LiteSVM tests only; a deployable mock is a drain-everything
 //!     backdoor, so this feature is OFF in the default/deployable build);
-//!   * feature OFF (default/deployable) → Switchboard On-Demand stub returning
-//!     NotImplemented, filled in H2.
+//!   * feature OFF (default/deployable) → Switchboard On-Demand (H2): parse
+//!     RandomnessAccountData, enforce seed_slot freshness at commit, and read
+//!     the revealed value at settle (reveal bundled in the settle tx).
 //!
 //! Mirrors the Yvone-Protocol arbiter patterns: singleton config PDA
 //! (initialize-once + update_admin), direct-debit lamport transfers, manual
@@ -22,6 +23,9 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
 use yvone_house_math as hm;
+// Switchboard On-Demand parsing lives only in the deployable (non-mock) build.
+#[cfg(not(feature = "mock-randomness"))]
+use switchboard_on_demand::{RandomnessAccountData, ON_DEMAND_DEVNET_PID};
 
 declare_id!("EewsDJqfDEEfF8mKhQRED6NSB987LhkKL9wawjM7SBQ");
 
@@ -181,6 +185,11 @@ pub mod house {
         let max_payout_u128 = hm::spin_payout(wager as u128, tier, k, JACKPOT_SYMBOLS);
         let max_payout = u64::try_from(max_payout_u128).map_err(|_| HouseError::MathOverflow)?;
 
+        // verify the randomness account is freshly committed and snapshot its
+        // seed_slot; settle later requires the same account + seed_slot. Done
+        // before moving money so a stale/foreign randomness account fails fast.
+        let seed_slot = commit_seed_slot(&ctx.accounts.randomness, now)?;
+
         // escrow the wager into the vault (player signs).
         invoke(
             &system_instruction::transfer(&ctx.accounts.player.key(), &ctx.accounts.machine.key(), wager),
@@ -208,6 +217,7 @@ pub mod house {
         s.tier_is_deep = is_deep;
         s.max_payout = max_payout;
         s.randomness = ctx.accounts.randomness.key();
+        s.rand_seed_slot = seed_slot;
         s.commit_slot = now;
         s.bump = ctx.bumps.pending_spin;
         Ok(())
@@ -222,7 +232,11 @@ pub mod house {
         let _ = nonce; // bound in the Accounts seeds; unused in the handler body
         let s = &ctx.accounts.pending_spin;
 
-        let bytes = revealed_bytes(&ctx.accounts.randomness, s.randomness, s.commit_slot)?;
+        // read the revealed randomness through the seam: the account must match
+        // the snapshot key AND seed_slot, and (Switchboard) the reveal must have
+        // landed this slot. Snapshot k/tier below are still used to price it.
+        let now = Clock::get()?.slot;
+        let bytes = revealed_bytes(&ctx.accounts.randomness, s.randomness, s.rand_seed_slot, now)?;
         let reels = hm::reels_from_randomness(&bytes);
 
         let tier = if s.tier_is_deep { &hm::DEEP } else { &hm::SHALLOW };
@@ -288,13 +302,35 @@ pub mod house {
 }
 
 // -------------------- randomness seam --------------------
+//
+// Two backends behind one boundary, selected at compile time:
+//   * commit_seed_slot(account, slot) — verify the randomness at commit and
+//     return the seed_slot to snapshot into PendingSpin;
+//   * revealed_bytes(account, key, seed_slot, slot) — verify the SAME account
+//     at settle (key + seed_slot must match the snapshot) and read the value.
+// The default/deployable build is Switchboard On-Demand; the mock is compiled
+// ONLY under `mock-randomness` (LiteSVM tests). The expiry path is backend-
+// agnostic: a request that never reveals just falls through to spin_expire.
 
-/// Mock implementation: the revealed bytes come from a program-owned
-/// MockRandomness account. Compiled ONLY under the `mock-randomness` feature.
+// ---- mock backend (feature = "mock-randomness") ----
+
+/// Mock: nothing to verify at commit (the account may not even exist yet), and
+/// there is no meaningful seed slot — snapshot 0; the mock reader ignores it.
 #[cfg(feature = "mock-randomness")]
-fn revealed_bytes(account: &AccountInfo, expected_key: Pubkey, _commit_slot: u64) -> Result<[u8; 32]> {
-    require_keys_eq!(account.key(), expected_key, HouseError::WrongRandomnessAccount);
-    require_keys_eq!(*account.owner, crate::ID, HouseError::WrongRandomnessAccount);
+fn commit_seed_slot(_account: &AccountInfo, _clock_slot: u64) -> Result<u64> {
+    Ok(0)
+}
+
+/// Mock: revealed bytes come from a program-owned MockRandomness account.
+#[cfg(feature = "mock-randomness")]
+fn revealed_bytes(
+    account: &AccountInfo,
+    expected_key: Pubkey,
+    _expected_seed_slot: u64,
+    _clock_slot: u64,
+) -> Result<[u8; 32]> {
+    require_keys_eq!(account.key(), expected_key, HouseError::InvalidRandomnessAccount);
+    require_keys_eq!(*account.owner, crate::ID, HouseError::InvalidRandomnessAccount);
     let data = account.try_borrow_data()?;
     let r = MockRandomness::try_deserialize(&mut &data[..])
         .map_err(|_| HouseError::RandomnessNotResolved)?;
@@ -302,13 +338,51 @@ fn revealed_bytes(account: &AccountInfo, expected_key: Pubkey, _commit_slot: u64
     Ok(r.bytes)
 }
 
-/// Switchboard On-Demand implementation (default/deployable build). Stub until
-/// H2: it must parse `RandomnessAccountData`, verify the reveal at commit_slot,
-/// and return the 32 revealed bytes. Deliberately unimplemented so the default
-/// build cannot settle a spin against unverified randomness.
+// ---- Switchboard On-Demand backend (default / deployable) ----
+//
+// devnet-only module (HOUSE-SPEC §Cluster), so the owner is pinned to the
+// Switchboard devnet program id. is_devnet() in the crate is compile/env-gated
+// and would resolve to mainnet on-chain, so we do NOT use the Owner trait.
+
+/// Verify a freshly committed randomness account and return its seed_slot.
+/// Per the Switchboard tutorial the commitment must have happened in the
+/// immediately preceding slot (`seed_slot == clock_slot - 1`); bundling the
+/// Switchboard commit ix in the same tx as spin_commit satisfies this.
 #[cfg(not(feature = "mock-randomness"))]
-fn revealed_bytes(_account: &AccountInfo, _expected_key: Pubkey, _commit_slot: u64) -> Result<[u8; 32]> {
-    err!(HouseError::NotImplemented)
+fn commit_seed_slot(account: &AccountInfo, clock_slot: u64) -> Result<u64> {
+    require!(
+        account.owner.to_bytes() == ON_DEMAND_DEVNET_PID.to_bytes(),
+        HouseError::InvalidRandomnessAccount
+    );
+    let data = account.try_borrow_data()?;
+    let rand = RandomnessAccountData::parse(data).map_err(|_| HouseError::InvalidRandomnessAccount)?;
+    let expected = clock_slot.checked_sub(1).ok_or(HouseError::RandomnessExpired)?;
+    require!(rand.seed_slot == expected, HouseError::RandomnessExpired);
+    Ok(rand.seed_slot)
+}
+
+/// Verify the settle-time randomness account matches the snapshot (key AND
+/// seed_slot — a swapped or re-seeded account fails) and read the revealed
+/// value. get_value requires the reveal to have landed this slot, so the
+/// Switchboard reveal ix is bundled in the same tx as spin_settle; a spin that
+/// never reveals is unreadable and routes to spin_expire.
+#[cfg(not(feature = "mock-randomness"))]
+fn revealed_bytes(
+    account: &AccountInfo,
+    expected_key: Pubkey,
+    expected_seed_slot: u64,
+    clock_slot: u64,
+) -> Result<[u8; 32]> {
+    require_keys_eq!(account.key(), expected_key, HouseError::InvalidRandomnessAccount);
+    require!(
+        account.owner.to_bytes() == ON_DEMAND_DEVNET_PID.to_bytes(),
+        HouseError::InvalidRandomnessAccount
+    );
+    let data = account.try_borrow_data()?;
+    let rand = RandomnessAccountData::parse(data).map_err(|_| HouseError::InvalidRandomnessAccount)?;
+    // the account must be the very one committed against: same seed_slot.
+    require!(rand.seed_slot == expected_seed_slot, HouseError::InvalidRandomnessAccount);
+    rand.get_value(clock_slot).map_err(|_| HouseError::RandomnessNotResolved.into())
 }
 
 /// Direct-debit lamport move between two accounts (no CPI), matching the
@@ -394,12 +468,18 @@ pub struct PendingSpin {
     pub max_payout: u64,
     // randomness binding
     pub randomness: Pubkey,
+    /// Switchboard seed_slot the account was committed against (0 under mock).
+    /// Settle requires the presented account's seed_slot to equal this, so a
+    /// swapped or re-seeded randomness account is rejected.
+    pub rand_seed_slot: u64,
     pub commit_slot: u64,
     pub bump: u8,
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 24],
 }
 impl PendingSpin {
-    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1 + 8 + 32 + 8 + 1 + 32;
+    // rand_seed_slot(8) was carved out of the former 32-byte reserved tail, so
+    // the account size is unchanged from H1.
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1 + 8 + 32 + 8 + 8 + 1 + 24;
 }
 
 /// TEST-ONLY randomness source (mock-randomness feature). Program-owned so the
@@ -546,9 +626,159 @@ pub enum HouseError {
     #[msg("Wager exceeds solvency-derived max bet")] BetExceedsMax,
     #[msg("Deposit too small to mint any shares")] DepositTooSmall,
     #[msg("Arithmetic overflow")] MathOverflow,
-    #[msg("Wrong randomness account for this spin")] WrongRandomnessAccount,
-    #[msg("Randomness not yet resolved")] RandomnessNotResolved,
-    #[msg("Randomness backend not implemented (Switchboard: H2)")] NotImplemented,
+    #[msg("Randomness account is wrong, foreign, malformed, or re-seeded")] InvalidRandomnessAccount,
+    #[msg("Randomness commitment is not fresh (must be the prior slot)")] RandomnessExpired,
+    #[msg("Randomness not yet resolved (reveal not landed this slot)")] RandomnessNotResolved,
     #[msg("Spin has not passed its expiry window")] SpinNotExpired,
     #[msg("Settlement would make the pool insolvent")] InsolventSettlement,
+}
+
+// ---------------------------------------------------------------------------
+// Unit coverage for the Switchboard randomness verification, without a live
+// oracle: we craft RandomnessAccountData bytes and drive the seam functions
+// directly. Compiled only in the default (Switchboard) build — the mock build
+// replaces these functions. The live end-to-end path is exercised on devnet by
+// scripts/devnet-spin.ts.
+#[cfg(all(test, not(feature = "mock-randomness")))]
+mod switchboard_seam_tests {
+    use super::*;
+    use anchor_lang::solana_program::account_info::AccountInfo;
+
+    // RandomnessAccountData is #[repr(C)]; these are its field byte offsets
+    // (add 8 for the account discriminator prefix). Guarded by a size assert.
+    const DISC: [u8; 8] = [10, 66, 229, 135, 220, 239, 217, 114];
+    const OFF_SEED_SLOT: usize = 8 + 96;
+    const OFF_REVEAL_SLOT: usize = 8 + 136;
+    const OFF_VALUE: usize = 8 + 144;
+    const ACCT_LEN: usize = 8 + 400;
+
+    // 8-byte aligned backing store so bytemuck's from_bytes accepts data[8..].
+    #[repr(C, align(8))]
+    struct Aligned([u8; ACCT_LEN]);
+
+    fn build(seed_slot: u64, reveal_slot: u64, value: [u8; 32]) -> Aligned {
+        assert_eq!(core::mem::size_of::<RandomnessAccountData>(), 400, "SB layout drifted");
+        let mut b = Aligned([0u8; ACCT_LEN]);
+        b.0[..8].copy_from_slice(&DISC);
+        b.0[OFF_SEED_SLOT..OFF_SEED_SLOT + 8].copy_from_slice(&seed_slot.to_le_bytes());
+        b.0[OFF_REVEAL_SLOT..OFF_REVEAL_SLOT + 8].copy_from_slice(&reveal_slot.to_le_bytes());
+        b.0[OFF_VALUE..OFF_VALUE + 32].copy_from_slice(&value);
+        b
+    }
+
+    fn sb_owner() -> Pubkey { Pubkey::new_from_array(ON_DEMAND_DEVNET_PID.to_bytes()) }
+
+    fn code(e: anchor_lang::error::Error) -> u32 {
+        match e {
+            anchor_lang::error::Error::AnchorError(a) => a.error_code_number,
+            _ => panic!("expected AnchorError"),
+        }
+    }
+    fn want(err: HouseError) -> u32 { code(error!(err)) }
+
+    /// commit: a randomness account committed in the immediately prior slot is
+    /// accepted and its seed_slot returned.
+    #[test]
+    fn commit_accepts_fresh_seed_slot() {
+        let buf = build(100, 0, [0u8; 32]);
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        assert_eq!(commit_seed_slot(&info, 101).unwrap(), 100);
+    }
+
+    /// commit: a stale commitment (not the prior slot) is rejected.
+    #[test]
+    fn commit_rejects_stale_seed_slot() {
+        let buf = build(100, 0, [0u8; 32]);
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        // clock 200 => expected seed_slot 199, but it is 100
+        let e = commit_seed_slot(&info, 200).unwrap_err();
+        assert_eq!(code(e), want(HouseError::RandomnessExpired));
+    }
+
+    /// commit: a foreign-owned account (not the Switchboard program) is rejected.
+    #[test]
+    fn commit_rejects_wrong_owner() {
+        let buf = build(100, 0, [0u8; 32]);
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique(); // not Switchboard
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        let e = commit_seed_slot(&info, 101).unwrap_err();
+        assert_eq!(code(e), want(HouseError::InvalidRandomnessAccount));
+    }
+
+    /// commit: a malformed account (bad discriminator) is rejected.
+    #[test]
+    fn commit_rejects_malformed() {
+        let mut buf = build(100, 0, [0u8; 32]);
+        buf.0[0] ^= 0xFF; // corrupt discriminator
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        let e = commit_seed_slot(&info, 101).unwrap_err();
+        assert_eq!(code(e), want(HouseError::InvalidRandomnessAccount));
+    }
+
+    /// settle: matching key + seed_slot, revealed this slot -> returns the value.
+    #[test]
+    fn settle_reads_revealed_value() {
+        let value = [7u8; 32];
+        let buf = build(100, 555, value);
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        assert_eq!(revealed_bytes(&info, key, 100, 555).unwrap(), value);
+    }
+
+    /// settle: the presented account's key must match the snapshot.
+    #[test]
+    fn settle_rejects_wrong_key() {
+        let buf = build(100, 555, [7u8; 32]);
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        let e = revealed_bytes(&info, Pubkey::new_unique(), 100, 555).unwrap_err();
+        assert_eq!(code(e), want(HouseError::InvalidRandomnessAccount));
+    }
+
+    /// settle: a swapped/re-seeded account (seed_slot != snapshot) is rejected.
+    #[test]
+    fn settle_rejects_seed_slot_mismatch() {
+        let buf = build(100, 555, [7u8; 32]);
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        let e = revealed_bytes(&info, key, 999, 555).unwrap_err();
+        assert_eq!(code(e), want(HouseError::InvalidRandomnessAccount));
+    }
+
+    /// settle: value not revealed this slot (reveal_slot != clock) -> not resolved.
+    #[test]
+    fn settle_rejects_unrevealed() {
+        let buf = build(100, 0, [0u8; 32]); // reveal_slot 0
+        let key = Pubkey::new_unique();
+        let owner = sb_owner();
+        let mut data = buf.0;
+        let mut lam = 0u64;
+        let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
+        let e = revealed_bytes(&info, key, 100, 555).unwrap_err();
+        assert_eq!(code(e), want(HouseError::RandomnessNotResolved));
+    }
 }

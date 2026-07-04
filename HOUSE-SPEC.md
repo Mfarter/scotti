@@ -1,7 +1,8 @@
 # Yvone House Module — Specification v0 (draft)
 
-**Status:** H1 shipped — program skeleton on LiteSVM against **mock randomness** (see §8 roadmap;
-spec text below remains v0 draft for review) · **Depends on:** Yvone core (registry/admin patterns) · **Cluster:** devnet only
+**Status:** H2 shipped — deployed to devnet with **live Switchboard On-Demand randomness**; three
+public spins settled + independently verified (see §8 roadmap; spec text below remains v0 draft for
+review) · **Depends on:** Yvone core (registry/admin patterns) · **Cluster:** devnet only
 **Legal posture (fixed):** this module is a devnet demonstration of verifiable, state-dependent
 house games and pooled bankrolls. Real-money operation is a licensed-casino activity AND a pooled
 investment product; that is not a "consult counsel" gray zone and this spec does not pretend otherwise.
@@ -166,8 +167,15 @@ anything.
   smoothing, share minting (1:1 + drifted), pause semantics, and the mock-gate proof. LP
   withdrawals (epoch crank + liquidity floor) are deferred to H3; PendingSpin/LpPosition layouts
   are already sized for them.
-- **H2:** Switchboard On-Demand integration on devnet — real commit/reveal, expiry handling,
-  the `verifySpin` SDK function, devnet smoke with a public spin transaction as the artifact.
+- **H2 (shipped):** Switchboard On-Demand randomness live on devnet. The `revealed_bytes` seam's
+  stub is replaced by real `RandomnessAccountData` parsing: commit enforces `seed_slot == clock-1`
+  and snapshots it; settle re-binds the account key + seed_slot then reads `get_value` (reveal
+  bundled in the settle tx); never-revealed spins route to `spin_expire`. Unit-tested against
+  crafted account bytes; the mock backend stays feature-gated and out of the deployed IDL.
+  Deployed program `EewsDJqfDEEfF8mKhQRED6NSB987LhkKL9wawjM7SBQ`; `scripts/devnet-spin.ts` +
+  `scripts/verify-spin.ts` produced three public, independently-audited spins (see README Devnet).
+  Reveal latency observed ~2–4 s. (The `verifySpin` TypeScript SDK export is folded into H3's SDK
+  work; the standalone `verify-spin.ts` delivers the runnable audit now.)
 - **H3:** Epoch withdrawal crank hardening + curve UX endpoints (SDK reads: current k, tier,
   max bet, share price series).
 - **H4:** Frontend — machine floor UI (each machine showing live RTP/k, depth, tier), spin flow,

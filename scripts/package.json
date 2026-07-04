@@ -1,0 +1,21 @@
+{
+  "name": "house-scripts",
+  "private": true,
+  "type": "module",
+  "description": "Reproducible devnet operations for the Yvone House Module (H2): config, machine, LP seed, live Switchboard spins, and independent spin verification.",
+  "scripts": {
+    "init-config": "node init-config.ts",
+    "create-machine": "node create-machine.ts",
+    "seed-lp": "node seed-lp.ts",
+    "spin": "node devnet-spin.ts",
+    "verify": "node verify-spin.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "@switchboard-xyz/on-demand": "^2.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  }
+}

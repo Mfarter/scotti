@@ -20,6 +20,9 @@ dist/
 !package.json
 !tsconfig.json
 !Anchor.toml
+!scripts/package-lock.json
+# Live devnet spin records (pubkeys, signatures, revealed randomness — no secrets)
+!scripts/spins/*.json
 
 # Program identity keypairs — the on-chain program IDs live here; NEVER commit.
 # Backed up out of target/deploy/ so `cargo clean` cannot destroy them.
