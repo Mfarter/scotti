@@ -1,0 +1,19 @@
+[workspace]
+members = ["programs/house"]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+house = "EewsDJqfDEEfF8mKhQRED6NSB987LhkKL9wawjM7SBQ"
+
+[programs.devnet]
+house = "EewsDJqfDEEfF8mKhQRED6NSB987LhkKL9wawjM7SBQ"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test --workspace"

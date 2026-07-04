@@ -1,6 +1,7 @@
 # Yvone House Module — Specification v0 (draft)
 
-**Status:** Draft for review · **Depends on:** Yvone core (registry/admin patterns) · **Cluster:** devnet only
+**Status:** H1 shipped — program skeleton on LiteSVM against **mock randomness** (see §8 roadmap;
+spec text below remains v0 draft for review) · **Depends on:** Yvone core (registry/admin patterns) · **Cluster:** devnet only
 **Legal posture (fixed):** this module is a devnet demonstration of verifiable, state-dependent
 house games and pooled bankrolls. Real-money operation is a licensed-casino activity AND a pooled
 investment product; that is not a "consult counsel" gray zone and this spec does not pretend otherwise.
@@ -155,9 +156,16 @@ anything.
 ## 8. Roadmap (session-sized)
 
 - **H0 (this repo):** this spec + `house-math` crate with enumeration proofs (delivered, tested).
-- **H1:** House program skeleton — Machine/HouseConfig accounts, create_machine, deposit/LP shares,
-  spin lifecycle against a **mock randomness account** (LiteSVM), full books-balance integration
-  tests including expiry and floor-capped withdrawals.
+- **H1 (shipped):** House program (`programs/house`) — HouseConfig/Machine/LpPosition/PendingSpin
+  accounts; initialize_house_config, update_admin, create_machine, set_paused (curator halt),
+  lp_deposit (share-price mint), spin commit/settle/expire against a **mock randomness account**
+  behind a narrow `revealed_bytes` seam (mock compiled only under a non-default `mock-randomness`
+  feature — absent from the deployable IDL, proven by a test). All odds/exposure/smoothing math
+  delegated to `house-math`. LiteSVM books-balance tests: happy-spin reconciliation, JACKPOT³,
+  max-bet boundary, k-snapshot honored across pool changes, expiry refund, on-chain depth
+  smoothing, share minting (1:1 + drifted), pause semantics, and the mock-gate proof. LP
+  withdrawals (epoch crank + liquidity floor) are deferred to H3; PendingSpin/LpPosition layouts
+  are already sized for them.
 - **H2:** Switchboard On-Demand integration on devnet — real commit/reveal, expiry handling,
   the `verifySpin` SDK function, devnet smoke with a public spin transaction as the artifact.
 - **H3:** Epoch withdrawal crank hardening + curve UX endpoints (SDK reads: current k, tier,

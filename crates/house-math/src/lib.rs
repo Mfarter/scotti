@@ -109,16 +109,42 @@ pub fn base_rtp(t: &Tier) -> (u128, u128) {
 pub const RTP_MIN_BP: u128 = 9_200; // 92%
 pub const RTP_MAX_BP: u128 = 9_700; // 97%
 
-/// k scaler bounds (in bp, 10_000 = 1.0x) for a tier such that
-/// realized RTP = base_rtp * k stays inside the band.
+/// k scaler bounds (in bp, 10_000 = 1.0x) from a tier's exact base-RTP
+/// numerator, such that realized RTP = base_rtp * k stays inside the band.
 /// k_min rounds UP (so RTP >= floor), k_max rounds DOWN (so RTP <= ceiling).
-pub fn k_bounds(t: &Tier) -> (u128, u128) {
-    let (_, num) = base_rtp(t);
+/// `const` so on-chain callers avoid the 32_768-outcome enumeration entirely.
+pub const fn k_bounds_of_num(num: u128) -> (u128, u128) {
     let total = (STOPS * STOPS * STOPS) as u128;
     // realized_rtp_bp = num * k / (total * BP); solve for k at band edges.
     let k_min = (RTP_MIN_BP * total * BP).div_ceil(num);
     let k_max = (RTP_MAX_BP * total * BP) / num;
     (k_min, k_max)
+}
+
+/// k scaler bounds for a tier — enumerates to derive the numerator. Test-time
+/// path; on-chain code must use the pinned [`SHALLOW_K`]/[`DEEP_K`] constants
+/// (base_rtp's 32_768-outcome enumeration would blow the BPF compute budget).
+pub fn k_bounds(t: &Tier) -> (u128, u128) {
+    let (_, num) = base_rtp(t);
+    k_bounds_of_num(num)
+}
+
+// --- O(1) on-chain constants ---------------------------------------------
+// The exact base-RTP numerators, pinned from the full enumeration (and cross-
+// verified in `base_rtp_exact_and_pinned`). On-chain the house program reads
+// the k bounds through these constants rather than enumerating; the proof
+// `const_k_bounds_match_enumeration` guarantees they equal `k_bounds()`, so
+// the enumeration in house-math remains the single source of truth.
+pub const SHALLOW_NUM: u128 = 301_132_000;
+pub const DEEP_NUM: u128 = 302_901_000;
+
+/// (k_min, k_max) in bp for each tier — const-derived from the pinned numerators.
+pub const SHALLOW_K: (u128, u128) = k_bounds_of_num(SHALLOW_NUM);
+pub const DEEP_K: (u128, u128) = k_bounds_of_num(DEEP_NUM);
+
+/// k bounds by tier, O(1). `is_deep` selects DEEP (true) or SHALLOW (false).
+pub const fn k_bounds_const(is_deep: bool) -> (u128, u128) {
+    if is_deep { DEEP_K } else { SHALLOW_K }
 }
 
 /// Piecewise-linear k(D): k_max at/below d_low, k_min at/above d_high.
@@ -271,6 +297,22 @@ mod proofs {
                         "{} k={} floored rtp={}", t.name, k, realized_bp);
             }
         }
+    }
+
+    /// PROOF: the O(1) on-chain k-bound constants equal the enumerated
+    /// `k_bounds()` exactly, for both tiers. This is what lets the house
+    /// program read k bounds without running base_rtp's 32_768-outcome loop
+    /// (which would exceed the BPF compute budget) while keeping the
+    /// enumeration the single source of truth.
+    #[test]
+    fn const_k_bounds_match_enumeration() {
+        assert_eq!(SHALLOW_K, k_bounds(&SHALLOW), "SHALLOW const k-bounds drifted");
+        assert_eq!(DEEP_K, k_bounds(&DEEP), "DEEP const k-bounds drifted");
+        assert_eq!(k_bounds_const(false), k_bounds(&SHALLOW));
+        assert_eq!(k_bounds_const(true), k_bounds(&DEEP));
+        // and the pinned numerators match the enumeration
+        assert_eq!(SHALLOW_NUM, base_rtp(&SHALLOW).1);
+        assert_eq!(DEEP_NUM, base_rtp(&DEEP).1);
     }
 
     /// PROOF: randomness mapping is bias-free (mod 32 over a byte) and total.

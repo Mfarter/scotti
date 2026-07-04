@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/house-math"]
+members = ["crates/house-math", "programs/house"]
+
+[profile.release]
+overflow-checks = true

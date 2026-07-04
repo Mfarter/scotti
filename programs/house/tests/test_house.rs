@@ -1,0 +1,507 @@
+//! LiteSVM integration tests for the House H1 program, under the
+//! `mock-randomness` feature (the whole file is cfg-gated, so plain
+//! `cargo test --workspace` skips it — run with:
+//!
+//!   cargo build-sbf --features mock-randomness   # test .so with the mock
+//!   cargo test -p house --features mock-randomness
+//!
+//! Books-balance discipline: every settlement/expiry is reconciled to the
+//! lamport against house-math's own predicted payout — no hardcoded outcome
+//! numbers. Harness style mirrors the Yvone-Protocol arbiter tests.
+#![cfg(feature = "mock-randomness")]
+
+use {
+    anchor_lang::{
+        solana_program::instruction::Instruction, solana_program::pubkey::Pubkey,
+        solana_program::system_program, AccountDeserialize, InstructionData, ToAccountMetas,
+    },
+    litesvm::LiteSVM,
+    solana_keypair::Keypair,
+    solana_message::{Message, VersionedMessage},
+    solana_signer::Signer,
+    solana_transaction::versioned::VersionedTransaction,
+    yvone_house_math as hm,
+};
+
+// machine params shared by the tests
+const D_LOW: u64 = 1_000_000_000; // 1 SOL
+const D_MID: u64 = 10_000_000_000; // 10 SOL
+const D_HIGH: u64 = 100_000_000_000; // 100 SOL
+const EXPO_BP: u64 = 100; // 1%
+fn window() -> u64 { hm::SMOOTH_WINDOW_SLOTS }
+
+// -------------------- tx plumbing --------------------
+
+fn try_send(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Keypair]) -> Result<(), String> {
+    let bh = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(&[ix], Some(&payer.pubkey()), &bh);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), signers).unwrap();
+    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("err={:?} logs={:#?}", e.err, e.meta.logs))
+}
+fn send(svm: &mut LiteSVM, ix: Instruction, payer: &Keypair, signers: &[&Keypair]) -> bool {
+    try_send(svm, ix, payer, signers).is_ok()
+}
+fn pid() -> Pubkey { house::id() }
+fn boot() -> LiteSVM {
+    let mut svm = LiteSVM::new();
+    svm.add_program(pid(), include_bytes!("../../../target/deploy/house.so")).unwrap();
+    svm
+}
+fn funded(svm: &mut LiteSVM) -> Keypair {
+    let kp = Keypair::new();
+    svm.airdrop(&kp.pubkey(), 500_000_000_000).unwrap(); // 500 SOL
+    kp
+}
+fn lamports(svm: &LiteSVM, k: &Pubkey) -> u64 { svm.get_account(k).map(|a| a.lamports).unwrap_or(0) }
+
+// -------------------- PDAs --------------------
+
+fn config_pda() -> Pubkey { Pubkey::find_program_address(&[b"house-config"], &pid()).0 }
+fn machine_pda(id: &[u8; 16]) -> Pubkey { Pubkey::find_program_address(&[b"machine", id.as_ref()], &pid()).0 }
+fn lp_pda(machine: &Pubkey, owner: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"lp", machine.as_ref(), owner.as_ref()], &pid()).0
+}
+fn spin_pda(machine: &Pubkey, player: &Pubkey, nonce: u64) -> Pubkey {
+    Pubkey::find_program_address(&[b"spin", machine.as_ref(), player.as_ref(), &nonce.to_le_bytes()], &pid()).0
+}
+fn mock_pda(id: &[u8; 16]) -> Pubkey { Pubkey::find_program_address(&[b"mock-rand", id.as_ref()], &pid()).0 }
+
+// -------------------- instruction builders --------------------
+
+fn ix_init(admin: &Pubkey) -> Instruction {
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::InitializeHouseConfig { admin: *admin }.data(),
+        house::accounts::InitializeHouseConfig { config: config_pda(), payer: *admin, system_program: system_program::ID }
+            .to_account_metas(None),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn ix_create(id: [u8; 16], admin: &Pubkey, curator: Pubkey) -> Instruction {
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::CreateMachine {
+            machine_id: id, d_low: D_LOW, d_mid: D_MID, d_high: D_HIGH,
+            max_exposure_bp: EXPO_BP, smooth_window: window(), curator,
+        }.data(),
+        house::accounts::CreateMachine { config: config_pda(), machine: machine_pda(&id), admin: *admin, system_program: system_program::ID }
+            .to_account_metas(None),
+    )
+}
+fn ix_set_paused(id: [u8; 16], curator: &Pubkey, paused: bool) -> Instruction {
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::SetPaused { paused }.data(),
+        house::accounts::SetPaused { machine: machine_pda(&id), curator: *curator }.to_account_metas(None),
+    )
+}
+fn ix_deposit(id: [u8; 16], owner: &Pubkey, amount: u64) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::LpDeposit { amount }.data(),
+        house::accounts::LpDeposit { machine: m, position: lp_pda(&m, owner), owner: *owner, system_program: system_program::ID }
+            .to_account_metas(None),
+    )
+}
+fn ix_commit(id: [u8; 16], player: &Pubkey, randomness: Pubkey, wager: u64, nonce: u64) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::SpinCommit { wager, nonce }.data(),
+        house::accounts::SpinCommit {
+            machine: m, pending_spin: spin_pda(&m, player, nonce), player: *player,
+            randomness, system_program: system_program::ID,
+        }.to_account_metas(None),
+    )
+}
+fn ix_settle(id: [u8; 16], player: &Pubkey, randomness: Pubkey, nonce: u64, cranker: &Pubkey) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::SpinSettle { nonce }.data(),
+        house::accounts::SpinSettle {
+            machine: m, pending_spin: spin_pda(&m, player, nonce), player: *player,
+            randomness, cranker: *cranker, system_program: system_program::ID,
+        }.to_account_metas(None),
+    )
+}
+fn ix_expire(id: [u8; 16], player: &Pubkey, nonce: u64, cranker: &Pubkey) -> Instruction {
+    let m = machine_pda(&id);
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::SpinExpire { nonce }.data(),
+        house::accounts::SpinExpire {
+            machine: m, pending_spin: spin_pda(&m, player, nonce), player: *player,
+            cranker: *cranker, system_program: system_program::ID,
+        }.to_account_metas(None),
+    )
+}
+fn ix_fill(id: [u8; 16], authority: &Pubkey, bytes: [u8; 32]) -> Instruction {
+    Instruction::new_with_bytes(
+        pid(),
+        &house::instruction::MockFillRandomness { id, bytes }.data(),
+        house::accounts::MockFillRandomness { randomness: mock_pda(&id), authority: *authority, system_program: system_program::ID }
+            .to_account_metas(None),
+    )
+}
+
+// -------------------- account readers --------------------
+
+fn read_machine(svm: &LiteSVM, id: &[u8; 16]) -> house::Machine {
+    let a = svm.get_account(&machine_pda(id)).unwrap();
+    house::Machine::try_deserialize(&mut &a.data[..]).unwrap()
+}
+fn read_position(svm: &LiteSVM, machine: &Pubkey, owner: &Pubkey) -> house::LpPosition {
+    let a = svm.get_account(&lp_pda(machine, owner)).unwrap();
+    house::LpPosition::try_deserialize(&mut &a.data[..]).unwrap()
+}
+fn read_spin(svm: &LiteSVM, machine: &Pubkey, player: &Pubkey, nonce: u64) -> house::PendingSpin {
+    let a = svm.get_account(&spin_pda(machine, player, nonce)).unwrap();
+    house::PendingSpin::try_deserialize(&mut &a.data[..]).unwrap()
+}
+fn spin_closed(svm: &LiteSVM, machine: &Pubkey, player: &Pubkey, nonce: u64) -> bool {
+    lamports(svm, &spin_pda(machine, player, nonce)) == 0
+}
+
+// -------------------- house-math mirrors (the single source of truth) --------------------
+
+/// Snapshot the program will compute for a FULLY CONVERGED machine at `depth`.
+/// Returns (is_deep, k_bp, max_bet).
+fn converged_snapshot(depth: u128) -> (bool, u128, u128) {
+    let is_deep = depth >= D_MID as u128;
+    let tier = if is_deep { &hm::DEEP } else { &hm::SHALLOW };
+    let (kmin, kmax) = hm::k_bounds_const(is_deep);
+    let k = hm::k_of_depth(depth, D_LOW as u128, D_HIGH as u128, kmin, kmax);
+    let max_bet = hm::max_bet(depth, EXPO_BP as u128, tier, k);
+    (is_deep, k, max_bet)
+}
+fn tier_of(is_deep: bool) -> &'static hm::Tier { if is_deep { &hm::DEEP } else { &hm::SHALLOW } }
+
+/// Boot an initialized machine funded to `pool` lamports, warped past the
+/// smoothing window so the next commit's snapshot reads smoothed == pool.
+/// Returns (svm, machine_id, admin, curator, lp).
+fn boot_converged(seed: u8, pool: u64) -> (LiteSVM, [u8; 16], Keypair, Keypair, Keypair) {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let curator = funded(&mut svm);
+    let lp = funded(&mut svm);
+    let id = [seed; 16];
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create(id, &admin.pubkey(), curator.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), pool), &lp, &[&lp]));
+    svm.warp_to_slot(window() * 3); // converge smoothing on the next commit
+    (svm, id, admin, curator, lp)
+}
+
+// ============================================================================
+// (a) happy spin — exact reconciliation of pool_value, player, vault vs house-math
+// ============================================================================
+#[test]
+fn a_happy_spin_reconciles_exactly() {
+    let pool = 50_000_000_000; // 50 SOL -> DEEP
+    let (mut svm, id, _admin, _cur, _lp) = boot_converged(0xA1, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+
+    let (is_deep, k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 2) as u64;
+    // 1 cherry (indices: 13=CHERRY, 22/23=BLANK) -> a net house win, payout < wager, payout > 0
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    let reels = hm::reels_from_randomness(&bytes);
+    let expected_payout = u64::try_from(hm::spin_payout(wager as u128, tier_of(is_deep), k, reels)).unwrap();
+    assert!(expected_payout > 0 && expected_payout < wager, "want a nonzero house-win outcome");
+
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+
+    // snapshot recorded exactly what house-math predicts
+    let s = read_spin(&svm, &m, &player.pubkey(), 0);
+    assert_eq!(s.k_bp, k, "snapshot k");
+    assert_eq!(s.tier_is_deep, is_deep, "snapshot tier");
+    let mach = read_machine(&svm, &id);
+    assert_eq!(mach.reserved_exposure, s.max_payout, "reserve == snapshot max_payout");
+    assert_eq!(mach.pool_value, pool, "commit must NOT credit pool_value");
+
+    // reconcile the settle
+    let vault_before = lamports(&svm, &m);
+    let player_before = lamports(&svm, &player.pubkey());
+    let spin_rent = lamports(&svm, &spin_pda(&m, &player.pubkey(), 0));
+
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    let mach2 = read_machine(&svm, &id);
+    assert_eq!(mach2.pool_value, pool + wager - expected_payout, "pool_value += wager - payout");
+    assert_eq!(mach2.reserved_exposure, 0, "reserve fully released");
+    assert_eq!(vault_before - lamports(&svm, &m), expected_payout, "vault debited exactly the payout");
+    assert_eq!(lamports(&svm, &player.pubkey()) - player_before, expected_payout + spin_rent, "player += payout + spin rent");
+    assert!(spin_closed(&svm, &m, &player.pubkey(), 0), "spin closed");
+}
+
+// ============================================================================
+// (b) crafted JACKPOT^3 — payout equals snapshot max_payout, reserves release
+// ============================================================================
+#[test]
+fn b_jackpot_pays_exactly_max_payout() {
+    let pool = 60_000_000_000; // DEEP
+    let (mut svm, id, _a, _c, _lp) = boot_converged(0xB2, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+
+    let (_is_deep, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = max_bet as u64; // bet the boundary
+    let bytes = [0u8; 32]; // STRIP[0]=JACKPOT on every reel -> JACKPOT^3
+
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    let s = read_spin(&svm, &m, &player.pubkey(), 0);
+
+    let vault_before = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // the jackpot is the max outcome: payout == the escrowed reserve exactly
+    assert_eq!(vault_before - lamports(&svm, &m), s.max_payout, "jackpot pays exactly max_payout");
+    let mach = read_machine(&svm, &id);
+    assert_eq!(mach.reserved_exposure, 0, "reserve released after jackpot");
+    assert_eq!(mach.pool_value, pool + wager - s.max_payout, "pool_value folds the (negative) net edge");
+}
+
+// ============================================================================
+// (c) max_bet boundary — both sides
+// ============================================================================
+#[test]
+fn c_max_bet_boundary_both_sides() {
+    let pool = 40_000_000_000;
+    let (mut svm, id, _a, _c, _lp) = boot_converged(0xC3, pool);
+    let player = funded(&mut svm);
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let max_bet = max_bet as u64;
+
+    // exactly max_bet: allowed
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), max_bet, 0), &player, &[&player]));
+    // max_bet + 1: rejected (smoothing unchanged at the same slot => identical bound)
+    let err = try_send(&mut svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), max_bet + 1, 1), &player, &[&player]).unwrap_err();
+    assert!(err.contains("BetExceedsMax"), "expected BetExceedsMax, got {err}");
+}
+
+// ============================================================================
+// (d) k-snapshot honored when pool state changes between commit and settle
+// ============================================================================
+#[test]
+fn d_k_snapshot_survives_pool_change() {
+    let pool = 2_000_000_000; // 2 SOL -> SHALLOW, cold (k near k_max)
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xD4, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+
+    let (is_deep, k1, max_bet) = converged_snapshot(pool as u128);
+    assert!(!is_deep, "start shallow");
+    let wager = (max_bet / 2) as u64;
+    // 3 cherries (13=CHERRY) — an outcome whose payout depends on k and tier
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 13; b[2] = 13; b };
+    let reels = hm::reels_from_randomness(&bytes);
+
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    let s = read_spin(&svm, &m, &player.pubkey(), 0);
+    assert_eq!(s.k_bp, k1);
+
+    // pool state changes drastically before settle: a whale deposits 300 SOL
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), 300_000_000_000), &lp, &[&lp]));
+    let now_pool = read_machine(&svm, &id).pool_value as u128; // 302 SOL -> DEEP, k_min
+
+    let payout_snapshot = u64::try_from(hm::spin_payout(wager as u128, tier_of(is_deep), k1, reels)).unwrap();
+    // what a (wrongly) re-priced settle at current state would pay — must differ
+    let (now_deep, now_k, _) = converged_snapshot(now_pool);
+    let payout_if_repriced = u64::try_from(hm::spin_payout(wager as u128, tier_of(now_deep), now_k, reels)).unwrap();
+    assert_ne!(payout_snapshot, payout_if_repriced, "test is only meaningful if the two differ");
+
+    let vault_before = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+    // settle honored the SNAPSHOT k/tier, not current state
+    assert_eq!(vault_before - lamports(&svm, &m), payout_snapshot, "paid the snapshot payout, not the re-priced one");
+}
+
+// ============================================================================
+// (e) expiry refund
+// ============================================================================
+#[test]
+fn e_expiry_refunds_and_releases() {
+    let pool = 30_000_000_000;
+    let (mut svm, id, _a, _c, _lp) = boot_converged(0xE5, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 2) as u64;
+
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    let reserved = read_machine(&svm, &id).reserved_exposure;
+    assert!(reserved > 0);
+
+    // settle cannot succeed (randomness never resolved), and expire is premature
+    assert!(!send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+    svm.expire_blockhash();
+    let err = try_send(&mut svm, ix_expire(id, &player.pubkey(), 0, &cranker.pubkey()), &cranker, &[&cranker]).unwrap_err();
+    assert!(err.contains("SpinNotExpired"), "premature expire must fail, got {err}");
+
+    // warp past the expiry window and crank expire (fresh blockhash so the
+    // now-valid expire isn't deduped against the premature attempt above)
+    svm.warp_to_slot(window() * 3 + house::EXPIRE_SLOTS + 10);
+    svm.expire_blockhash();
+    let vault_before = lamports(&svm, &m);
+    let player_before = lamports(&svm, &player.pubkey());
+    let spin_rent = lamports(&svm, &spin_pda(&m, &player.pubkey(), 0));
+    let pool_before = read_machine(&svm, &id).pool_value;
+
+    assert!(send(&mut svm, ix_expire(id, &player.pubkey(), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    assert_eq!(vault_before - lamports(&svm, &m), wager, "vault refunds exactly the wager");
+    assert_eq!(lamports(&svm, &player.pubkey()) - player_before, wager + spin_rent, "player += wager + spin rent");
+    let mach = read_machine(&svm, &id);
+    assert_eq!(mach.reserved_exposure, 0, "reserve released on expiry");
+    assert_eq!(mach.pool_value, pool_before, "no edge taken on expiry");
+    assert!(spin_closed(&svm, &m, &player.pubkey(), 0), "spin closed");
+}
+
+// ============================================================================
+// (f) smoothing on-chain — snapshot k reflects SMOOTHED, not spot, depth
+// ============================================================================
+#[test]
+fn f_commit_snapshot_uses_smoothed_depth() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let curator = funded(&mut svm);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let id = [0xF6; 16];
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create(id, &admin.pubkey(), curator.pubkey()), &admin, &[&admin]));
+    let m = machine_pda(&id);
+
+    // small deposit, converge, and a first commit to seat smoothed == A
+    let a_pool: u64 = 2_000_000_000; // 2 SOL, SHALLOW
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), a_pool), &lp, &[&lp]));
+    let base_slot = window() * 2;
+    svm.warp_to_slot(base_slot);
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), 1_000, 0), &player, &[&player]));
+    let mach = read_machine(&svm, &id);
+    assert_eq!(mach.smoothed_value, a_pool as u128, "smoothed seated at A");
+    assert_eq!(mach.smoothed_last_slot, base_slot);
+
+    // whale deposit, then a commit ONE slot later
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), 300_000_000_000), &lp, &[&lp]));
+    let spot = read_machine(&svm, &id).pool_value as u128; // 302 SOL
+    svm.warp_to_slot(base_slot + 1);
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), 1_000, 1), &player, &[&player]));
+    let s = read_spin(&svm, &m, &player.pubkey(), 1);
+
+    // reproduce the on-chain smoothing with house-math and assert the snapshot matches it
+    let mut sd = hm::SmoothedDepth { value: a_pool as u128, last_slot: base_slot };
+    let smoothed = sd.update(spot, base_slot + 1, window());
+    let (sm_deep, sm_k, _) = converged_snapshot(smoothed);
+    assert_eq!(s.tier_is_deep, sm_deep, "tier from smoothed depth");
+    assert_eq!(s.k_bp, sm_k, "k from smoothed depth");
+
+    // and that this is NOT the spot answer (smoothed stays SHALLOW/cold; spot is DEEP/floor)
+    let (spot_deep, spot_k, _) = converged_snapshot(spot);
+    assert!(spot_deep && !sm_deep, "spot is DEEP, smoothed still SHALLOW");
+    assert_ne!(s.k_bp, spot_k, "snapshot k must not be the spot k");
+}
+
+// ============================================================================
+// (g) share minting — 1:1 first, then at a drifted price, exact lamports
+// ============================================================================
+#[test]
+fn g_share_minting_first_and_drifted() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let curator = funded(&mut svm);
+    let lp1 = funded(&mut svm);
+    let lp2 = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    let id = [0x67; 16];
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create(id, &admin.pubkey(), curator.pubkey()), &admin, &[&admin]));
+    let m = machine_pda(&id);
+
+    // first deposit: 1:1 at 1e6 scale
+    let a: u64 = 20_000_000_000; // 20 SOL -> DEEP
+    assert!(send(&mut svm, ix_deposit(id, &lp1.pubkey(), a), &lp1, &[&lp1]));
+    let pos1 = read_position(&svm, &m, &lp1.pubkey());
+    assert_eq!(pos1.shares, a as u128 * house::SHARE_SCALE, "first deposit mints amount * 1e6");
+    let mach = read_machine(&svm, &id);
+    assert_eq!(mach.total_shares, a as u128 * house::SHARE_SCALE);
+    assert_eq!(mach.pool_value, a);
+
+    // drift the price up: a losing spin (3 blanks -> payout 0) accrues the wager to the pool
+    svm.warp_to_slot(window() * 3);
+    let (_d, _k, max_bet) = converged_snapshot(a as u128);
+    let wager = (max_bet / 2) as u64;
+    let blanks = { let mut b = [0u8; 32]; b[0] = 22; b[1] = 23; b[2] = 24; b }; // all BLANK
+    assert_eq!(hm::reels_from_randomness(&blanks), [hm::BLANK, hm::BLANK, hm::BLANK]);
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), blanks), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    let mach2 = read_machine(&svm, &id);
+    assert_eq!(mach2.pool_value, a + wager, "losing spin accrues wager to the pool");
+    assert_eq!(mach2.total_shares, a as u128 * house::SHARE_SCALE, "spins never mint shares");
+
+    // drifted deposit: shares = amount * total_shares / pool_value, exact
+    let b: u64 = 5_000_000_000; // 5 SOL
+    assert!(send(&mut svm, ix_deposit(id, &lp2.pubkey(), b), &lp2, &[&lp2]));
+    let expected = b as u128 * mach2.total_shares / mach2.pool_value as u128;
+    let pos2 = read_position(&svm, &m, &lp2.pubkey());
+    assert_eq!(pos2.shares, expected, "drifted-price shares are exact");
+    assert!(pos2.shares < b as u128 * house::SHARE_SCALE, "drifted price mints fewer shares than 1:1");
+    let mach3 = read_machine(&svm, &id);
+    assert_eq!(mach3.pool_value, a + wager + b, "pool_value tracks deposits + edge to the lamport");
+}
+
+// ============================================================================
+// (h) pause blocks commits, never settle/expire
+// ============================================================================
+#[test]
+fn h_pause_blocks_commit_only() {
+    let pool = 30_000_000_000;
+    let (mut svm, id, _a, curator, _lp) = boot_converged(0x88, pool);
+    let m = machine_pda(&id);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    let wager = (max_bet / 4) as u64;
+
+    // two spins committed before pausing; fill randomness for spin 0
+    let bytes = { let mut b = [0u8; 32]; b[0] = 22; b[1] = 23; b[2] = 24; b }; // losing, payout 0
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), wager, 1), &player, &[&player]));
+
+    // a non-curator cannot pause
+    let rando = funded(&mut svm);
+    let err = try_send(&mut svm, ix_set_paused(id, &rando.pubkey(), true), &rando, &[&rando]).unwrap_err();
+    assert!(err.contains("NotCurator"), "expected NotCurator, got {err}");
+
+    // curator pauses
+    assert!(send(&mut svm, ix_set_paused(id, &curator.pubkey(), true), &curator, &[&curator]));
+    assert!(read_machine(&svm, &id).paused);
+
+    // new commits are blocked
+    let err = try_send(&mut svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), wager, 2), &player, &[&player]).unwrap_err();
+    assert!(err.contains("MachinePaused"), "commit must be blocked while paused, got {err}");
+
+    // but settle of spin 0 still works while paused
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]),
+        "settle must never be blocked by pause");
+
+    // and expire of spin 1 still works while paused (after the window)
+    svm.warp_to_slot(window() * 3 + house::EXPIRE_SLOTS + 10);
+    assert!(send(&mut svm, ix_expire(id, &player.pubkey(), 1, &cranker.pubkey()), &cranker, &[&cranker]),
+        "expire must never be blocked by pause");
+    assert!(spin_closed(&svm, &m, &player.pubkey(), 1));
+}

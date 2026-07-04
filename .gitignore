@@ -1,0 +1,26 @@
+# Rust / Anchor
+target/
+**/*.rs.bk
+
+# Anchor
+.anchor/
+.surfpool/
+test-ledger/
+.DS_Store
+
+# Node
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+
+# Keypairs — NEVER commit these
+*.json
+!package.json
+!tsconfig.json
+!Anchor.toml
+
+# Program identity keypairs — the on-chain program IDs live here; NEVER commit.
+# Backed up out of target/deploy/ so `cargo clean` cannot destroy them.
+keys/
