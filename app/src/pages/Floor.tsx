@@ -12,10 +12,14 @@ export function Floor() {
         <div className="eyebrow">The floor · live on devnet</div>
         <h1 style={{ fontSize: 40 }}>Find the cold machine.</h1>
         <p className="muted" style={{ maxWidth: 620, margin: 0 }}>
-          Every machine's odds are a published function of its pool depth. Shallow, quiet
-          pools pay closer to the ceiling; deep, crowded ones compress to the floor. Sorted by
-          live realized RTP — the hotter the glow, the better the odds right now.
+          Every machine's odds are a published function of its pool depth. Sorted by live realized
+          RTP — the hotter the glow, the better the odds right now.
         </p>
+        <div className="note warn" style={{ maxWidth: 720 }}>
+          <b>The mechanic:</b> cold, shallow pools pay closer to the 97% ceiling; deep pools drop to
+          the 92% floor but unlock the bigger-jackpot (500×) tier. Same house edge — different odds
+          and different volatility.
+        </div>
       </header>
 
       {error && <div className="note bad">Couldn't reach the RPC: {error}. Set <code>VITE_RPC_URL</code> to a devnet endpoint.</div>}

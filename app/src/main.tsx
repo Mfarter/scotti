@@ -7,6 +7,7 @@ import "@solana/wallet-adapter-react-ui/styles.css";
 import "./theme.css";
 
 import { RPC_URL } from "./lib/constants.ts";
+import { SessionProvider } from "./components/SessionProvider.tsx";
 import { Layout } from "./components/Layout.tsx";
 import { Floor } from "./pages/Floor.tsx";
 
@@ -26,6 +27,7 @@ function Root() {
     <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed" }}>
       <WalletProvider wallets={wallets} autoConnect>
         <WalletModalProvider>
+          <SessionProvider>
           <HashRouter>
             <Routes>
               <Route path="/" element={<Layout />}>
@@ -36,6 +38,7 @@ function Root() {
               </Route>
             </Routes>
           </HashRouter>
+          </SessionProvider>
         </WalletModalProvider>
       </WalletProvider>
     </ConnectionProvider>

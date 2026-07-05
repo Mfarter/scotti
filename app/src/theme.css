@@ -149,6 +149,14 @@ h1, h2, h3 { font-family: var(--display); font-weight: 800; letter-spacing: -0.0
 .wallet-adapter-button-trigger { background: linear-gradient(150deg, var(--gold), var(--gold-deep)) !important; color: #1a1408 !important; }
 .wallet-adapter-dropdown-list { right: 0 !important; left: auto !important; }
 
+/* session chips ----------------------------------------------------------- */
+.chips { display: inline-flex; align-items: center; gap: 7px; padding: 7px 12px; border-radius: 999px; border: 1px solid rgba(245,196,81,0.4); background: rgba(245,196,81,0.08); color: var(--gold); font-weight: 800; cursor: pointer; font-family: var(--body); }
+.chips:hover { background: rgba(245,196,81,0.14); }
+.chips-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 9px var(--gold); }
+
+.modal-backdrop { position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.66); backdrop-filter: blur(4px); display: grid; place-items: center; padding: 18px; }
+.modal { width: min(460px, 100%); background: linear-gradient(180deg, var(--panel), var(--bg-2)); border: 1px solid var(--line-2); border-radius: var(--radius); box-shadow: var(--shadow); padding: 22px; max-height: 90vh; overflow-y: auto; }
+
 @media (max-width: 640px) {
   body { font-size: 14px; }
   .nav .wrap { gap: 12px; height: 58px; }

@@ -76,6 +76,19 @@ export function Fair() {
         ))}
       </div>
 
+      <div className="note stack" style={{ gap: 6 }}>
+        <span style={{ fontWeight: 800, fontFamily: "var(--display)" }}>Session chips</span>
+        <span style={{ fontSize: 14 }}>
+          To skip a wallet prompt on every spin, you can buy <b>chips</b>: one wallet confirmation
+          funds an ephemeral key that then plays and auto-settles without prompts. That key's secret
+          is stored in <b>this browser</b> — anyone with access to this browser profile can spend the
+          chips, and clearing site data without cashing out loses them. Your exposure is bounded by
+          the buy-in. Cash out sweeps the balance back to your wallet and clears the key. Devnet only,
+          so this is a convenience demo — a mainnet build would scope and expire such keys far more
+          tightly.
+        </span>
+      </div>
+
       <div className="note warn stack" style={{ gap: 6 }}>
         <span style={{ fontWeight: 800, fontFamily: "var(--display)" }}>The posture, in plain language</span>
         <span style={{ fontSize: 14 }}>

@@ -1,8 +1,10 @@
 # Yvone House Module — Specification v0 (draft)
 
-**Status:** H2 shipped — deployed to devnet with **live Switchboard On-Demand randomness**; three
-public spins settled + independently verified (see §8 roadmap; spec text below remains v0 draft for
-review) · **Depends on:** Yvone core (registry/admin patterns) · **Cluster:** devnet only
+**Status:** H1–H5 shipped — program live on devnet with **Switchboard On-Demand randomness**, LP
+deposits + epoch-gated withdrawals, a three-machine floor placed across the RTP band, and the
+**Scotti** frontend (`app/`) with a session-key "chips" flow (one confirmation per sitting). See §8
+roadmap; spec text below remains v0 draft for review · **Depends on:** Yvone core (registry/admin
+patterns) · **Cluster:** devnet only
 **Legal posture (fixed):** this module is a devnet demonstration of verifiable, state-dependent
 house games and pooled bankrolls. Real-money operation is a licensed-casino activity AND a pooled
 investment product; that is not a "consult counsel" gray zone and this spec does not pretend otherwise.

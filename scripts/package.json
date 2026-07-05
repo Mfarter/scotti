@@ -10,7 +10,8 @@
     "spin": "node devnet-spin.ts",
     "verify": "node verify-spin.ts",
     "status": "node machine-status.ts",
-    "withdraw": "node devnet-withdraw.ts"
+    "withdraw": "node devnet-withdraw.ts",
+    "bootstrap": "node bootstrap-machines.ts"
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",

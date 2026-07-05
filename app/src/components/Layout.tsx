@@ -1,6 +1,7 @@
 import { NavLink, Outlet, Link } from "react-router-dom";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { Banner } from "./Banner.tsx";
+import { SessionWidget } from "./SessionWidget.tsx";
 
 export function Layout() {
   return (
@@ -18,6 +19,7 @@ export function Layout() {
             <NavLink to="/fair" className={({ isActive }) => (isActive ? "on" : "")}>Fair?</NavLink>
           </nav>
           <div className="grow" />
+          <SessionWidget />
           <WalletMultiButton />
         </div>
       </header>

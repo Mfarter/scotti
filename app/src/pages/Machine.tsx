@@ -10,18 +10,19 @@ import { fmtPctBp, fmtSol, fmtLamports, heatColor, rtpHeat } from "../lib/format
 import { Reels, Sol, Stat, TierBadge, Solscan } from "../components/ui.tsx";
 import { VerifyButton } from "../components/Verify.tsx";
 import { MachineStatus } from "../lib/status.ts";
+import { useSession } from "../components/SessionProvider.tsx";
+import { SPIN_OVERHEAD } from "../lib/session.ts";
 
-const STAGE_TEXT: Record<SpinStage, string> = {
-  committing: "Prompt 1 of 2 — approve “place wager” in your wallet",
-  revealing: "Waiting for the Switchboard oracle to reveal (~2–4s)…",
-  settling: "Prompt 2 of 2 — approve “settle & reveal” in your wallet",
-  done: "",
+const stageText = (s: SpinStage, chips: boolean): string => {
+  if (chips) return ({ committing: "Placing wager…", revealing: "Waiting for the Switchboard oracle to reveal (~2–4s)…", settling: "Auto-settling…", done: "" } as Record<SpinStage, string>)[s];
+  return ({ committing: "Prompt 1 of 2 — approve “place wager” in your wallet", revealing: "Waiting for the Switchboard oracle to reveal (~2–4s)…", settling: "Prompt 2 of 2 — approve “settle & reveal” in your wallet", done: "" } as Record<SpinStage, string>)[s];
 };
 
 export function MachinePage() {
   const { pubkey } = useParams();
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
+  const { active: chips, session, balance: chipBalance, sessionSend, refresh: refreshChips } = useSession();
   const { status } = useMachine(pubkey);
 
   const [wager, setWager] = useState<bigint | null>(null);
@@ -36,19 +37,27 @@ export function MachinePage() {
 
   const busy = phase === "committing" || phase === "revealing" || phase === "settling";
   const spinning = busy;
+  // chips (session key) plays promptlessly; otherwise the connected wallet plays
+  // with two prompts. Chips take precedence when a session is active.
+  const player = chips && session ? session.keypair.publicKey : publicKey;
+  const canPlay = chips || connected;
 
   async function spin() {
-    if (!publicKey || !status || !pubkey || !wager) return;
+    if (!player || !status || !pubkey || !wager) return;
     if (wager <= 0n || wager > status.maxBet) { setErr("Wager must be between 1 and the live max bet."); return; }
+    if (chips && chipBalance !== null && chipBalance < wager + SPIN_OVERHEAD) {
+      setErr("Not enough chips to cover this wager plus fees — top up your chips."); return;
+    }
     setErr(null); setResult(null); setPhase("committing");
     try {
       const r = await runSpin({
-        conn: connection, player: publicKey,
+        conn: connection, player,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        sendTransaction: (tx, c, o) => sendTransaction(tx as any, c, o as any),
+        sendTransaction: chips ? sessionSend : ((tx, c, o) => sendTransaction(tx as any, c, o as any)),
         machine: new PublicKey(pubkey), wager, onStage: setPhase,
       });
       setResult(r); setHistory((h) => [r, ...h]); setPhase("done");
+      if (chips) await refreshChips();
     } catch (e) {
       setErr((e as Error).message); setPhase("error");
     }
@@ -89,9 +98,9 @@ export function MachinePage() {
 
         {status.paused && <div className="note warn">This machine is paused by its curator — new spins are halted.</div>}
 
-        {!connected ? (
+        {!canPlay ? (
           <div className="stack" style={{ gap: 10, alignItems: "center" }}>
-            <div className="muted">Connect a devnet wallet to play.</div>
+            <div className="muted">Buy chips (one confirmation, then promptless) or connect a wallet to play.</div>
             <WalletMultiButton />
           </div>
         ) : (
@@ -115,8 +124,14 @@ export function MachinePage() {
             <button className="btn gold big" onClick={spin} disabled={busy || status.paused || !wager}>
               {busy ? "Spinning…" : "Spin"}
             </button>
-            {busy && <div className="note warn spin-anim">{STAGE_TEXT[phase as SpinStage]}</div>}
-            <div className="faint" style={{ fontSize: 12, textAlign: "center" }}>Two wallet prompts per spin: place the wager, then settle &amp; reveal.</div>
+            {busy && <div className="note warn spin-anim">{stageText(phase as SpinStage, chips)}</div>}
+            {chips ? (
+              <div className="faint" style={{ fontSize: 12, textAlign: "center" }}>
+                Playing with chips — no wallet prompts. Balance {chipBalance !== null ? fmtSol(chipBalance, 4) : "…"} SOL · auto-settles on reveal.
+              </div>
+            ) : (
+              <div className="faint" style={{ fontSize: 12, textAlign: "center" }}>Two wallet prompts per spin: place the wager, then settle &amp; reveal. Buy chips to play promptless.</div>
+            )}
           </div>
         )}
 

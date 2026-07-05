@@ -116,25 +116,32 @@ The program is deployed and live on **devnet** (upgrade authority
 |---|---|
 | House program | `EewsDJqfDEEfF8mKhQRED6NSB987LhkKL9wawjM7SBQ` |
 | HouseConfig PDA (`["house-config"]`) | `EdQAnjaMztwffrfDVPszqQDcdkUvw97Qb8Fz9fcVS1yk` |
-| Demo machine `house-demo-1` | `9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1` |
 | Switchboard On-Demand (devnet) | `Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2` |
 
-Demo machine params: `d_low/d_mid/d_high = 0.5 / 2 / 10 SOL`, `max_exposure_bp =
-100` (1%), founding LP bankroll **1 SOL**. It keeps its H2 `smooth_window` of 150
-slots, but **that hack is no longer needed**: H3's cold-start fix seeds the
-smoothed depth to the founding bankroll at the first deposit, so new machines
-created with the production ~9000-slot (~1h) window offer full `max_bet`
-immediately. The machine also predates H3's `epoch_length` field and so reads it
-as 0, falling back to the default (1350 slots ≈ 9 min) — no migration; the H2
-spins and this machine keep working.
+The floor is **three machines** placed at visibly different points on their
+k-curves so the depth↔RTP economics are legible at a glance — two shallow
+(50× frequent-win) at the ceiling and mid-band, one deep (500× jackpot) at the
+floor:
+
+| machine | address | placement |
+|---|---|---|
+| `house-demo-1` | `9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1` | near ceiling · SHALLOW · **~96.7%** |
+| `Cold Comfort` | `4Tb4cW8vn4P1aR4Wwnfd1pLZ7hF942FmrLaKWPogzmeD` | mid-band · SHALLOW · **~94.5%** |
+| `Leviathan` | `6zsjba9sbx7v8fPrnvyrUDoL1dDaaWcXaigq9swsF2uC` | at the floor · DEEP · **~92%** · 500× jackpot |
+
+The floor manifest (`scripts/machines.ts`) is the source of truth for each
+machine's band and founding seed; `npm run bootstrap` creates and seeds any that
+are missing (idempotent). The two new machines use the production `smooth_window`
+of 9000 slots — H3's cold-start fix seeds the smoothed depth to the founding
+bankroll, so they offer full `max_bet` immediately, no 150-slot hack. `house-demo-1`
+keeps its original 150-slot window and 0 `epoch_length` (→ 1350-slot default); it
+and its H2 spins keep working untouched.
 
 ### Run a spin (and audit it)
 
 ```sh
 cd scripts && npm install
-npm run init-config            # once: HouseConfig, admin = deploy wallet
-SMOOTH_WINDOW=150 npm run create-machine
-npm run seed-lp                # deposit ~1 SOL as the founding LP
+npm run bootstrap              # config + create/seed every machine in machines.ts (idempotent)
 npm run spin                   # a throwaway player: commit → reveal → settle
 npm run verify spins/<sig>.json  # recompute the outcome from chain data
 npm run status [lpOwnerPubkey] # live machine status (the frontend data contract)
@@ -195,7 +202,7 @@ Exact to the lamport; the 1-lamport gap vs the deposit is flooring dust that
 stays in the pool (accrues to the remaining LP). Process tx:
 [`3BT9ez…fjAfPe`](https://solscan.io/tx/3BT9ezJT6kV5eag8ypLc7WaedcyKBdrgHZUHrBfRUrrVJ6tyXjs18ju7fPM5vRZztvxFDN1i2eJ3zaR8s4fjAfPe?cluster=devnet).
 
-## App (H4 — the Scotti frontend)
+## App (H4/H5 — the Scotti frontend)
 
 `app/` is **Scotti**, a standalone Vite + React + TypeScript site — its own brand,
 its own `package.json`, no shared identity or code with Showdown. It reads the
@@ -205,13 +212,30 @@ renders the live `machineStatus` data contract, runs the spin flow ported from
 spin's outcome in the browser (the `verify-spin` logic). Every page carries the
 persistent devnet banner.
 
-Pages: **The Floor** (all machines, sorted by realized RTP — the glow runs hotter
-as the odds improve), **Machine** (three-reel spin with two honest wallet prompts,
-payout math, Solscan links, and per-spin in-browser Verify), **Liquidity**
-(position, deposit, epoch-gated request/cancel, a permissionless process crank,
-and an honest yield display — share price + an EV calculator + variance warning,
-explicitly not an APY), and **Fair?** (the trust story + the three H2 spins,
-each verifiable in-browser).
+Pages: **The Floor** (the three machines above, sorted by realized RTP — the glow
+runs hotter as the odds improve, with a one-line explainer of the depth↔odds
+mechanic), **Machine** (three-reel spin, payout math, Solscan links, per-spin
+in-browser Verify), **Liquidity** (position, deposit, epoch-gated request/cancel,
+a permissionless process crank, and an honest yield display — share price + an EV
+calculator + variance warning, `edge × volume ÷ pool`, explicitly not an APY),
+and **Fair?** (the trust story + the three H2 spins, each verifiable in-browser).
+
+### Session chips (H5 — one confirmation per sitting)
+
+By default a spin needs two wallet prompts (place wager, settle). **Buy chips** to
+skip them: one wallet-signed transfer funds an ephemeral browser key (stored in
+`localStorage`), which then plays as player + payer — spins and settles are
+**promptless and auto-settle** on reveal. The header shows the live chip balance;
+**Cash out** sweeps the balance (minus the base fee) back to your wallet, signed
+by the session key, and clears storage; **Top up** adds more. Client-side only,
+no program change. The sharp edges are handled: a wager the chips can't cover is
+refused with a top-up nudge; a pending spin blocks cash-out (never strand a
+`PendingSpin`); reconnecting a different main wallet shows provenance and asks
+where to sweep (original vs current) rather than silently redirecting; and the
+sweep drains the 0-data session account to exactly zero (no rent dust). The
+honesty is stated in the buy-in modal and on the Fair page: the chips live behind
+a browser-stored key — anyone with this browser profile can spend them, clearing
+site data without cashing out loses them, and the loss is bounded by the buy-in.
 
 ### Run it
 
@@ -237,12 +261,21 @@ The app uses hash routing (`/#/machine/…`), so **no SPA rewrite rule is needed
 point the host at `app/` with build command `npm run build` and output directory
 `dist`, set `VITE_RPC_URL` as an environment variable, and that's it.
 
-### Verified (H4)
+### Verified (H4/H5)
 
-Headless (Playwright) against the live devnet demo machine: the Floor renders
-`house-demo-1` from chain with its live RTP; the in-browser **Verify** recomputes
-an H2 artifact and matches the on-chain payout to the lamport (`50108 == 50108`);
-the Floor and Machine pages have no horizontal overflow at 380px; console clean.
-The app's own ported `spin_commit`/`spin_settle` builders were run against devnet
-and settled a real spin reconciled to the lamport. The only step needing a human
-is the wallet-signature popup itself (standard wallet-adapter plumbing).
+Headless (Playwright) against the live devnet floor: it renders all **three**
+machines with the RTP spread (`96.74 / 94.5 / 92`), correctly sorted descending,
+the DEEP 500× badge on `Leviathan`, the mechanic explainer, and the persistent
+banner; the buy-in modal shows the chips honesty text; the in-browser **Verify**
+recomputes an H2 artifact and matches the on-chain payout to the lamport
+(`50108 == 50108`); no horizontal overflow at 380px; console clean; `npm run
+build` clean.
+
+The two paths a headless browser can't drive without a human were exercised
+against devnet with node harnesses reusing the app's own code: the ported
+`spin_commit`/`spin_settle` builders settled a real spin (reconciled to the
+lamport), and the **promptless chips flow** — buy-in → three session-key spins
+(auto-settle) → cash-out sweep — reconciled exactly (session drained to zero,
+main wallet received exactly the swept amount). The only step still needing a
+human is the single wallet-signature popup (connect, then buy-in or a wallet-mode
+spin) — standard wallet-adapter plumbing.

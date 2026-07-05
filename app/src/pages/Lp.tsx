@@ -191,8 +191,13 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
           <span className="faint" style={{ fontSize: 13 }}>SOL/day</span>
         </div>
         <div className="mono" style={{ fontSize: 13.5 }}>
-          edge × volume ÷ pool → the pool is expected to earn <b>{dailyEdgeSol.toFixed(4)} SOL/day</b>
+          expected yield = edge × volume ÷ pool → the pool earns <b>{dailyEdgeSol.toFixed(4)} SOL/day</b>
           {pool > 0 && <> (~{dailyPct.toFixed(3)}%/day, ~{yearlyPct.toFixed(1)}%/yr on current depth)</>} — <b>before variance</b>.
+        </div>
+        <div className="faint" style={{ fontSize: 12.5 }}>
+          The rate is edge × volume ÷ pool: a smaller pool with the same routed volume runs a
+          <b> hotter rate</b> — because the same edge is spread over less capital, <i>not</i> because your
+          deposit is a bigger slice. More depositors at the same volume dilute the rate for everyone.
         </div>
       </div>
 
