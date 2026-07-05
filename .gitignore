@@ -21,6 +21,7 @@ dist/
 !tsconfig.json
 !Anchor.toml
 !scripts/package-lock.json
+!app/package-lock.json
 # Live devnet spin records (pubkeys, signatures, revealed randomness — no secrets)
 !scripts/spins/*.json
 

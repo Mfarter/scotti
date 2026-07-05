@@ -207,5 +207,11 @@ anything.
   in place on devnet (same id) — the pre-H3 demo machine keeps working via the epoch_length=0
   legacy default. Live-verified: a throwaway LP deposit → request → epoch wait → crank, exact
   lamports.
-- **H4:** Frontend — machine floor UI (each machine showing live RTP/k, depth, tier), spin flow,
-  LP dashboard with the three-number yield display.
+- **H4 (shipped):** Standalone frontend **Scotti** (`app/`, Vite + React + TS; own brand, no shared
+  code with Showdown). The Floor (machines sorted by live realized RTP, RTP-glow keyed to k), the
+  Machine spin experience (two honest wallet prompts, reels mapped from the strip, payout math,
+  in-browser Verify), the LP dashboard (deposit / epoch-gated withdraw / permissionless crank +
+  honest yield display: share price, EV calculator, variance warning, no APY), and the Fair page
+  (trust story + the three H2 spins verifiable in-browser). Reads chain directly (no backend);
+  Switchboard SDK bundled for the browser via node polyfills. Verified headless against the live
+  demo machine (README App section).

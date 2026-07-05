@@ -194,3 +194,55 @@ and a permissionless `process_withdrawals` (cranked by the deploy wallet) paid:
 Exact to the lamport; the 1-lamport gap vs the deposit is flooring dust that
 stays in the pool (accrues to the remaining LP). Process tx:
 [`3BT9ez…fjAfPe`](https://solscan.io/tx/3BT9ezJT6kV5eag8ypLc7WaedcyKBdrgHZUHrBfRUrrVJ6tyXjs18ju7fPM5vRZztvxFDN1i2eJ3zaR8s4fjAfPe?cluster=devnet).
+
+## App (H4 — the Scotti frontend)
+
+`app/` is **Scotti**, a standalone Vite + React + TypeScript site — its own brand,
+its own `package.json`, no shared identity or code with Showdown. It reads the
+chain directly (no backend): it enumerates machines via `getProgramAccounts`,
+renders the live `machineStatus` data contract, runs the spin flow ported from
+`scripts/devnet-spin.ts` against a wallet-adapter wallet, and recomputes any
+spin's outcome in the browser (the `verify-spin` logic). Every page carries the
+persistent devnet banner.
+
+Pages: **The Floor** (all machines, sorted by realized RTP — the glow runs hotter
+as the odds improve), **Machine** (three-reel spin with two honest wallet prompts,
+payout math, Solscan links, and per-spin in-browser Verify), **Liquidity**
+(position, deposit, epoch-gated request/cancel, a permissionless process crank,
+and an honest yield display — share price + an EV calculator + variance warning,
+explicitly not an APY), and **Fair?** (the trust story + the three H2 spins,
+each verifiable in-browser).
+
+### Run it
+
+```sh
+cd app
+cp .env.example .env       # set VITE_RPC_URL to a devnet RPC (public is fine, rate-limited)
+npm install
+npm run dev                # http://localhost:5173
+npm run build              # tsc + vite build → dist/  (clean)
+npm run preview            # serve the production build
+```
+
+`VITE_RPC_URL` is the only config and is never committed (`.env` is gitignored;
+`.env.example` documents it). The lib layer (`app/src/lib/`) is a browser port of
+`scripts/common.ts` — house-math, PDAs, decoders, `machineStatus`/`lpStatus`, the
+spin flow, and the verifier — using a browser `sha256` and node polyfills for the
+Switchboard SDK (`vite-plugin-node-polyfills`); the `scripts/` are untouched.
+
+### Static deploy (Vercel / Netlify / any static host)
+
+There is no server — it's all chain reads — so deploy `dist/` as static files.
+The app uses hash routing (`/#/machine/…`), so **no SPA rewrite rule is needed**;
+point the host at `app/` with build command `npm run build` and output directory
+`dist`, set `VITE_RPC_URL` as an environment variable, and that's it.
+
+### Verified (H4)
+
+Headless (Playwright) against the live devnet demo machine: the Floor renders
+`house-demo-1` from chain with its live RTP; the in-browser **Verify** recomputes
+an H2 artifact and matches the on-chain payout to the lamport (`50108 == 50108`);
+the Floor and Machine pages have no horizontal overflow at 380px; console clean.
+The app's own ported `spin_commit`/`spin_settle` builders were run against devnet
+and settled a real spin reconciled to the lamport. The only step needing a human
+is the wallet-signature popup itself (standard wallet-adapter plumbing).
