@@ -21,6 +21,15 @@ export function fmtPctBp(bp: bigint, dp = 2): string {
 export function shortKey(k: string, n = 4): string {
   return k.length <= n * 2 + 1 ? k : `${k.slice(0, n)}…${k.slice(-n)}`;
 }
+/** Token base units → a whole-token string with `dp` decimals (thousands-grouped). */
+export function fmtTokens(base: bigint, dec: number, dp = 2): string {
+  const neg = base < 0n; const a = neg ? -base : base;
+  const unit = 10n ** BigInt(dec);
+  const whole = a / unit;
+  const frac = ((a % unit) * 10n ** BigInt(dp)) / unit;
+  const wholeStr = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  return `${neg ? "-" : ""}${wholeStr}${dp > 0 ? "." + frac.toString().padStart(dp, "0") : ""}`;
+}
 
 // -------------------- RTP heat glow --------------------
 // A machine's colour is its live odds. High realized RTP (a "cold" machine —

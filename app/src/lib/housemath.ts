@@ -83,3 +83,31 @@ export function realizedRtpBp(isDeep: boolean, k: bigint): bigint {
   const total = STOPS * STOPS * STOPS;
   return (num * k) / (total * BP);
 }
+
+// -------------------- dual-asset token payout (mirrors crates/house-math/src/payout.rs) --------------------
+
+export const LAMPORTS_PER_SOL = 1_000_000_000n;
+export const PRICE_SCALE = 1_000_000_000_000n; // 1e12, the price_1e12 fixed point
+/** LAMPORTS_PER_SOL · BP² · PRICE_SCALE = 1e29. BigInt is exact, no wide_mul_div needed. */
+export const PAYOUT_DENOM = LAMPORTS_PER_SOL * BP * BP * PRICE_SCALE;
+export const pow10 = (dec: number): bigint => 10n ** BigInt(dec);
+
+/** Dual k-bounds: like the single-asset bounds but the ceiling respects the
+ * machine's validated RTP cap (rtp_max_bp), not the fixed 9700 (spec §4). */
+export function kBoundsDual(num: bigint, rtpMaxBp: bigint): [bigint, bigint] {
+  const total = STOPS * STOPS * STOPS;
+  return [ceilDiv(9200n * total * BP, num), (rtpMaxBp * total * BP) / num];
+}
+
+/** payout in token base units: wager·mult·k·price·10^dec / 1e29 (payout.rs). */
+export function payoutTokens(wagerLamports: bigint, multBp: bigint, kBp: bigint, price1e12: bigint, dec: number): bigint {
+  return (wagerLamports * multBp * kBp * pow10(dec) * price1e12) / PAYOUT_DENOM;
+}
+export function spinPayoutTokens(wagerLamports: bigint, t: Tier, kBp: bigint, symbols: number[], price1e12: bigint, dec: number): bigint {
+  return payoutTokens(wagerLamports, payoutBp(t, symbols), kBp, price1e12, dec);
+}
+/** token payout → its SOL value in lamports (display + curve depth). */
+export function payoutValueLamports(payoutTok: bigint, price1e12: bigint, dec: number): bigint {
+  const denom = price1e12 * pow10(dec);
+  return denom === 0n ? 0n : (payoutTok * LAMPORTS_PER_SOL * PRICE_SCALE) / denom;
+}

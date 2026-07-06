@@ -8,6 +8,7 @@ import { confirm } from "../lib/rpc.ts";
 import { SOL } from "../lib/constants.ts";
 import { fmtPctBp, fmtLamports } from "../lib/format.ts";
 import { Sol, Stat } from "../components/ui.tsx";
+import { DualLpPanel } from "./DualLpPanel.tsx";
 
 function parseSol(s: string): bigint | null {
   const n = Number(s);
@@ -161,6 +162,9 @@ export function Lp() {
           <Yield status={status} />
         </div>
       )}
+
+      <div className="hr" style={{ margin: "8px 0" }} />
+      <DualLpPanel />
     </div>
   );
 }

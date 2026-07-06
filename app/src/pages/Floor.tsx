@@ -1,11 +1,12 @@
 import { Link } from "react-router-dom";
-import { useFloor } from "../lib/hooks.ts";
+import { useFloor, useDualFloor, DualFloorEntry } from "../lib/hooks.ts";
 import { MachineStatus } from "../lib/status.ts";
-import { fmtPctBp, fmtSol, heatColor, rtpHeat } from "../lib/format.ts";
-import { TierBadge } from "../components/ui.tsx";
+import { fmtPctBp, fmtSol, fmtTokens, heatColor, rtpHeat } from "../lib/format.ts";
+import { TierBadge, PriceChip } from "../components/ui.tsx";
 
 export function Floor() {
   const { entries, error } = useFloor();
+  const { entries: dualEntries } = useDualFloor();
   return (
     <div className="stack" style={{ gap: 24 }}>
       <header className="stack" style={{ gap: 8 }}>
@@ -28,8 +29,56 @@ export function Floor() {
 
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))" }}>
         {entries?.map((e) => <MachineCard key={e.pubkey.toBase58()} s={e.status} />)}
+        {dualEntries?.map((e) => <DualMachineCard key={e.pubkey.toBase58()} e={e} />)}
       </div>
+
+      {dualEntries && dualEntries.length > 0 && (
+        <div className="note" style={{ maxWidth: 720 }}>
+          <b>Dual-asset machines</b> take a SOL wager and pay a token (CHIP) prize, priced by the
+          pool's on-chain TWAP. Their price-status chip is the machine's own commit gate, computed in
+          your browser from the live pool — <b>LIVE</b> (fresh &amp; in-band), <b>PRICE UNSTABLE</b>
+          (spot drifted past the band), or <b>STALE</b> (the price feed went quiet).
+        </div>
+      )}
     </div>
+  );
+}
+
+function DualMachineCard({ e }: { e: DualFloorEntry }) {
+  const s = e.status;
+  const live = s.price.kind === "LIVE";
+  const heat = s.realizedRtpBp !== null ? rtpHeat(s.realizedRtpBp) : 0.5;
+  const glow = live ? heatColor(heat) : "var(--ink-faint)";
+  return (
+    <Link to={`/dual/${s.machine}`} className="card pad stack" style={{ gap: 16, position: "relative", overflow: "hidden" }}>
+      <div aria-hidden style={{ position: "absolute", inset: 0, background: `radial-gradient(120px 90px at 85% 0%, ${heatColor(heat, live ? 0.16 : 0.05)}, transparent 70%)`, pointerEvents: "none" }} />
+      <div className="spread" style={{ alignItems: "flex-start" }}>
+        <div className="stack" style={{ gap: 4 }}>
+          <h3 style={{ fontSize: 21 }}>{s.name}</h3>
+          <span className="tag" style={{ color: "var(--neon, #7ce7c4)" }}>dual · pays CHIP</span>
+        </div>
+        <div className="stack" style={{ gap: 6, alignItems: "flex-end" }}>
+          <PriceChip kind={s.price.kind} label={s.price.label} title={s.price.reason} />
+          {s.paused && <span className="badge paused">Paused</span>}
+        </div>
+      </div>
+      <div className="row" style={{ gap: 14, alignItems: "baseline" }}>
+        <div style={{ fontFamily: "var(--display)", fontWeight: 900, fontSize: 40, lineHeight: 1, color: glow, textShadow: live ? `0 0 26px ${heatColor(heat, 0.5)}` : "none" }} className="num">
+          {s.realizedRtpBp !== null ? fmtPctBp(s.realizedRtpBp) : "—"}
+        </div>
+        <div className="stack" style={{ gap: 0 }}>
+          <span className="tag">realized RTP</span>
+          <span className="faint" style={{ fontSize: 12 }}>band {fmtPctBp(s.rtpFloorBp, 0)}–{fmtPctBp(s.rtpMaxBp, 0)}</span>
+        </div>
+      </div>
+      <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Mini k="pool depth" v={`${fmtTokens(s.tokenBalance, s.tokenDecimals, 0)} CHIP`} />
+        <Mini k="depth value" v={s.tokenValueLamports !== null ? `${fmtSol(s.tokenValueLamports, 3)} SOL` : "—"} />
+        <Mini k="spot" v={s.price.spot !== null ? `${s.price.spot.toFixed(1)} CHIP/SOL` : "—"} />
+        <Mini k="max bet" v={s.maxBetLamports !== null ? `${fmtSol(s.maxBetLamports, 5)} SOL` : "—"} />
+      </div>
+      <div className="row" style={{ gap: 6, color: "var(--gold)", fontWeight: 700, fontSize: 14 }}>Play this machine →</div>
+    </Link>
   );
 }
 

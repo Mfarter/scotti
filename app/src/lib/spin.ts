@@ -4,7 +4,7 @@
 //   tx 2 ("settle & reveal")= [SB reveal, spin_settle]            (wallet)
 // Between them we poll the Switchboard oracle for the reveal (~2-4s).
 import {
-  ComputeBudgetProgram, Connection, Keypair, PublicKey, Signer,
+  ComputeBudgetProgram, Connection, Keypair, PublicKey, type Signer,
   TransactionInstruction, TransactionMessage, VersionedTransaction,
 } from "@solana/web3.js";
 import { getDefaultDevnetQueue, Randomness } from "@switchboard-xyz/on-demand";

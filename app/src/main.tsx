@@ -14,6 +14,7 @@ import { Floor } from "./pages/Floor.tsx";
 // Machine page pulls in the (heavy) Switchboard SDK for the spin flow — lazy so
 // the Floor/Liquidity/Fair pages don't pay for it up front.
 const MachinePage = lazy(() => import("./pages/Machine.tsx").then((m) => ({ default: m.MachinePage })));
+const DualMachinePage = lazy(() => import("./pages/DualMachine.tsx").then((m) => ({ default: m.DualMachinePage })));
 const Lp = lazy(() => import("./pages/Lp.tsx").then((m) => ({ default: m.Lp })));
 const Fair = lazy(() => import("./pages/Fair.tsx").then((m) => ({ default: m.Fair })));
 
@@ -33,6 +34,7 @@ function Root() {
               <Route path="/" element={<Layout />}>
                 <Route index element={<Floor />} />
                 <Route path="machine/:pubkey" element={<Suspense fallback={<Loading />}><MachinePage /></Suspense>} />
+                <Route path="dual/:pubkey" element={<Suspense fallback={<Loading />}><DualMachinePage /></Suspense>} />
                 <Route path="lp" element={<Suspense fallback={<Loading />}><Lp /></Suspense>} />
                 <Route path="fair" element={<Suspense fallback={<Loading />}><Fair /></Suspense>} />
               </Route>

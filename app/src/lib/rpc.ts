@@ -1,7 +1,7 @@
 import { Connection, PublicKey, Transaction, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { RPC_URL, PROGRAM_ID } from "./constants.ts";
-import { acctDisc, decodeMachine, Machine } from "./program.ts";
+import { acctDisc, decodeMachine, type Machine } from "./program.ts";
 import { Buffer } from "buffer";
 
 let _conn: Connection | null = null;

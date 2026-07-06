@@ -32,6 +32,19 @@ export function TierBadge({ tier, topMult, paused }: { tier: string; topMult: nu
   return <span className={`badge ${tier}`}>{tier} · {topMult}× top</span>;
 }
 
+/** The client-side price-status of a dual machine's pool: the SAME gate the
+ * on-chain spin_commit_dual applies (staleness → STALE, band → PRICE UNSTABLE). */
+export function PriceChip({ kind, label, title }: { kind: "LIVE" | "UNSTABLE" | "STALE"; label: string; title?: string }) {
+  const color = kind === "LIVE" ? "var(--good, #57d9a3)" : kind === "UNSTABLE" ? "var(--gold)" : "var(--ink-faint)";
+  const bg = kind === "LIVE" ? "rgba(87,217,163,0.10)" : kind === "UNSTABLE" ? "rgba(245,196,81,0.10)" : "rgba(255,255,255,0.05)";
+  return (
+    <span title={title} className="badge" style={{ color, borderColor: color, background: bg, display: "inline-flex", gap: 6, alignItems: "center" }}>
+      <span aria-hidden style={{ width: 7, height: 7, borderRadius: 99, background: color, boxShadow: kind === "LIVE" ? `0 0 8px ${color}` : "none" }} />
+      {label}
+    </span>
+  );
+}
+
 export function Solscan({ tx, acct, children }: { tx?: string; acct?: string; children?: React.ReactNode }) {
   const href = tx ? solscanTx(tx) : solscanAcct(acct!);
   const label = children ?? shortKey(tx ?? acct ?? "");

@@ -76,6 +76,43 @@ export function Fair() {
         ))}
       </div>
 
+      <div className="stack" style={{ gap: 12 }}>
+        <h2 style={{ fontSize: 24 }}>Dual-asset machines (SOL in, CHIP out)</h2>
+        <p className="muted" style={{ margin: 0 }}>
+          A dual machine takes a SOL wager and pays a <b>token</b> (CHIP) prize, priced by the pool's
+          on-chain price. The same "verify everything" discipline applies, with three extra guards
+          worth stating plainly (full detail in <b>H6-DUAL-ASSET-SPEC.md</b>).
+        </p>
+        <div className="card pad stack" style={{ gap: 20 }}>
+          <Step n={1} title="Priced at the TWAP, not the spot">
+            The prize is priced at a <span className="mono">time-weighted average price</span> snapshotted at
+            commit — never the instantaneous spot. A single-block price wick can't move your payout, and (like
+            the single-asset odds) the snapshot is frozen: a price move between commit and settle can't re-price it.
+          </Step>
+          <Step n={2} title="Two gates — the machine refuses rather than misprice">
+            The commit is gated by <b>staleness</b> (the newest observation must be fresh — else <b>STALE</b>) and a
+            <b> band</b> (spot must sit within <span className="mono">band_bp</span> of the TWAP — else <b>PRICE
+            UNSTABLE</b>). Out of gate, the machine <i>refuses the spin</i>; it never pays at a manipulated price.
+            The Floor's price-status chip computes this exact gate in your browser from the live pool.
+          </Step>
+          <Step n={3} title="Haircut reserve — every prize is pre-funded">
+            At commit the machine reserves the worst-case payout (the JACKPOT³ line) plus a <b>haircut</b> from the
+            token vault, and proves that reserve covers every outcome. So a booked spin can always be paid; the
+            unused remainder releases at settle.
+          </Step>
+          <Step n={4} title="A margin floor that survives the worst case">
+            Even at the machine's maximum RTP <i>and</i> spot at the very top of the band, the effective payout stays
+            bounded: <span className="mono">95% × (1 + 3%) = 97.85% ≤ 98%</span>. <span className="mono">create_machine_dual</span> validates
+            this invariant on-chain, so the house keeps a <b>≥ 2% margin</b> no matter where price sits in the band.
+          </Step>
+          <Step n={5} title="Effective RTP at spot — the honest hedge">
+            Because the prize is priced at the TWAP but you receive CHIP worth the <i>spot</i>, your effective return is
+            <span className="mono"> nominal RTP × spot/TWAP</span>. When spot is below the TWAP it reads <b>below</b> nominal;
+            above, above. The machine page shows this live and never clamps it — the price hedge, stated both ways.
+          </Step>
+        </div>
+      </div>
+
       <div className="note stack" style={{ gap: 6 }}>
         <span style={{ fontWeight: 800, fontFamily: "var(--display)" }}>Session chips</span>
         <span style={{ fontSize: 14 }}>
