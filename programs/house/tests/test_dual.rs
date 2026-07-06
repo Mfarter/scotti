@@ -544,6 +544,11 @@ fn params_expo(id: &[u8; 16], expo_bp: u64) -> house::DualParams {
     p.max_exposure_bp = expo_bp;
     p
 }
+fn params_cap(id: &[u8; 16], cap: u16) -> house::DualParams {
+    let mut p = params(id);
+    p.max_pending_spins = cap;
+    p
+}
 fn read_position(svm: &LiteSVM, id: &[u8; 16], owner: &Pubkey) -> house::DualLpPosition {
     let a = svm.get_account(&dlp(&dmachine(id), owner)).unwrap();
     house::DualLpPosition::try_deserialize(&mut &a.data[..]).unwrap()
@@ -936,4 +941,283 @@ fn k_withdraw_both_assets_books_balance() {
     // did not lose SOL and the token side moved. Books still balance (checked).
     assert!(lamports(&svm, &lp1.pubkey()) >= sol_before, "withdraw never costs the LP SOL");
     let _ = admin;
+}
+
+// ============================================================================
+// SCALE-1 analysis demonstrations (dual-asset). See SCALE.md.
+// ============================================================================
+
+/// init + create a dual machine with a custom pending-spin cap; in-band price.
+fn boot_cap(seed: u8, cap: u16) -> (LiteSVM, [u8; 16], Pubkey, Keypair) {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let id = [seed; 16];
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create_dual(id, &admin.pubkey(), admin.pubkey(), mint, params_cap(&id, cap)), &admin, &[&admin]), "create");
+    assert!(send(&mut svm, ix_set_price(id, &admin.pubkey(), PRICE, PRICE, 5), &admin, &[&admin]), "price");
+    (svm, id, mint, admin)
+}
+
+// (scale-2) PENDING-SPIN SLOT CONTENTION. `max_pending_spins` caps concurrent
+// dual pending spins; commits are first-come. A bot fills every slot (here cap=3)
+// with tiny wagers and the next commit is DENIED (TooManyPendingSpins). The hold
+// cost is only the escrowed wager (refunded) + tx fee — the token reserve is drawn
+// from the MACHINE's own vault, not the bot's capital. What frees a slot is a
+// settle (needs a reveal the bot won't provide) or a PERMISSIONLESS expire after
+// EXPIRE_SLOTS (~9000 slots ≈ 1h): a stranger expires an abandoned spin and the
+// machine self-heals. Bucket B (cheap griefing of commits, self-healing, no funds
+// at risk); mitigation (per-committer cap / commit bond) sketched in SCALE.md.
+#[test]
+fn scale_e_pending_cap_denies_then_permissionlessly_heals() {
+    let (mut svm, id, mint, admin) = boot_cap(0xF3, 3);
+    let lp = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp, 100_000); // token liquidity
+    let bot = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&bot.pubkey(), &mint), &mint, &bot.pubkey(), 0);
+    assert!(send(&mut svm, ix_fill(id, &bot.pubkey(), [22, 23, 24, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]), &bot, &[&bot]));
+
+    let wager: u64 = 1_000_000; // 0.001 SOL — a nearly-free slot to hold
+    // fill all 3 slots
+    for n in 0..3u64 {
+        assert!(send(&mut svm, ix_commit(id, &bot.pubkey(), wager, n), &bot, &[&bot]), "commit {n}");
+    }
+    assert_eq!(read_machine(&svm, &id).pending_spins, 3, "cap saturated");
+
+    // the 4th commit is denied — service is down for new players.
+    let denied = try_send(&mut svm, ix_commit(id, &bot.pubkey(), wager, 3), &bot, &[&bot]).unwrap_err();
+    assert!(denied.contains("TooManyPendingSpins") || denied.contains("6018") || denied.contains("pending"),
+            "expected pending-cap denial: {denied}");
+
+    // hold cost to the bot: just the 3 escrowed wagers (refundable) — the machine's
+    // own tokens are what got reserved.
+    assert_eq!(read_machine(&svm, &id).escrowed_sol, 3 * wager, "bot only escrowed the wagers");
+
+    // self-heal: past EXPIRE_SLOTS a STRANGER (not the bot) expires an abandoned
+    // spin, permissionlessly. Refund goes to the bot (player); the SLOT frees.
+    let stranger = funded(&mut svm);
+    svm.warp_to_slot(hm::SMOOTH_WINDOW_SLOTS + 10); // > EXPIRE_SLOTS after commit
+    assert!(send(&mut svm, ix_expire(id, &bot.pubkey(), 0, &stranger.pubkey()), &stranger, &[&stranger]), "permissionless expire");
+    assert_eq!(read_machine(&svm, &id).pending_spins, 2, "a slot freed");
+
+    // and a fresh commit succeeds again — the machine recovered on its own.
+    // (fresh blockhash so this isn't the byte-identical signature of the denied commit above.)
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_commit(id, &bot.pubkey(), wager, 3), &bot, &[&bot]), "service restored after expire");
+    let _ = admin;
+}
+
+// (scale-1, dual) TOKEN-SIDE WITHDRAWAL ORDERING PAYOFF. Dual withdrawals are
+// PRICE-FREE (no TWAP read, so manipulation-immune), but the token side is still
+// pro-rata of the token balance AT PROCESSING. So the same crank-ordering payoff
+// as single-asset applies to the TOKEN side: two identical dual LPs both queue full
+// exits; a token JACKPOT lands between their cranks; the later-cranked LP receives
+// exactly the jackpot's token payout FEWER tokens. (The SOL dividend side, by
+// contrast, is order-independent — a per-share MasterChef ledger; see
+// k_deposit_accrue_claim / worked_example and house-math dividend::conservation.)
+// Bucket B; same batch-snapshot/FIFO mitigation as the single-asset case.
+#[test]
+fn scale_f_dual_token_withdraw_order_payoff() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xF4, 100);
+    let lp1 = funded(&mut svm);
+    let lp2 = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    deposit(&mut svm, id, mint, &lp1, 100_000);
+    deposit(&mut svm, id, mint, &lp2, 100_000); // equal → equal shares (price 1.0)
+    // Both in SPL mode: the interleaved jackpot accrues a SOL dividend, and SPL
+    // withdrawal EARMARKS it (no lamport surgery) — so this isolates the TOKEN
+    // ordering payoff and sidesteps the SOL-mode surgery revert (scale_g bug A).
+    assert!(send(&mut svm, ix_set_mode(id, &lp1.pubkey(), house::REWARD_MODE_SPL), &lp1, &[&lp1]));
+    assert!(send(&mut svm, ix_set_mode(id, &lp2.pubkey(), house::REWARD_MODE_SPL), &lp2, &[&lp2]));
+    let s1 = read_position(&svm, &id, &lp1.pubkey()).shares;
+    let s2 = read_position(&svm, &id, &lp2.pubkey()).shares;
+    assert_eq!(s1, s2, "identical dual LPs hold identical shares");
+
+    // a spin that will JACKPOT, paying tokens out of the vault.
+    let wager: u64 = 20_000_000; // 0.02 SOL
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), wager, 0), &player, &[&player]), "commit jackpot spin");
+    let sp = read_spin(&svm, &id, &player.pubkey(), 0);
+    let jackpot_tokens = sp.max_payout_tokens; // jackpot pays exactly this
+
+    // both queue full exits for the same epoch.
+    assert!(send(&mut svm, ix_request_wd(id, &lp1.pubkey(), s1), &lp1, &[&lp1]));
+    assert!(send(&mut svm, ix_request_wd(id, &lp2.pubkey(), s2), &lp2, &[&lp2]));
+    svm.warp_to_slot(2_000); // cross the epoch boundary (epoch_length 1000)
+
+    // crank #1: lp1 at the pre-jackpot token balance.
+    let lp1_tok_before = tok_bal(&svm, &ata(&lp1.pubkey(), &mint));
+    assert!(send(&mut svm, ix_process_wd(id, &lp1.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "process lp1");
+    let tokens1 = tok_bal(&svm, &ata(&lp1.pubkey(), &mint)) - lp1_tok_before;
+
+    // interleaved JACKPOT settle: token vault drops by the jackpot payout.
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mint, 0, &cranker.pubkey()), &cranker, &[&cranker]), "settle jackpot");
+
+    // crank #2: lp2 at the post-jackpot token balance.
+    let lp2_tok_before = tok_bal(&svm, &ata(&lp2.pubkey(), &mint));
+    assert!(send(&mut svm, ix_process_wd(id, &lp2.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "process lp2");
+    let tokens2 = tok_bal(&svm, &ata(&lp2.pubkey(), &mint)) - lp2_tok_before;
+
+    // PINNED: the later LP got exactly the jackpot's token payout fewer tokens.
+    assert!(tokens1 > tokens2, "ordering changed the token payout: {tokens1} vs {tokens2}");
+    assert_eq!(tokens1 - tokens2, jackpot_tokens as u64, "later dual LP eats exactly the token jackpot");
+}
+
+// (scale-1 / BUCKET A) LATENT BUG: process_withdrawal_token REVERTS with
+// UnbalancedInstruction when a SOL-mode position withdraws while it still has an
+// UNCLAIMED SOL dividend AND a token payout in the same crank. Root cause: the
+// handler moves lamports out of the machine PDA (debit_credit for the dividend)
+// BEFORE the token-transfer CPI — the "PDA lamport surgery before a CPI trips
+// UnbalancedInstruction" gotcha (compound_epoch does its surgery LAST for exactly
+// this reason; process_withdrawal_token does not). The existing books-balance test
+// side-steps it by claiming the dividend FIRST, so the combined path shipped
+// untested. Funds are NOT lost — the workaround is claim_sol (or a mode switch)
+// before withdrawing — but the intended single-crank both-asset exit fails for any
+// SOL-mode LP with accrued, unclaimed dividends. See SCALE.md §1(A). NOT fixed here.
+#[test]
+fn scale_g_bug_a_sol_dividend_plus_token_withdraw_reverts() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xF7, BP);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp, 10_000); // sole LP, SOL reward mode (default)
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 5); // 0.5 SOL dividend, UNCLAIMED
+    let pos = read_position(&svm, &id, &lp.pubkey());
+    let m0 = read_machine(&svm, &id);
+    let owed = hm::dividend::pending_sol(pos.shares + pos.pending_shares, pos.sol_debt, m0.acc_sol_per_share);
+    assert!(owed > 0, "the LP has an unclaimed SOL dividend");
+
+    let sh = read_position(&svm, &id, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_wd(id, &lp.pubkey(), sh), &lp, &[&lp]));
+    svm.warp_to_slot(2_000); // cross the epoch boundary
+
+    // THE BUG: the both-asset crank reverts with UnbalancedInstruction (surgery
+    // before the token CPI), even though the books are internally consistent.
+    let err = try_send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]).unwrap_err();
+    assert!(err.contains("UnbalancedInstruction"), "expected the surgery-before-CPI revert, got: {err}");
+
+    // THE WORKAROUND (recovers funds): claim the dividend first (zeroes the SOL
+    // surgery), then the token-only withdrawal crank succeeds.
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]), "claim first");
+    svm.expire_blockhash();
+    let tok_before = tok_bal(&svm, &ata(&lp.pubkey(), &mint));
+    assert!(send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "withdraw after claim works");
+    assert!(tok_bal(&svm, &ata(&lp.pubkey(), &mint)) > tok_before, "tokens paid once the dividend was pre-claimed");
+}
+
+// Control: an SPL-mode position with the SAME unclaimed dividend withdraws FINE —
+// SPL mode EARMARKS the dividend (accounting only, no lamports leave the machine),
+// so there is no surgery before the token CPI. This pins the root cause to the
+// SOL-mode debit_credit ordering, not the token CPI itself.
+#[test]
+fn scale_g2_spl_mode_withdraw_with_dividend_is_fine() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xF8, BP);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp, 10_000);
+    assert!(send(&mut svm, ix_set_mode(id, &lp.pubkey(), house::REWARD_MODE_SPL), &lp, &[&lp]));
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 5); // dividend, unclaimed
+    let sh = read_position(&svm, &id, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_wd(id, &lp.pubkey(), sh), &lp, &[&lp]));
+    svm.warp_to_slot(2_000);
+    let tok_before = tok_bal(&svm, &ata(&lp.pubkey(), &mint));
+    // no revert: SPL mode never moves SOL out of the machine during the crank.
+    assert!(send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "SPL-mode withdraw with dividend works");
+    assert!(tok_bal(&svm, &ata(&lp.pubkey(), &mint)) > tok_before, "tokens paid");
+    assert!(read_position(&svm, &id, &lp.pubkey()).earmarked_sol > 0 || pos_closed(&svm, &id, &lp.pubkey()), "dividend earmarked, not paid in SOL");
+}
+
+// (scale-4) PER-POSITION COMPOUNDING when the band closes mid-sequence. Shipped
+// design is one compound per position per epoch (not the spec's single aggregated
+// swap), so N SPL positions = N swaps = N× the band-gate exposure. If the band
+// closes partway through the epoch's crank sequence, the positions already
+// compounded this epoch got their price; the rest NO-OP (succeed, earmark intact)
+// and compound later. Demonstrated: A compounds (band open); B no-ops (band out,
+// earmark preserved); band reopens and B compounds. A non-compounding SOL-mode LP
+// is NEVER diluted (token-per-share non-decreasing) — the shipped per-position
+// path keeps the compound_mint_shares non-dilution guarantee. So "some compounded,
+// some not" is timing VARIANCE, not unfairness or dilution. Bucket B (cost: N
+// swaps/epoch vs 1); mitigation (aggregate) sketched in SCALE.md.
+#[cfg(feature = "mock-swap")]
+#[test]
+fn scale_h_compound_per_position_band_close_is_variance_not_dilution() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xF9, BP);
+    let a = funded(&mut svm);
+    let b = funded(&mut svm);
+    let c = funded(&mut svm); // SOL-mode, never compounds — the dilution canary
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &a, 5_000);
+    deposit(&mut svm, id, mint, &b, 5_000);
+    deposit(&mut svm, id, mint, &c, 5_000);
+    assert!(send(&mut svm, ix_set_mode(id, &a.pubkey(), house::REWARD_MODE_SPL), &a, &[&a]));
+    assert!(send(&mut svm, ix_set_mode(id, &b.pubkey(), house::REWARD_MODE_SPL), &b, &[&b]));
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 30); // 3 SOL
+    assert!(send(&mut svm, ix_earmark_sol(id, &a.pubkey()), &a, &[&a]));
+    assert!(send(&mut svm, ix_earmark_sol(id, &b.pubkey()), &b, &[&b]));
+    assert!(read_position(&svm, &id, &a.pubkey()).earmarked_sol > 0);
+    assert!(read_position(&svm, &id, &b.pubkey()).earmarked_sol > 0);
+
+    let amm = funded(&mut svm);
+    let amm_tok = ata(&amm.pubkey(), &mint);
+    set_token_acct(&mut svm, &amm_tok, &mint, &amm.pubkey(), (200_000 * CHIP) as u64);
+    let claim_c = |svm: &LiteSVM| { let m = read_machine(svm, &id); let p = read_position(svm, &id, &c.pubkey()); p.shares * m.token_balance / m.total_shares };
+    let c0 = claim_c(&svm);
+
+    svm.warp_to_slot(2_000); // epoch 2 — band OPEN (in-band price from boot)
+    assert!(send(&mut svm, ix_compound(id, &a.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "A compounds while band open");
+    assert_eq!(read_position(&svm, &id, &a.pubkey()).earmarked_sol, 0, "A fully compounded");
+    let c1 = claim_c(&svm);
+    assert!(c1 >= c0, "SOL-mode LP not diluted by A's compound: {c0} -> {c1}");
+
+    // band CLOSES mid-sequence: spot 5% off TWAP (> 300bp).
+    assert!(send(&mut svm, ix_set_price(id, &_admin.pubkey(), PRICE, PRICE * 9500 / 10000, 5), &_admin, &[&_admin]));
+    let b_ear = read_position(&svm, &id, &b.pubkey()).earmarked_sol;
+    let tb_before = read_machine(&svm, &id).token_balance;
+    svm.expire_blockhash();
+    // B's compound NO-OPs and SUCCEEDS — never a forced fill; earmark preserved.
+    assert!(send(&mut svm, ix_compound(id, &b.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "B no-ops out of band");
+    assert_eq!(read_position(&svm, &id, &b.pubkey()).earmarked_sol, b_ear, "B earmark intact (no forced fill)");
+    assert_eq!(read_machine(&svm, &id).token_balance, tb_before, "no tokens minted for B while out of band");
+
+    // band REOPENS: B compounds later — its earmark was never lost (variance, not loss).
+    assert!(send(&mut svm, ix_set_price(id, &_admin.pubkey(), PRICE, PRICE, 5), &_admin, &[&_admin]));
+    svm.warp_to_slot(3_000);
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_compound(id, &b.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "B compounds once band reopens");
+    assert_eq!(read_position(&svm, &id, &b.pubkey()).earmarked_sol, 0, "B fully compounded later");
+    let c2 = claim_c(&svm);
+    assert!(c2 >= c1, "SOL-mode LP still not diluted after B's compound: {c1} -> {c2}");
+}
+
+// (scale-2, model) CAPITAL COST OF HOLDING A PENDING SLOT — pinned. A slot's
+// token reserve is drawn from the MACHINE's vault, not the bot's wallet; the bot
+// only escrows the (refundable) wager. So denying all 100 slots costs the bot
+// ~100 tiny wagers + tx fees, while the reserve it pins scales with the wager it
+// chooses. Pins the per-slot reserve at a min-ish wager (near-zero) vs a real
+// wager, showing slot-denial is decoupled from liquidity-locking.
+#[test]
+fn scale_model_pending_slot_capital() {
+    let k_max = hm::k_bounds_dual(hm::SHALLOW_NUM, RTP_MAX as u128).1;
+    let tier = &hm::SHALLOW;
+    // a tiny 1000-lamport wager: the reserve it pins is negligible.
+    let tiny = 1_000u128;
+    let r_tiny = hm::payout::reserve_with_haircut(
+        hm::payout::max_payout_tokens(tiny, tier, k_max, PRICE, DEC).unwrap(), HAIRCUT).unwrap();
+    // a 0.01-SOL wager: a materially larger reserve.
+    let real = 10_000_000u128;
+    let r_real = hm::payout::reserve_with_haircut(
+        hm::payout::max_payout_tokens(real, tier, k_max, PRICE, DEC).unwrap(), HAIRCUT).unwrap();
+    // slot denial is cheap and near-liquidity-free; liquidity-locking needs real wagers.
+    assert!(r_tiny * 1000 < r_real, "tiny-wager slots pin ~no liquidity vs real wagers");
+    // escrow to fill all 100 slots at the tiny wager = 100 refundable wagers.
+    let escrow_100 = 100 * tiny;
+    assert_eq!(escrow_100, 100_000, "100 slots held for 0.0001 SOL of (refundable) escrow");
+    // (numbers surfaced in SCALE.md §2)
+    let _ = (r_tiny, r_real);
 }

@@ -887,3 +887,101 @@ fn w_h_books_balance_full_lifecycle() {
     assert_eq!(mf.pool_value, 0, "pool fully drained");
     assert_eq!(lamports(&svm, &m), vault_rent, "vault back to rent-only — books balance to the lamport");
 }
+
+// ============================================================================
+// SCALE-1 analysis demonstrations (single-asset). See SCALE.md.
+// ============================================================================
+
+// (scale-1) WITHDRAWAL CRANK ORDERING — the payoff. `process_withdrawals` prices
+// at the pool state AT PROCESSING and handles one position per crank in an order
+// the cranker picks. Two IDENTICAL LPs both queue full exits for the same epoch;
+// a JACKPOT settles BETWEEN their two cranks. The one cranked FIRST exits at the
+// pre-jackpot price; the one cranked SECOND eats the ENTIRE net jackpot cost —
+// exactly `max_payout - wager` lamports, borne by whoever is processed last. The
+// cranker controls the order (and, being permissionless, can bundle its own exit
+// + the settle + the victim's crank), so the split of an interleaved jackpot is
+// cranker-chosen. Contrast w_d_two_lps_sequential_pricing: absent a price move,
+// order does NOT change amounts. Bucket B (fairness under contention); mitigation
+// (batch-snapshot / FIFO) sketched in SCALE.md. The magnitude is bounded per spin
+// by the exposure cap (max_payout <= ~max_exposure_bp of the pool).
+#[test]
+fn scale_a_crank_order_dumps_interleaved_jackpot_on_later_lp() {
+    let pool = 40_000_000_000u64; // each LP; 80 SOL total -> DEEP
+    let (mut svm, id, _a, _c, lp1) = boot_converged(0xF1, pool);
+    let m = machine_pda(&id);
+    let lp2 = funded(&mut svm);
+    // lp1 doubles as the cranker — it front-runs its own exit before the jackpot.
+    assert!(send(&mut svm, ix_deposit(id, &lp2.pubkey(), pool), &lp2, &[&lp2]));
+    let total_pool = 2 * pool;
+
+    // equal deposits at price 1.0 -> equal shares.
+    let s1 = read_position(&svm, &m, &lp1.pubkey()).shares;
+    let s2 = read_position(&svm, &m, &lp2.pubkey()).shares;
+    assert_eq!(s1, s2, "identical LPs hold identical shares");
+
+    // a player commits a spin; its worst case (JACKPOT^3) is what we will land.
+    let player = funded(&mut svm);
+    let (is_deep, k, max_bet) = converged_snapshot(total_pool as u128);
+    let wager = (max_bet / 2) as u64;
+    let jack_bytes = [0u8; 32]; // JACKPOT^3
+    let jack_reels = hm::reels_from_randomness(&jack_bytes);
+    let max_payout = u64::try_from(hm::spin_payout(wager as u128, tier_of(is_deep), k, jack_reels)).unwrap();
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), jack_bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    let sp = read_spin(&svm, &m, &player.pubkey(), 0);
+    assert_eq!(sp.max_payout, max_payout, "reserve == the jackpot we will land");
+
+    // both queue a FULL exit for the same epoch.
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp1.pubkey(), s1), &lp1, &[&lp1]));
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp2.pubkey(), s2), &lp2, &[&lp2]));
+    svm.warp_to_slot(E1_SLOT);
+
+    // crank #1: lp1 processes ITSELF first, at the pre-jackpot pool. Reserve pins
+    // free liquidity but is small enough to fully fill lp1 (max_payout <= pool).
+    assert!((max_payout as u128) <= pool as u128, "reserve fits so lp1 fills fully");
+    let m1 = read_machine(&svm, &id);
+    let (_f1, pay1) = expected_process(m1.pool_value as u128, sp.max_payout as u128, m1.total_shares, s1);
+    let v_before1 = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp1.pubkey(), &lp1.pubkey()), &lp1, &[&lp1]));
+    assert_eq!(v_before1 - lamports(&svm, &m), pay1 as u64, "lp1 paid at the pre-jackpot price");
+    assert_eq!(pay1, pool as u128, "lp1 recovers its full deposit");
+
+    // the interleaved JACKPOT: pool pays out max_payout, absorbs wager.
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &lp1.pubkey()), &lp1, &[&lp1]));
+
+    // crank #2: lp2, now at the post-jackpot pool (reserve released).
+    let m2 = read_machine(&svm, &id);
+    let (_f2, pay2) = expected_process(m2.pool_value as u128, 0, m2.total_shares, s2);
+    let v_before2 = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp2.pubkey(), &lp1.pubkey()), &lp1, &[&lp1]));
+    assert_eq!(v_before2 - lamports(&svm, &m), pay2 as u64, "lp2 paid at the post-jackpot price");
+
+    // THE PINNED FINDING: identical requests, different payouts; the entire net
+    // jackpot cost (max_payout - wager) fell on the LATER-cranked LP.
+    assert!(pay1 > pay2, "ordering changed the payout: {pay1} vs {pay2}");
+    assert_eq!(pay1 - pay2, (max_payout - wager) as u128, "later LP eats exactly the net jackpot cost");
+}
+
+// (scale-1) NO INDEFINITE STARVATION. The crank is permissionless and the payout
+// always goes to `owner` regardless of who signs, so a hostile cranker that simply
+// refuses to process a victim cannot starve them: the victim cranks ITSELF and is
+// paid to the lamport. (Ordering can still shift interleaved variance — that is
+// scale_a — but liveness is never at a third party's mercy.)
+#[test]
+fn scale_b_no_starvation_victim_self_cranks() {
+    let pool = 30_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xF2, pool);
+    let m = machine_pda(&id);
+    let _griefer = funded(&mut svm); // exists, but never cranks the victim
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT);
+
+    let pos_rent = lamports(&svm, &lp_pda(&m, &lp.pubkey()));
+    let before = lamports(&svm, &lp.pubkey());
+    // the victim is its OWN cranker — no third party needed.
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &lp.pubkey()), &lp, &[&lp]));
+    let gained = lamports(&svm, &lp.pubkey()) as i128 - before as i128; // payout + rent - tx fee
+    assert!(gained > (pool as i128) + (pos_rent as i128) - 100_000, "victim self-cranked and was paid: {gained}");
+    assert!(position_closed(&svm, &m, &lp.pubkey()), "position closed on self-crank");
+}

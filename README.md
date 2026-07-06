@@ -523,6 +523,18 @@ deploy `dist/` as static files. The app uses hash routing (`/#/machine/…`), so
 **no SPA rewrite rule is needed**: point the host at `app/` with build command
 `npm run build`, output directory `dist`, and `VITE_RPC_URL` as an env var.
 
+## Production-scale analysis
+
+[`SCALE.md`](./SCALE.md) analyzes how the design behaves at volume — withdrawal
+crank ordering, pending-spin contention, epoch-drain latency, per-position
+compounding, keeper/TWAP-window economics, the realization horizon, and off-chain
+scans — with every claimed failure mode demonstrated by a named `scale_*` LiteSVM
+test or a pinned house-math model. Findings are triaged real-bug (A) / scale-limit
+(B) / mainnet-only (C). **It surfaced one (A):** `process_withdrawal_token` reverts
+(`UnbalancedInstruction`) for a SOL-mode LP that withdraws while holding an unclaimed
+SOL dividend — funds recoverable (claim first), fix is a pure reordering, flagged
+for a follow-up. Everything else is a bounded (B) or precluded (C).
+
 ## Known deferrals
 
 - **`spin_expire` live.** Needs a ~1 h abandonment to stage on devnet; covered by

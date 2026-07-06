@@ -139,7 +139,12 @@ alone. The SDK ships `verifySpin(spinPda)` doing exactly that.
     returned to the owner.
   - **Ordering across LPs:** each crank prices at the current pool state, so a batch cranked in
     sequence prices each fill at the state left by the previous one; there is no separate global
-    FIFO structure. Epochs remain the anti-pool-hopping and anti-bank-run mechanism.
+    FIFO structure. Epochs remain the anti-pool-hopping and anti-bank-run mechanism. The
+    production-scale consequences of this — that a spin settling *between* two withdrawal cranks
+    dumps the interleaved variance on whoever is cranked last, cranker-chosen — are analyzed and
+    demonstrated in [`SCALE.md`](./SCALE.md) §1 (bucket B; bounded per spin by the exposure cap;
+    mitigation = a per-epoch price snapshot). SCALE.md §1 also reports a real (bucket A) bug it
+    surfaced in `process_withdrawal_token`.
 - **Yield display (frontend obligation):** trailing share-price change (7d/30d, annualized) AND
   expected-value math (`edge × projected volume / D`) AND historical drawdown — never a fixed
   "APY". A $1M pool at 5% avg edge and $20k daily volume expects ~36%/yr with whole-percent
