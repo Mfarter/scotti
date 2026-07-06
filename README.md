@@ -530,10 +530,14 @@ crank ordering, pending-spin contention, epoch-drain latency, per-position
 compounding, keeper/TWAP-window economics, the realization horizon, and off-chain
 scans — with every claimed failure mode demonstrated by a named `scale_*` LiteSVM
 test or a pinned house-math model. Findings are triaged real-bug (A) / scale-limit
-(B) / mainnet-only (C). **It surfaced one (A):** `process_withdrawal_token` reverts
-(`UnbalancedInstruction`) for a SOL-mode LP that withdraws while holding an unclaimed
-SOL dividend — funds recoverable (claim first), fix is a pure reordering, flagged
-for a follow-up. Everything else is a bounded (B) or precluded (C).
+(B) / mainnet-only (C). **It surfaced one (A), now FIXED (FIX-1):**
+`process_withdrawal_token` reverted (`UnbalancedInstruction`) for a SOL-mode LP that
+withdrew while holding an unclaimed SOL dividend — a lamport surgery before the token
+CPI. FIX-1 reordered the surgery to last (mirroring `compound_epoch`), upgraded the
+program in place ([`3hPp33d3…`](https://solscan.io/tx/3hPp33d33TN2uUXNfpjHynHGZkswM5bifVDRctuWKpregsMvP4ewspXkLC3BTLd7xudnXjkVKucb2NWWqpzfeXFT?cluster=devnet)),
+and proved the once-reverting combined withdrawal live on `dual-chip-1`
+([`3faxnxiW…`](https://solscan.io/tx/3faxnxiWmQBPe1UBHH7faWEZKuDvLrQTwJR1TJ5ZBFEZ5xgqWFgrpY5vvaVujsv6YRS9Vf9HqcZ7BqfnfrK1sSYh?cluster=devnet)) —
+both assets paid, exact by recompute. Everything else is a bounded (B) or precluded (C).
 
 ## Known deferrals
 

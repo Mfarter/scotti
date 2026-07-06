@@ -1066,47 +1066,92 @@ fn scale_f_dual_token_withdraw_order_payoff() {
     assert_eq!(tokens1 - tokens2, jackpot_tokens as u64, "later dual LP eats exactly the token jackpot");
 }
 
-// (scale-1 / BUCKET A) LATENT BUG: process_withdrawal_token REVERTS with
-// UnbalancedInstruction when a SOL-mode position withdraws while it still has an
-// UNCLAIMED SOL dividend AND a token payout in the same crank. Root cause: the
-// handler moves lamports out of the machine PDA (debit_credit for the dividend)
-// BEFORE the token-transfer CPI — the "PDA lamport surgery before a CPI trips
-// UnbalancedInstruction" gotcha (compound_epoch does its surgery LAST for exactly
-// this reason; process_withdrawal_token does not). The existing books-balance test
-// side-steps it by claiming the dividend FIRST, so the combined path shipped
-// untested. Funds are NOT lost — the workaround is claim_sol (or a mode switch)
-// before withdrawing — but the intended single-crank both-asset exit fails for any
-// SOL-mode LP with accrued, unclaimed dividends. See SCALE.md §1(A). NOT fixed here.
+// (FIX-1) The SCALE.md §1(A) bug is FIXED: process_withdrawal_token now does the
+// token CPI FIRST and defers the SOL dividend debit_credit to the LAST lamport op,
+// so a SOL-mode LP with an UNCLAIMED dividend withdraws BOTH assets in ONE crank —
+// the path that previously reverted with UnbalancedInstruction. This test asserts
+// the correct behavior (exact-lamport token pro-rata AND the SOL dividend, books
+// balanced, position closed). Was `scale_g_bug_a_*` (which asserted the revert).
 #[test]
-fn scale_g_bug_a_sol_dividend_plus_token_withdraw_reverts() {
+fn scale_g_fix_sol_dividend_plus_token_withdraw_one_crank() {
     let (mut svm, id, mint, _admin) = boot_machine(0xF7, BP);
     let lp = funded(&mut svm);
     let player = funded(&mut svm);
     let cranker = funded(&mut svm);
+    let m = dmachine(&id);
+    let base_rent = lamports(&svm, &m); // machine PDA rent, before any SOL flows in
     deposit(&mut svm, id, mint, &lp, 10_000); // sole LP, SOL reward mode (default)
     accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 5); // 0.5 SOL dividend, UNCLAIMED
-    let pos = read_position(&svm, &id, &lp.pubkey());
-    let m0 = read_machine(&svm, &id);
-    let owed = hm::dividend::pending_sol(pos.shares + pos.pending_shares, pos.sol_debt, m0.acc_sol_per_share);
-    assert!(owed > 0, "the LP has an unclaimed SOL dividend");
 
-    let sh = read_position(&svm, &id, &lp.pubkey()).shares;
+    // recompute what the ONE crank must pay: full token balance (sole LP, full exit)
+    // and the whole pending dividend.
+    let m0 = read_machine(&svm, &id);
+    let pos0 = read_position(&svm, &id, &lp.pubkey());
+    let expect_tokens = m0.token_balance; // sole LP withdrawing all shares gets the whole vault
+    let expect_div = hm::dividend::pending_sol(pos0.shares + pos0.pending_shares, pos0.sol_debt, m0.acc_sol_per_share);
+    assert_eq!(expect_div, 500_000_000, "sole LP's dividend == the accrued 0.5 SOL");
+    assert!(m0.div_pool_sol as u128 >= expect_div);
+
+    let sh = pos0.shares;
     assert!(send(&mut svm, ix_request_wd(id, &lp.pubkey(), sh), &lp, &[&lp]));
     svm.warp_to_slot(2_000); // cross the epoch boundary
 
-    // THE BUG: the both-asset crank reverts with UnbalancedInstruction (surgery
-    // before the token CPI), even though the books are internally consistent.
-    let err = try_send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]).unwrap_err();
-    assert!(err.contains("UnbalancedInstruction"), "expected the surgery-before-CPI revert, got: {err}");
+    let pos_rent = lamports(&svm, &dlp(&m, &lp.pubkey()));
+    let lp_sol_before = lamports(&svm, &lp.pubkey());
+    let lp_tok_before = tok_bal(&svm, &ata(&lp.pubkey(), &mint));
 
-    // THE WORKAROUND (recovers funds): claim the dividend first (zeroes the SOL
-    // surgery), then the token-only withdrawal crank succeeds.
-    svm.expire_blockhash();
-    assert!(send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]), "claim first");
-    svm.expire_blockhash();
-    let tok_before = tok_bal(&svm, &ata(&lp.pubkey(), &mint));
-    assert!(send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "withdraw after claim works");
-    assert!(tok_bal(&svm, &ata(&lp.pubkey(), &mint)) > tok_before, "tokens paid once the dividend was pre-claimed");
+    // THE ONCE-REVERTING PATH, NOW CORRECT: one crank pays both assets. lp is NOT
+    // the cranker, so its SOL delta is exactly dividend + reclaimed position rent.
+    assert!(send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]),
+            "combined both-asset withdrawal succeeds in one crank");
+
+    // token side: exact pro-rata (the whole vault).
+    assert_eq!(tok_bal(&svm, &ata(&lp.pubkey(), &mint)) - lp_tok_before, expect_tokens as u64, "token pro-rata to the base unit");
+    // SOL side: exact dividend + reclaimed rent (cranker paid the fee, not lp).
+    assert_eq!(lamports(&svm, &lp.pubkey()) - lp_sol_before, expect_div as u64 + pos_rent, "SOL dividend + rent to the lamport");
+    // books: dividend drained, vault empty, shares gone, position closed, machine
+    // back to bare rent (escrowed + div_pool + earmarked all zero).
+    let mf = read_machine(&svm, &id);
+    assert_eq!(mf.div_pool_sol, m0.div_pool_sol - expect_div as u64, "div pool drained by exactly the dividend");
+    assert_eq!(mf.token_balance, 0, "vault emptied");
+    assert_eq!(mf.total_shares, 0, "all shares burned");
+    assert!(pos_closed(&svm, &id, &lp.pubkey()), "position closed, rent returned");
+    assert_eq!(lamports(&svm, &m), base_rent, "machine back to bare rent — books balance to the lamport");
+}
+
+// (FIX-1 regression) The combined one-crank path is ECONOMICALLY IDENTICAL to the
+// old workaround (claim_sol, then withdraw): same tokens out, same dividend out,
+// same machine-side drains. Runs both orderings on two identical machines and
+// asserts the asset movements match to the base unit / lamport (fee-independent,
+// measured machine-side + on the token ATA).
+#[test]
+fn scale_g_regression_combined_equals_claim_then_withdraw() {
+    let run = |seed: u8, claim_first: bool| -> (u64, u64) {
+        let (mut svm, id, mint, _admin) = boot_machine(seed, BP);
+        let lp = funded(&mut svm);
+        let player = funded(&mut svm);
+        let cranker = funded(&mut svm);
+        let m = dmachine(&id);
+        deposit(&mut svm, id, mint, &lp, 10_000);
+        accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 5); // 0.5 SOL
+        let div_before = read_machine(&svm, &id).div_pool_sol;
+        let sh = read_position(&svm, &id, &lp.pubkey()).shares;
+        assert!(send(&mut svm, ix_request_wd(id, &lp.pubkey(), sh), &lp, &[&lp]));
+        svm.warp_to_slot(2_000);
+        let tok_before = tok_bal(&svm, &ata(&lp.pubkey(), &mint));
+        if claim_first {
+            assert!(send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]), "claim");
+            svm.expire_blockhash();
+        }
+        assert!(send(&mut svm, ix_process_wd(id, &lp.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "process");
+        let tokens_out = tok_bal(&svm, &ata(&lp.pubkey(), &mint)) - tok_before;
+        let div_drained = div_before - read_machine(&svm, &id).div_pool_sol; // SOL that left as dividend
+        (tokens_out, div_drained)
+    };
+    let combined = run(0xFC, false);       // the fixed one-crank path
+    let claim_then = run(0xFD, true);       // the old workaround
+    assert_eq!(combined, claim_then, "combined one-crank == claim-then-withdraw (tokens, dividend)");
+    assert_eq!(combined.1, 500_000_000, "0.5 SOL dividend realized either way");
 }
 
 // Control: an SPL-mode position with the SAME unclaimed dividend withdraws FINE —

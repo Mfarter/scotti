@@ -143,8 +143,9 @@ alone. The SDK ships `verifySpin(spinPda)` doing exactly that.
     production-scale consequences of this — that a spin settling *between* two withdrawal cranks
     dumps the interleaved variance on whoever is cranked last, cranker-chosen — are analyzed and
     demonstrated in [`SCALE.md`](./SCALE.md) §1 (bucket B; bounded per spin by the exposure cap;
-    mitigation = a per-epoch price snapshot). SCALE.md §1 also reports a real (bucket A) bug it
-    surfaced in `process_withdrawal_token`.
+    mitigation = a per-epoch price snapshot). SCALE.md §1 also surfaced a real (bucket A) bug in
+    `process_withdrawal_token` (a lamport surgery before the token CPI), now **FIXED and live on
+    devnet (FIX-1)** — see SCALE.md §1(A).
 - **Yield display (frontend obligation):** trailing share-price change (7d/30d, annualized) AND
   expected-value math (`edge × projected volume / D`) AND historical drawdown — never a fixed
   "APY". A $1M pool at 5% avg edge and $20k daily volume expects ~36%/yr with whole-percent

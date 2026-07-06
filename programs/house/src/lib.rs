@@ -838,11 +838,12 @@ pub mod house {
         let token_payout_u64 = u64::try_from(token_payout).map_err(|_| HouseError::MathOverflow)?;
 
         // ----- money movement -----
-        // SOL side: pay the owner (SOL mode); SPL mode earmarks (below, no transfer).
-        if sol_realized_u64 > 0 && reward_mode == REWARD_MODE_SOL {
-            debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.owner.to_account_info(), sol_realized_u64)?;
-        }
-        // token side: vault -> owner ATA, signed by the machine PDA.
+        // token side FIRST: vault -> owner ATA, signed by the machine PDA. The SOL
+        // dividend payout is machine-PDA lamport surgery, and a surgery interleaved
+        // BEFORE this CPI would trip the runtime's per-CPI subset balance check
+        // (the H6c-1 compound_epoch gotcha). So the SOL debit is deferred to the
+        // LAST lamport op (below), leaving the only balance check at instruction
+        // return — exactly the pattern amm_swap_sol_to_token documents.
         if token_payout_u64 > 0 {
             let id = m.machine_id;
             let bump = [m.bump];
@@ -879,8 +880,17 @@ pub mod house {
         let remaining = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
         pos.sol_debt = hm::dividend::sol_entitlement(remaining, acc);
 
+        // ----- SOL side, LAST: pay the owner (SOL mode); SPL mode earmarked above.
+        // Deferred to here so all lamport surgery follows the token CPI — the only
+        // runtime balance check is now at instruction return (this debit + the
+        // close primitive below), never across the CPI. Amount and condition are
+        // unchanged from before the reorder; the accounting above already reflects it.
+        if sol_realized_u64 > 0 && reward_mode == REWARD_MODE_SOL {
+            debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.owner.to_account_info(), sol_realized_u64)?;
+        }
+
         // fully-emptied position with no earmark closes; rent to owner.
-        if pos.shares == 0 && pos.pending_shares == 0 && pos.earmarked_sol == 0 {
+        if ctx.accounts.position.shares == 0 && ctx.accounts.position.pending_shares == 0 && ctx.accounts.position.earmarked_sol == 0 {
             ctx.accounts.position.close(ctx.accounts.owner.to_account_info())?;
         }
         Ok(())

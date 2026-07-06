@@ -21,32 +21,46 @@ Every finding is triaged into exactly one bucket:
 
 ## Executive summary
 
-> ### (A) finding — report first
+> ### (A) finding — ✅ FIXED in FIX-1
 >
-> **`process_withdrawal_token` reverts (`UnbalancedInstruction`) for a SOL-mode LP
-> that withdraws while holding an unclaimed SOL dividend.** The handler moves
-> lamports out of the machine PDA (`debit_credit` for the dividend) *before* the
-> token-transfer CPI — the "PDA lamport surgery before a CPI trips
-> UnbalancedInstruction" gotcha that `compound_epoch` was written to avoid (it does
-> its surgery last). The existing books-balance test sidesteps the bug by claiming
-> the dividend first, so the combined single-crank path shipped **untested**.
+> **Status: FIXED and live on devnet (FIX-1).** `process_withdrawal_token` was
+> reordered so the SOL dividend `debit_credit` is the LAST money movement, after
+> the token CPI — mirroring `compound_epoch`'s surgery-last pattern. The program
+> was **upgraded in place** ([`3hPp33d3…eXFT`](https://solscan.io/tx/3hPp33d33TN2uUXNfpjHynHGZkswM5bifVDRctuWKpregsMvP4ewspXkLC3BTLd7xudnXjkVKucb2NWWqpzfeXFT?cluster=devnet))
+> and the once-reverting combined withdrawal ran **live** on `dual-chip-1`: a
+> SOL-mode LP with an unclaimed 2,000,000-lamport dividend executed one
+> `process_withdrawal_token` crank ([`3faxnxiW…sSYh`](https://solscan.io/tx/3faxnxiWmQBPe1UBHH7faWEZKuDvLrQTwJR1TJ5ZBFEZ5xgqWFgrpY5vvaVujsv6YRS9Vf9HqcZ7BqfnfrK1sSYh?cluster=devnet)),
+> receiving both assets — token pro-rata `1,999,486,046,306` base units and the
+> `2,000,000` lamport dividend, exact by recompute. The finding is preserved below
+> as the record.
 >
-> - **Demonstration:** `scale_g_bug_a_sol_dividend_plus_token_withdraw_reverts`
->   (the crank reverts), and control `scale_g2_spl_mode_withdraw_with_dividend_is_fine`
->   (SPL mode earmarks the dividend — no surgery — and withdraws fine), isolating
->   the cause to the SOL-mode `debit_credit` ordering, not the token CPI.
-> - **Funds at risk?** **No loss.** The LP's tokens and dividend are both safe and
->   fully recoverable — `claim_sol` first (zeroing the surgery), then withdraw
->   tokens, works (shown in the same test). But the *intended* one-crank both-asset
->   exit is broken for any SOL-mode LP with accrued, unclaimed dividends, which is
->   the common case. So this is a correctness/liveness bug, not a drain — hence not
->   the "funds draining right now" emergency, but it is a real bug in **deployed**
->   code and should be the immediate follow-up.
-> - **Fix (follow-up, not done here):** reorder `process_withdrawal_token` so the
->   SOL `debit_credit` is the **last** money movement, after the token CPI — exactly
->   the pattern `compound_epoch` already uses ("reimbursed … as the swap's last op,
->   so the only balance check is at instruction return"). It is a pure reordering;
->   no accounting changes.
+> **The bug (as found).** `process_withdrawal_token` reverted
+> (`UnbalancedInstruction`) for a SOL-mode LP that withdrew while holding an
+> unclaimed SOL dividend, because the handler moved lamports out of the machine PDA
+> (`debit_credit` for the dividend) *before* the token-transfer CPI — the "PDA
+> lamport surgery before a CPI trips UnbalancedInstruction" gotcha that
+> `compound_epoch` was written to avoid (it does its surgery last). The existing
+> books-balance test sidestepped the bug by claiming the dividend first, so the
+> combined single-crank path shipped **untested**.
+>
+> - **Demonstration → now the positive test.** Was
+>   `scale_g_bug_a_*` (asserted the revert); FIX-1 rewrote it to
+>   `scale_g_fix_sol_dividend_plus_token_withdraw_one_crank` (asserts the correct
+>   one-crank both-asset payout, books balanced, position closes), added
+>   `scale_g_regression_combined_equals_claim_then_withdraw` (the combined path is
+>   economically identical to claim-then-withdraw), and kept the control
+>   `scale_g2_spl_mode_withdraw_with_dividend_is_fine` (SPL mode earmarks — no
+>   surgery — so it never regressed).
+> - **Funds at risk?** **No loss even before the fix.** The LP's tokens and dividend
+>   were both recoverable — `claim_sol` first, then withdraw. It was a
+>   correctness/liveness bug (the intended one-crank both-asset exit broken for any
+>   SOL-mode LP with accrued dividends), not a drain — but a real bug in deployed
+>   code, now fixed.
+> - **The fix (shipped):** reorder `process_withdrawal_token` so the SOL
+>   `debit_credit` is the **last** money movement, after the token CPI — exactly the
+>   pattern `compound_epoch`/`amm_swap_sol_to_token` document ("as the swap's last op,
+>   so the only balance check is at instruction return"). A pure reordering; same
+>   accounts, amounts, rounding, close condition. IDL byte-identical.
 
 Everything else is a **(B) scale limit** or **(C) mainnet-only**. The headline
 (B): withdrawal payouts are **crank-order-dependent** whenever a spin settles
@@ -59,7 +73,7 @@ explicitly deferred; it is bounded per spin by the exposure cap and is liveness-
 
 | # | finding | bucket | demonstration |
 |---|---|---|---|
-| 1a | SOL-mode dividend + token withdraw reverts (`UnbalancedInstruction`) | **A** | `scale_g_bug_a_*` + control `scale_g2_*` |
+| 1a | SOL-mode dividend + token withdraw reverted (`UnbalancedInstruction`) — **✅ FIXED (FIX-1)**, live-verified | **A** | `scale_g_fix_*` + `scale_g_regression_*` + control `scale_g2_*` |
 | 1b | Withdrawal payout depends on crank order when a spin interleaves (single: lamport price; dual: token balance) | **B** | `scale_a_crank_order_dumps_interleaved_jackpot_on_later_lp`, `scale_f_dual_token_withdraw_order_payoff` |
 | 1c | Indefinite starvation by a hostile cranker | not a bug | `scale_b_no_starvation_victim_self_cranks` (permissionless self-crank) |
 | 2 | Pending-spin cap (100) cheaply deniable; self-heals via permissionless expire | **B** | `scale_e_pending_cap_denies_then_permissionlessly_heals`, `scale_model_pending_slot_capital` |
@@ -78,11 +92,19 @@ explicitly deferred; it is bounded per spin by the exposure cap and is liveness-
 **permissionless** (`cranker: Signer` is "literally anyone"; the payout always
 goes to `owner`).
 
-### 1a — (A) the SOL-mode dividend + token withdraw revert
+### 1a — (A) the SOL-mode dividend + token withdraw revert — ✅ FIXED (FIX-1)
 
-Covered in the executive summary. `scale_g_bug_a_*` shows the revert;
-`scale_g2_*` shows SPL mode (no lamport surgery) is fine; the claim-first recovery
-is shown in `scale_g_bug_a_*`. **Bucket A**, demonstrated, not fixed.
+Covered in the executive summary. The revert (surgery before the token CPI) was
+FIXED in FIX-1 by moving the SOL `debit_credit` to the last money movement, after
+the CPI. Now demonstrated by the positive test
+`scale_g_fix_sol_dividend_plus_token_withdraw_one_crank` and the
+`scale_g_regression_combined_equals_claim_then_withdraw` equivalence test;
+`scale_g2_*` (SPL mode) remains the control. Shipped to devnet by in-place upgrade
+[`3hPp33d3…eXFT`](https://solscan.io/tx/3hPp33d33TN2uUXNfpjHynHGZkswM5bifVDRctuWKpregsMvP4ewspXkLC3BTLd7xudnXjkVKucb2NWWqpzfeXFT?cluster=devnet)
+and verified live on `dual-chip-1`
+([`3faxnxiW…sSYh`](https://solscan.io/tx/3faxnxiWmQBPe1UBHH7faWEZKuDvLrQTwJR1TJ5ZBFEZ5xgqWFgrpY5vvaVujsv6YRS9Vf9HqcZ7BqfnfrK1sSYh?cluster=devnet)):
+one crank paid `1,999,486,046,306` CHIP base units + `2,000,000` lamports, exact by
+recompute. **Bucket A, fixed.**
 
 ### 1b — (B) the ordering payoff
 
@@ -361,7 +383,7 @@ cargo test -p house --features mock-randomness,mock-price,mock-swap scale_
 
 # pre-existing suites are unchanged (counts rise only by the new scale_* tests):
 cargo test --workspace                                                   # 10 + 48 + 1
-cargo test -p house --features mock-randomness,mock-price,mock-swap      # test_house 19, test_dual 23, gate 1
+cargo test -p house --features mock-randomness,mock-price,mock-swap      # test_house 19, test_dual 24, gate 1
 ```
 
 Named tests referenced above:
@@ -369,7 +391,8 @@ Named tests referenced above:
 `scale_b_no_starvation_victim_self_cranks` (test_house.rs);
 `scale_e_pending_cap_denies_then_permissionlessly_heals`,
 `scale_f_dual_token_withdraw_order_payoff`,
-`scale_g_bug_a_sol_dividend_plus_token_withdraw_reverts`,
+`scale_g_fix_sol_dividend_plus_token_withdraw_one_crank` (FIX-1, was
+`scale_g_bug_a_*`), `scale_g_regression_combined_equals_claim_then_withdraw`,
 `scale_g2_spl_mode_withdraw_with_dividend_is_fine`,
 `scale_h_compound_per_position_band_close_is_variance_not_dilution`,
 `scale_model_pending_slot_capital` (test_dual.rs).
