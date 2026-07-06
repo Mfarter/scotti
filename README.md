@@ -13,9 +13,9 @@ licensed-casino activity *and* a pooled investment product — out of scope by d
 |---|---|---|
 | `HOUSE-SPEC.md` | module design v0 | draft for review |
 | `crates/house-math` | exact machine math: paytables, RTP curve `k(D)`, exposure cap, depth smoothing, books-balance, tick→price fixed point, TWAP-from-cumulative-ticks, margin-floor invariant, token payout + value-RTP-invariance + haircut-solvency, MasterChef SOL dividend ledger, **CLMM byte parser (ground-truthed to live bytes) + compound share-minting** — all integer-exact, with full 32³ enumeration proofs | tested (48 proofs, `cargo test`) |
-| `programs/house` | House program: config/machine/LP/spin accounts, spin commit/settle/expire, epoch-gated withdrawals, **dual-asset `DualMachine` (SOL in / SPL out): token vault, real on-chain CLMM price reader + band/staleness gates, haircut reserve, price-free token deposits, SOL dividend ledger + SOL/SPL reward modes, price-free dual-asset withdrawals, `compound_epoch` (SPL→shares)** | **H3 shipped** on devnet · **H6b-1/2/3** dual-asset core + LP layer + CLMM reader/compound (built + tested; **devnet upgrade deferred — faucet balance**) |
+| `programs/house` | House program: config/machine/LP/spin accounts, spin commit/settle/expire, epoch-gated withdrawals, **dual-asset `DualMachine` (SOL in / SPL out): token vault, real on-chain CLMM price reader + band/staleness gates, haircut reserve, price-free token deposits, SOL dividend ledger + SOL/SPL reward modes, price-free dual-asset withdrawals, `compound_epoch` (SPL→shares)** | **H3 shipped** · **H6b-1/2/3 shipped + upgraded on devnet** — dual-asset core + LP layer + real CLMM reader/compound, with a **live dual spin** verified by recompute |
 | `scripts` | devnet ops: bootstrap, live spin + verifier, machine/LP status read layer, live withdrawal, **CLMM pool + layout ground-truth + TWAP/keeper** | live on devnet (see below) |
-| `H6-DUAL-ASSET-SPEC.md` | dual-asset machines (SOL in, SPL out): Raydium CLMM TWAP price, band gate, haircut reserve, dual-asset LP | **H6a + H6b-1/2/3 shipped** (price infra + program core + LP layer + real CLMM reader/compound; devnet upgrade deferred on balance) |
+| `H6-DUAL-ASSET-SPEC.md` | dual-asset machines (SOL in, SPL out): Raydium CLMM TWAP price, band gate, haircut reserve, dual-asset LP | **H6a + H6b-1/2/3 shipped + LIVE** (price infra + program core + LP layer + real CLMM reader/compound; upgraded on devnet with a live dual spin) |
 
 H1 shipped the on-chain skeleton (mock randomness); **H2** wired in real
 Switchboard On-Demand randomness on devnet; **H3** adds the LP withdrawal side
@@ -308,6 +308,37 @@ node twap-status.ts [--watch]                       # spot / TWAP / band / stale
 node keeper.ts --interval 20                        # keep observations fresh
 node twap-demo.ts                                   # the full STALE→LIVE→band→stale artifact
 ```
+
+## Dual-asset machines (H6b — live on devnet)
+
+**Dual-asset machines** take SOL wagers and pay an SPL token, priced by the token's
+Raydium CLMM TWAP read **on-chain** (`house-math::clmm` parses PoolState/
+ObservationState via the H6a pinned offsets; the reader was ground-truthed against
+captured live account bytes — `spot_1e12` and the 5-min TWAP `avg_tick` reproduce
+`twap-status.ts` exactly). The program was **upgraded in place** (H6b-3) and a full
+dual spin ran live against the real CHIP/WSOL pool:
+
+| step | tx / address |
+|---|---|
+| program upgrade (extend 240KB + redeploy) | [`54YAPz…`](https://solscan.io/tx/54YAPz3Y4PBkgDfB3QfKXwGLbi5D4CyBRBW37e6CMEmjsKb3u646tYj8ZVPGEaYSHEjjAdZ2L7eJrHVEQzBdnKUU?cluster=devnet) |
+| dual machine `dual-chip-1` | [`6vyARZoi…`](https://solscan.io/account/6vyARZoi4Kc81ZLHYxYDhE4JGH5Db4zf1u8xvLJEvYzL?cluster=devnet) |
+| `spin_commit_dual` (priced by the live CLMM TWAP) | [`5m6FfG…`](https://solscan.io/tx/5m6FfGYuHHJDLoFqPNLFHkgHSsFQLRSz8RYvZxUiUQa7oh7D1RxsCKqJgNdE7MVGjpqosQ5JaTCb1j1c3E8eWewS?cluster=devnet) |
+| `spin_settle_dual` (Switchboard reveal + CHIP payout) | [`5ATign…`](https://solscan.io/tx/5ATignq4R8L4PoXSWm15fPQW1w8AxbnRo7nKFfGdMU12Aer43FdAAzgFcZ1Esyptq8sh8VQJe2NSEhsEGE22Adr5?cluster=devnet) |
+| `claim_sol` (SOL dividend) | [`46y4nJ…`](https://solscan.io/tx/46y4nJtBM6EYJvgbo7mVyCfy2yMXdhnDe3h1iz2DiJENrp9vnQqBQE4z9ZrKrLLkaFbpRGe7u9fbsnKkxsWfyKZ2?cluster=devnet) |
+
+The commit snapshotted `price_at_commit = 972.00 CHIP/SOL` (the on-chain TWAP; spot
+was within 18bp), and the settle's CHIP payout **matched an independent recompute
+to the base unit** (`803805307`). The live H3 single-asset machines still read and
+spin — the upgrade is backward-compatible. Reproduce with:
+
+```
+node keeper.ts --interval 16       # freshen the pool TWAP (needs pool liquidity)
+node devnet-dual-spin.ts           # create machine, deposit CHIP, commit→settle→claim, verify
+```
+
+The one residual is the REAL Raydium CLMM swap CPI inside `compound_epoch` (behind
+the `mock-swap` seam — its accounting is proven in LiteSVM, incl. the 33% compound
+worked example; the on-chain swap wiring awaits a dedicated live compound run).
 
 ## App (H4/H5 — the Scotti frontend)
 
