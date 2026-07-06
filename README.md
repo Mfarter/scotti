@@ -175,7 +175,7 @@ CHIP/WSOL CLMM pool — see *Dual-asset machines* below for the design.
 | H6b-3 `spin_settle_dual` | [`5ATign…`](https://solscan.io/tx/5ATignq4R8L4PoXSWm15fPQW1w8AxbnRo7nKFfGdMU12Aer43FdAAzgFcZ1Esyptq8sh8VQJe2NSEhsEGE22Adr5?cluster=devnet) | Switchboard-settled CHIP payout matched recompute to the base unit (803805307) |
 | H6b-3 `claim_sol` | [`46y4nJ…`](https://solscan.io/tx/46y4nJtBM6EYJvgbo7mVyCfy2yMXdhnDe3h1iz2DiJENrp9vnQqBQE4z9ZrKrLLkaFbpRGe7u9fbsnKkxsWfyKZ2?cluster=devnet) | SOL dividend paid from the MasterChef ledger |
 | H6c-1 live `compound_epoch` | [`5P8zLq…`](https://solscan.io/tx/5P8zLq6tqBtX35xvH2k8VeksddoJ6VoXmkjnKKsubc2JTGm4mJ5j95xBn9ALCndv1UWPbYL6cPUsTDov7KF9zWQP?cluster=devnet) | real `swap_v2` CPI (174,732 CU): machine SOL −earmark, vault CHIP +3,913,661,140 (≥ TWAP×(1−band)), shares minted non-dilutively |
-| H6c-2 UI dual spin | *app session-key harness + extended `verify-spin`* (no persisted txid) | CHERRY · BLANK · CHERRY, 3.83 CHIP, recompute == paid; price independently recomputed from the ring at 977.67 vs the 977.65 snapshot (0.15 bp) |
+| H6c-2 UI dual spin (`spin_settle_dual`) | [`Gc874Z…`](https://solscan.io/tx/Gc874Zcxrh37PWL9mpce8NWTUx7pYtjPfW1BpB9B8C7ynfmcKSoCkrUTVXMdApg7skKWnpwhoVZoAhc6LGZ5Uv2?cluster=devnet) | CHERRY · BLANK · CHERRY, 3.83 CHIP, recompute == paid; price independently recomputed from the ring at 977.67 vs the 977.65 snapshot (0.15 bp) |
 
 The three H2 spins' full commit/settle signatures and revealed randomness live in
 `scripts/spins/`. `spin_expire` (reveal-never-arrives refund) needs a ~9000-slot
