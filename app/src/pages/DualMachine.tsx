@@ -9,6 +9,7 @@ import { SpinStage } from "../lib/spin.ts";
 import { DEEP, SHALLOW, payoutBp, payoutValueLamports, BP, SYMBOL_NAME } from "../lib/housemath.ts";
 import { fmtPctBp, fmtSol, fmtTokens, heatColor, rtpHeat } from "../lib/format.ts";
 import { Reels, Sol, Stat, Solscan, PriceChip } from "../components/ui.tsx";
+import { RecentSpins } from "../components/Indexed.tsx";
 import { DualVerifyButton } from "../components/Verify.tsx";
 import { DualStatus } from "../lib/dualstatus.ts";
 import { useSession } from "../components/SessionProvider.tsx";
@@ -183,6 +184,8 @@ export function DualMachinePage() {
           ))}
         </div>
       )}
+
+      <RecentSpins machine={status.machine} kind="dual" tokenDecimals={status.tokenDecimals} />
     </div>
   );
 }

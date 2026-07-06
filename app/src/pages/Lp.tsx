@@ -8,6 +8,8 @@ import { confirm } from "../lib/rpc.ts";
 import { SOL } from "../lib/constants.ts";
 import { fmtPctBp, fmtLamports } from "../lib/format.ts";
 import { Sol, Stat } from "../components/ui.tsx";
+import { SharePriceChart } from "../components/Indexed.tsx";
+import { indexerEnabled } from "../lib/indexer.ts";
 import { DualLpPanel } from "./DualLpPanel.tsx";
 
 function parseSol(s: string): bigint | null {
@@ -214,7 +216,9 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
         </span>
       </div>
 
-      <div className="faint" style={{ fontSize: 12 }}>Trailing 7d/30d share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>
+      {indexerEnabled()
+        ? <><div className="hr" /><SharePriceChart machine={status.machine} kind="single" /></>
+        : <div className="faint" style={{ fontSize: 12 }}>Trailing 7d/30d share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>}
     </div>
   );
 }

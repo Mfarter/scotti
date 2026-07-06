@@ -126,6 +126,21 @@ export function Fair() {
         </span>
       </div>
 
+      <div className="note stack" style={{ gap: 6 }}>
+        <span style={{ fontWeight: 800, fontFamily: "var(--display)" }}>Chain-read data vs. the indexer</span>
+        <span style={{ fontSize: 14 }}>
+          Almost everything on this site is a <b>direct chain read</b>: the odds, the pool state, the price gate,
+          and every spin you run and verify are computed in your browser from on-chain accounts — trustless, no
+          middleman. The one exception is the optional <b>share-price history chart</b> and the <b>recent-spins
+          feed</b>, which are served by the <b>Scotti indexer</b> — an <b>off-chain service</b>. That data is
+          convenient but not trustless: it is served by an operator who could omit or reorder rows. To keep it
+          honest, the indexer <b>recomputes every spin at ingest</b> from the same chain data and stores the
+          result, so each row in the feed shows its <b>recompute status</b> (verified / partial / unverifiable) —
+          and you can always re-verify any spin in-browser yourself. Same register as the session-chips custody
+          note above: a convenience, with its trust boundary stated plainly.
+        </span>
+      </div>
+
       <div className="note warn stack" style={{ gap: 6 }}>
         <span style={{ fontWeight: 800, fontFamily: "var(--display)" }}>The posture, in plain language</span>
         <span style={{ fontSize: 14 }}>

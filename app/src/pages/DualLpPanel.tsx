@@ -14,6 +14,8 @@ import {
 import { confirm } from "../lib/rpc.ts";
 import { fmtTokens, fmtLamports } from "../lib/format.ts";
 import { Sol, Stat, PriceChip } from "../components/ui.tsx";
+import { SharePriceChart } from "../components/Indexed.tsx";
+import { indexerEnabled } from "../lib/indexer.ts";
 
 export function DualLpPanel() {
   const { connection } = useConnection();
@@ -196,7 +198,9 @@ export function DualLpPanel() {
                   vault is flat. You hold two risks at once: house variance <i>and</i> the token's market.
                 </span>
               </div>
-              <div className="faint" style={{ fontSize: 12 }}>Trailing share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>
+              {indexerEnabled() && m
+                ? <><div className="hr" /><SharePriceChart machine={m.toBase58()} kind="dual" /></>
+                : <div className="faint" style={{ fontSize: 12 }}>Trailing share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>}
             </div>
           </div>
         </div>

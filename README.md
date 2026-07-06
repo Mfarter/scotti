@@ -377,6 +377,61 @@ for SHALLOW only. The only step still needing a human is the single wallet-signa
 popup (connect, then buy-in or a wallet-mode spin) — standard wallet-adapter
 plumbing.
 
+## The indexer (optional off-chain service)
+
+The app is pure chain-reads, which is why it honestly *deferred* a trailing
+share-price chart: that needs history, and history needs something to record it.
+`indexer/` is that something — a **standalone** TypeScript/node service (its own
+`package.json`) that samples every machine's share price on an interval and walks
+the program's settle history into a spin feed, served over a small read-only JSON
+API. It is the **first non-chain-read data path** in the project, and it is built
+to earn that trust rather than assume it.
+
+- **Reuses, never re-derives.** All decoding and house-math come from `../scripts`
+  (the exact code `verify-spin.ts` runs) plus the DualMachine offsets ported from
+  the app — a single `reuse.ts` boundary. The indexer defines no layout of its own.
+- **Every spin is recomputed at ingest.** Reels from the randomness account, wager
+  from the commit tx, payout from the settle tx's balance/token delta — checked
+  against house-math, exactly like `verify-spin`. Each row is stored with its
+  status: **verified** (recompute matched), **partial** (reels + payout confirmed
+  but a dual price aged out of the 100-slot observation ring), **unverifiable**
+  (randomness closed / commit aged out of RPC), or **mismatch**. A mismatch is a
+  loud stop condition, never silently stored as ok.
+- **Share-price semantics, kept separate.** Single-asset = pool_value / total_shares
+  (lamports per share). Dual-asset: the **primary** series is token-per-share
+  (price-free, manipulation-immune); a **secondary**, clearly-labeled series adds
+  the pending SOL dividend and the token value at the TWAP (price-dependent, shown
+  only when the CLMM price is LIVE). They are never blended into one number.
+- **Backfill honesty.** It records the earliest indexed slot/time per machine and
+  serves it, so the app says "history begins &lt;date&gt;" instead of implying
+  completeness — devnet RPC history is finite.
+- **Storage + serving.** SQLite via `node:sqlite` (one file, one migration — no
+  native deps, no external services); HTTP via `node:http`, CORS wide open (public
+  devnet data). No writes, no auth, no state beyond the file.
+
+**The trust model, stated where it renders.** Indexed data is convenient and
+recompute-checked, but it is served by an operator who could omit or reorder rows —
+so wherever it appears (the LP chart, the machine spin feed) the app marks it *"from
+the Scotti indexer — an off-chain service… you can verify any spin yourself
+in-browser,"* every spin row shows its recompute badge, and the Fair page carries a
+note distinguishing trustless chain-reads from this convenient-but-operator-served
+layer (same register as the session-chips custody disclosure). Set
+`VITE_INDEXER_URL` to switch it on; **leave it unset and the app behaves exactly as
+before** — the chart stays deferred, no indexer calls fire.
+
+```sh
+cd indexer && npm install
+cp .env.example .env             # optional; every value has a default
+npm run ingest -- --once         # a single pass (backfill + one price sample); CI-friendly, exits non-zero on a mismatch
+npm run dev                      # ingest loop + API together
+npm run serve                    # API only          → http://localhost:8787
+npm test                         # 20 tests: parsers + recompute + idempotency + share-price math (offline fixtures)
+# API: GET /health · /machines · /machines/:pk/price?from&to&resolution · /machines/:pk/spins?limit&before
+```
+
+Then point the app at it: `VITE_INDEXER_URL=http://localhost:8787 npm run dev` in
+`app/`.
+
 ## Repo map
 
 | path | what | status |
@@ -387,6 +442,7 @@ plumbing.
 | `programs/house` | House program: config / machine / LP / spin accounts, spin commit/settle/expire, epoch-gated withdrawals, and dual-asset `DualMachine` (SOL in / SPL out): token vault, on-chain CLMM price reader + band/staleness gates, haircut reserve, price-free token deposits, SOL dividend ledger + SOL/SPL reward modes, price-free dual-asset withdrawals, `compound_epoch` (real `swap_v2`) | live on devnet |
 | `scripts` | devnet ops: bootstrap, live spin + verifier, machine/LP status read layer, live withdrawal, CLMM pool + layout ground-truth + TWAP/keeper, dual spin + compound | live on devnet |
 | `app` | Scotti frontend (Vite + React + TS) | live |
+| `indexer` | standalone off-chain service: share-price sampling + spin feed (each spin recomputed at ingest), SQLite + read-only JSON API | tests green; opt-in via `VITE_INDEXER_URL` |
 
 ## Reproduce it
 
@@ -471,8 +527,10 @@ deploy `dist/` as static files. The app uses hash routing (`/#/machine/…`), so
 
 - **`spin_expire` live.** Needs a ~1 h abandonment to stage on devnet; covered by
   the LiteSVM test `e_expiry_refunds_and_releases`.
-- **Share-price history** in the app LP dashboard — honestly deferred (the display
-  shows current share price + EV, not a trailing series).
+- **Share-price history in the app with no indexer running.** The trailing chart
+  requires the optional indexer (see *The indexer* above); with `VITE_INDEXER_URL`
+  unset the LP dashboard still shows current share price + EV and marks the trailing
+  series as deferred rather than faking it.
 - **Everything mainnet.** Precluded by the legal posture above, not by
   engineering — see [`HOUSE-SPEC.md`](./HOUSE-SPEC.md) §7 for the full v0
   exclusion list (multi-line reels, volume-EMA curve term, progressive jackpots,

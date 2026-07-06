@@ -8,6 +8,7 @@ import { runSpin, SpinResult, SpinStage } from "../lib/spin.ts";
 import { DEEP, SHALLOW, payoutBp, BP, SYMBOL_NAME } from "../lib/housemath.ts";
 import { fmtPctBp, fmtSol, fmtLamports, heatColor, rtpHeat } from "../lib/format.ts";
 import { Reels, Sol, Stat, TierBadge, Solscan } from "../components/ui.tsx";
+import { RecentSpins } from "../components/Indexed.tsx";
 import { VerifyButton } from "../components/Verify.tsx";
 import { MachineStatus } from "../lib/status.ts";
 import { useSession } from "../components/SessionProvider.tsx";
@@ -151,6 +152,8 @@ export function MachinePage() {
           ))}
         </div>
       )}
+
+      <RecentSpins machine={status.machine} kind="single" />
     </div>
   );
 }

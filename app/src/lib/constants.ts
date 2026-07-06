@@ -8,6 +8,10 @@ export const SOL = 1_000_000_000n;
 export const RPC_URL = (import.meta.env?.VITE_RPC_URL as string | undefined) ?? "https://api.devnet.solana.com";
 export const CLUSTER = "devnet" as const;
 
+// OPTIONAL off-chain indexer (../indexer). Unset ⇒ the app is chain-reads only and
+// the trailing history stays honestly deferred (graceful degradation, unchanged).
+export const INDEXER_URL = ((import.meta.env?.VITE_INDEXER_URL as string | undefined) ?? "").replace(/\/$/, "");
+
 // Switchboard On-Demand (devnet).
 export const SB_DEVNET_PID = new PublicKey("Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2");
 export const SB_DEVNET_QUEUE = new PublicKey("EYiAmGSdsQTuCw413V5BzaruWuCCSDgTPtBGvLkXHbe7");
