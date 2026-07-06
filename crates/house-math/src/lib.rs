@@ -11,6 +11,7 @@
 // cumulative ticks, and the margin-floor invariant. Each is proof-tested like
 // the game math below.
 pub mod margin;
+pub mod payout;
 pub mod price;
 pub mod twap;
 
@@ -121,11 +122,26 @@ pub const RTP_MAX_BP: u128 = 9_700; // 97%
 /// k_min rounds UP (so RTP >= floor), k_max rounds DOWN (so RTP <= ceiling).
 /// `const` so on-chain callers avoid the 32_768-outcome enumeration entirely.
 pub const fn k_bounds_of_num(num: u128) -> (u128, u128) {
+    k_bounds_of_num_with(num, RTP_MIN_BP, RTP_MAX_BP)
+}
+
+/// k bounds for an ARBITRARY realized-RTP band [rtp_min_bp, rtp_max_bp]. The
+/// single-asset default uses [92%, 97%]; dual-asset machines pass a tighter
+/// ceiling (the spec's 95%) so the margin-floor invariant holds under the price
+/// band gate (see `margin::margin_floor_holds`). Same rounding discipline:
+/// k_min rounds UP (realized ≥ floor), k_max rounds DOWN (realized ≤ ceiling).
+pub const fn k_bounds_of_num_with(num: u128, rtp_min_bp: u128, rtp_max_bp: u128) -> (u128, u128) {
     let total = (STOPS * STOPS * STOPS) as u128;
-    // realized_rtp_bp = num * k / (total * BP); solve for k at band edges.
-    let k_min = (RTP_MIN_BP * total * BP).div_ceil(num);
-    let k_max = (RTP_MAX_BP * total * BP) / num;
+    let k_min = (rtp_min_bp * total * BP).div_ceil(num);
+    let k_max = (rtp_max_bp * total * BP) / num;
     (k_min, k_max)
+}
+
+/// Dual-asset k bounds for a tier numerator at a validated RTP ceiling. The
+/// floor is the dual RTP min (`margin::DUAL_RTP_MIN_BP`, 92%); `rtp_max_bp` is
+/// the machine's validated ceiling. O(1), on-chain-safe.
+pub const fn k_bounds_dual(num: u128, rtp_max_bp: u128) -> (u128, u128) {
+    k_bounds_of_num_with(num, margin::DUAL_RTP_MIN_BP, rtp_max_bp)
 }
 
 /// k scaler bounds for a tier — enumerates to derive the numerator. Test-time

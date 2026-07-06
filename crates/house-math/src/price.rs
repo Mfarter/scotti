@@ -65,6 +65,34 @@ pub fn full_mul(x: u128, y: u128) -> (u128, u128) {
     (hi, lo)
 }
 
+/// floor(a · b / d), exact, via a 256-bit intermediate — so payout math never
+/// overflows even when a·b exceeds u128. `d` must be nonzero and < 2^127 (all
+/// house denominators are ~1e29 ≪ 2^97); the quotient is asserted to fit u128.
+pub fn wide_mul_div(a: u128, b: u128, d: u128) -> u128 {
+    assert!(d != 0 && d < (1u128 << 127), "wide_mul_div: bad divisor");
+    let (hi, lo) = full_mul(a, b); // 256-bit numerator
+    // binary long division of the 256-bit (hi,lo) by d, MSB first. `rem < d`
+    // is maintained, so `rem << 1` never overflows (d < 2^127 ⇒ rem < 2^127).
+    let mut q: u128 = 0;
+    let mut rem: u128 = 0;
+    let mut i: i32 = 255;
+    while i >= 0 {
+        let bit = if i >= 128 { (hi >> (i - 128)) & 1 } else { (lo >> i) & 1 };
+        rem = (rem << 1) | bit;
+        if rem >= d {
+            rem -= d;
+            if i < 128 {
+                q |= 1u128 << i;
+            } else {
+                // a set quotient bit at ≥128 means the result exceeds u128.
+                panic!("wide_mul_div: quotient overflow");
+            }
+        }
+        i -= 1;
+    }
+    q
+}
+
 /// price (mintB per mintA, equal decimals) scaled by 1e12, from a tick.
 /// price_1e12 = (sqrt_price_x64^2 · 1e12) >> 128, computed in 256-bit so the
 /// square and the scale never truncate. Panics (overflow guard) for ticks whose
@@ -176,5 +204,22 @@ mod proofs {
         let (hi, lo) = full_mul(1u128 << 80, 1u128 << 80);
         assert_eq!(lo, 0);
         assert_eq!(hi, 1u128 << 32);
+    }
+
+    /// PROOF: wide_mul_div == floor(a·b/d), matching native u128 where a·b fits,
+    /// and correct where it does not (checked against a scaled-down reference).
+    #[test]
+    fn wide_mul_div_correct() {
+        // fits-in-u128 cases: compare to native
+        for &(a, b, d) in &[(0u128, 5, 3), (100, 100, 7), (1_000_000_007, 999_983, 101),
+            (u64::MAX as u128, u64::MAX as u128, 1_000_000_000)] {
+            assert_eq!(wide_mul_div(a, b, d), a * b / d);
+        }
+        // overflowing product: (2^100)·(2^30) / 2^40 = 2^90, exact
+        assert_eq!(wide_mul_div(1u128 << 100, 1u128 << 30, 1u128 << 40), 1u128 << 90);
+        // the payout denominator (1e29) with a big numerator
+        let denom = 1_000_000_000u128 * 10_000 * 10_000 * 1_000_000_000_000; // 1e29
+        // 1e26 · 1e15 / 1e29 = 1e12
+        assert_eq!(wide_mul_div(100_000_000_000_000_000_000_000_000, 1_000_000_000_000_000, denom), 1_000_000_000_000);
     }
 }

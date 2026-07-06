@@ -1,6 +1,6 @@
 # Scotti House Module — H6: Dual-Asset Machines (SOL in, SPL out) — Spec v0 draft
 
-**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
+**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3; LP dividend ledger is H6b-2. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
 **Legal posture:** unchanged from HOUSE-SPEC and amplified: a token-denominated house adds a
 token-issuance/market dimension on top of the licensed-casino question. Devnet demonstration only.
 
@@ -126,7 +126,22 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
   reserved space — decide against live-account compatibility, per H3 precedent), token vault,
   price snapshot + band gate + staleness gate + haircut reserve, dual-asset deposit/withdraw,
   full LiteSVM matrix with a mock pool/observation fixture (the seam pattern from H1: mock price
-  source behind a feature gate, absent from deployable IDL).
+  source behind a feature gate, absent from deployable IDL). Split into three:
+  - **H6b-1 — dual-asset core + spin path. ✓ SHIPPED (mock price).** A separate `DualMachine`
+    account (the dual-asset params — 4 pubkeys + risk fields — far exceed `Machine`'s 56 reserved
+    bytes, so growing it would break the live H3 SOL machines; a new account type keeps them
+    untouched). Token vault ATA owned by the PDA, `create_machine_dual` validating the margin-floor
+    invariant via house-math, a minimal `lp_deposit_token`, and `spin_commit_dual` /
+    `spin_settle_dual` / `spin_expire_dual`. Price behind a `read_price` seam (mock feature vs a
+    CLMM stub) with gate evaluation in shared code. house-math: token payout + value-RTP-invariance
+    + haircut-solvency. 27-test LiteSVM matrix; legacy SOL machines pass untouched; mocks absent
+    from the deployable IDL.
+  - **H6b-2 — LP dividend ledger.** Value-priced token deposits behind the band gate, dual-asset
+    pro-rata withdrawals (price-free), and the `pending_sol_yield` → per-share SOL dividend ledger
+    (`DualLpPosition.sol_debt`/`reward_mode` are laid out now).
+  - **H6b-3 — CLMM price reader.** Fill the `read_price` CLMM backend: parse Raydium
+    PoolState.sqrt_price + ObservationState cumulative-tick TWAP via the pinned H6a offsets, under
+    the owner-check trust pattern. No gate logic changes (it lives outside the seam).
 - **H6c — devnet + frontend.** Deploy/upgrade, bootstrap a dual-asset machine on the floor,
   spin against the real pool, extend `verify-spin` to recompute price from the observation
   history, and the UI: token payouts with value equivalents, the third LP disclosure, and a

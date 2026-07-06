@@ -26,11 +26,18 @@ fn default_build_idl_has_no_mock_surface() {
         .collect();
     assert!(!instrs.is_empty(), "default-build IDL has no instructions — stale/empty build?");
 
+    // Generic gate: NO instruction may contain "mock". This covers both seams —
+    // mock_fill_randomness (H1) and mock_set_price (H6b-1) — automatically.
     for n in &instrs {
         assert!(
             !n.to_lowercase().contains("mock"),
             "SECURITY GATE FAILED: mock instruction '{n}' present in the default-build IDL"
         );
+    }
+    // Belt-and-suspenders: both mock instructions named explicitly.
+    for banned in ["mock_set_price", "mock_fill_randomness"] {
+        assert!(!instrs.iter().any(|n| n == banned),
+            "SECURITY GATE FAILED: {banned} present in the default-build IDL");
     }
 
     if let Some(accts) = idl["accounts"].as_array() {
@@ -41,6 +48,13 @@ fn default_build_idl_has_no_mock_surface() {
                 "SECURITY GATE FAILED: mock account '{n}' present in the default-build IDL"
             );
         }
+    }
+
+    // Positive check: the REAL dual-asset surface (H6b-1) must be present — the
+    // clmm price backend ships even though its reader is stubbed until H6b-3.
+    for needed in ["create_machine_dual", "lp_deposit_token", "spin_commit_dual", "spin_settle_dual", "spin_expire_dual"] {
+        assert!(instrs.iter().any(|n| n == needed),
+            "dual-asset instruction '{needed}' missing from the default-build IDL");
     }
 
     eprintln!("gate ok: {} default-build instructions, none mock: {:?}", instrs.len(), instrs);

@@ -82,6 +82,29 @@ mod proofs {
         assert!(range_ok, "the rejection is the invariant's doing, not a range cap");
     }
 
+    /// PROOF: the dual k-ceiling actually enforces `rtp_max_bp` — with k clamped
+    /// to `k_bounds_dual(num, rtp_max_bp)`, realized RTP at k_max stays ≤
+    /// rtp_max_bp for both tiers, so the RTP ceiling the machine validates against
+    /// the margin floor is the ceiling the spin path realizes. This is the link
+    /// between `create_machine_dual`'s validation and settle-time payouts.
+    #[test]
+    fn dual_k_ceiling_respects_rtp_max() {
+        use crate::{base_rtp, k_bounds_dual, DEEP, SHALLOW, STOPS};
+        let total = (STOPS * STOPS * STOPS) as u128;
+        // rtp_max must exceed the dual RTP floor (9200) for a non-degenerate band.
+        for rtp_max in [9_350u128, 9_450, 9_500] {
+            for tier in [&SHALLOW, &DEEP] {
+                let (_, num) = base_rtp(tier);
+                let (k_min, k_max) = k_bounds_dual(num, rtp_max);
+                assert!(k_min <= k_max);
+                let realized = num * k_max / (total * BP);
+                assert!(realized <= rtp_max, "realized {realized} > ceiling {rtp_max}");
+                // and the margin floor holds for this ceiling at the spec band/floor
+                assert!(margin_floor_holds(rtp_max, BAND_CAP_BP, MARGIN_FLOOR_BP));
+            }
+        }
+    }
+
     /// PROOF (proptest-style sweep): over a broad grid that deliberately reaches
     /// past every cap, NO combination the validation accepts can cross the floor.
     /// Exhaustive: ~301 × 401 × 121 ≈ 14.6M configs.

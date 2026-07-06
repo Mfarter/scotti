@@ -13,7 +13,7 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
@@ -23,9 +23,17 @@ custom-panic = []
 # backdoor. Enabled only for LiteSVM tests (`cargo build-sbf --features
 # mock-randomness` + `cargo test -p house --features mock-randomness`).
 mock-randomness = []
+# Compiles the MockPrice account + mock_set_price instruction and the mock
+# implementation of the price seam (H6b-1). Same posture as mock-randomness: a
+# settable price account is a mint-arbitrary-payout backdoor, so it is OFF in the
+# deployable build and enabled ONLY for LiteSVM tests. The default build gets the
+# `clmm` price backend (Raydium ObservationState parsing; stubbed until H6b-3).
+mock-price = []
 
 [dependencies]
 anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }
+# Token vault CPI (transfer) + ATA creation for dual-asset machines (H6b-1).
+anchor-spl = "1.0.1"
 yvone-house-math = { path = "../../crates/house-math" }
 # On-chain only: RandomnessAccountData parsing. default-features off drops the
 # solana-v2 path and the client crates (solana-sdk/client/account-decoder);

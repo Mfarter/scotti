@@ -22,6 +22,8 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use yvone_house_math as hm;
 // Switchboard On-Demand parsing lives only in the deployable (non-mock) build.
 #[cfg(not(feature = "mock-randomness"))]
@@ -382,6 +384,299 @@ pub mod house {
         Ok(())
     }
 
+    // ===================== DUAL-ASSET MACHINES (H6b-1) =====================
+    // SOL wagers in, SPL-token payouts out. A separate DualMachine account type
+    // (see its doc-comment for the live-account-compatibility justification), a
+    // token vault owned by the machine PDA, a price snapshot behind the mock/clmm
+    // price seam with staleness + band gates, and a haircut-reserved token escrow.
+    // The randomness seam and ALL math (via house-math) are shared with H1.
+
+    /// Admin-gated dual-asset machine creation. Validates the margin-floor
+    /// invariant via house-math (`validate_dual_params`) so no accepted config
+    /// can cross the floor under the band gate, records the price-source
+    /// addresses (parsed in H6b-3), and creates the machine's token vault ATA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_machine_dual(
+        ctx: Context<CreateMachineDual>,
+        machine_id: [u8; 16],
+        params: DualParams,
+        curator: Pubkey,
+    ) -> Result<()> {
+        let p = &params;
+        require!(0 < p.d_low && p.d_low < p.d_mid && p.d_mid < p.d_high, HouseError::InvalidParams);
+        require!(p.max_exposure_bp > 0 && p.max_exposure_bp <= hm::BP as u64, HouseError::InvalidParams);
+        require!(p.smooth_window > 0 && p.epoch_length > 0, HouseError::InvalidParams);
+        require!(p.token_decimals <= 18, HouseError::InvalidParams);
+        require!(p.twap_window_secs > 0 && p.max_staleness_secs > 0, HouseError::InvalidParams);
+        require!(p.max_pending_spins > 0, HouseError::InvalidParams);
+        require!(p.haircut_bp as u128 <= hm::BP, HouseError::InvalidParams);
+        // The solvency link: reject any RTP-ceiling / band / margin-floor combo
+        // that could cross the floor (spec §3–4). This is where the H6a
+        // margin.rs invariant becomes an on-chain gate.
+        require!(
+            hm::margin::validate_dual_params(p.rtp_max_bp as u128, p.band_bp as u128, p.m_bp as u128),
+            HouseError::MarginFloorViolation
+        );
+
+        let now = Clock::get()?.slot;
+        let m = &mut ctx.accounts.machine;
+        m.machine_id = machine_id;
+        m.curator = curator;
+        m.token_mint = ctx.accounts.token_mint.key();
+        m.pool = p.pool;
+        m.observation = p.observation;
+        m.token_vault = ctx.accounts.token_vault.key();
+        m.token_decimals = p.token_decimals;
+        m.d_low = p.d_low;
+        m.d_mid = p.d_mid;
+        m.d_high = p.d_high;
+        m.max_exposure_bp = p.max_exposure_bp;
+        m.smooth_window = p.smooth_window;
+        m.epoch_length = p.epoch_length;
+        m.twap_window_secs = p.twap_window_secs;
+        m.max_staleness_secs = p.max_staleness_secs;
+        m.band_bp = p.band_bp;
+        m.m_bp = p.m_bp;
+        m.haircut_bp = p.haircut_bp;
+        m.rtp_max_bp = p.rtp_max_bp;
+        m.max_pending_spins = p.max_pending_spins;
+        m.pending_spins = 0;
+        m.token_balance = 0;
+        m.reserved_tokens = 0;
+        m.escrowed_sol = 0;
+        m.pending_sol_yield = 0;
+        m.total_shares = 0;
+        m.smoothed_value = 0; // cold until the first spin (first time a TWAP is read)
+        m.smoothed_last_slot = now;
+        m.paused = false;
+        m.bump = ctx.bumps.machine;
+        m.reserved = [0u8; DualMachine::RESERVED_LEN];
+        Ok(())
+    }
+
+    /// Minimal token deposit (H6b-1): fund the vault so the spin path has tokens
+    /// to pay. Token-denominated shares (value-priced deposits + the band gate +
+    /// dividend ledger are H6b-2). `mint = amount × total_shares / token_balance`,
+    /// first deposit 1:1 at 1e6 scale. Tokens move by token-program CPI.
+    pub fn lp_deposit_token(ctx: Context<LpDepositToken>, amount: u64) -> Result<()> {
+        require!(amount > 0, HouseError::InvalidWager);
+        let m = &ctx.accounts.machine;
+        let first = m.total_shares == 0;
+        let shares: u128 = if first {
+            (amount as u128).checked_mul(SHARE_SCALE).ok_or(HouseError::MathOverflow)?
+        } else {
+            require!(m.token_balance > 0, HouseError::MathOverflow);
+            (amount as u128)
+                .checked_mul(m.total_shares).ok_or(HouseError::MathOverflow)?
+                .checked_div(m.token_balance).ok_or(HouseError::MathOverflow)?
+        };
+        require!(shares > 0, HouseError::DepositTooSmall);
+
+        // owner ATA -> vault, authority = owner.
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                Transfer {
+                    from: ctx.accounts.owner_token_account.to_account_info(),
+                    to: ctx.accounts.token_vault.to_account_info(),
+                    authority: ctx.accounts.owner.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+
+        let m = &mut ctx.accounts.machine;
+        m.token_balance = m.token_balance.checked_add(amount as u128).ok_or(HouseError::MathOverflow)?;
+        m.total_shares = m.total_shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
+
+        let pos = &mut ctx.accounts.position;
+        pos.machine = ctx.accounts.machine.key();
+        pos.owner = ctx.accounts.owner.key();
+        pos.shares = pos.shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
+        pos.bump = ctx.bumps.position;
+        Ok(())
+    }
+
+    /// Commit a dual-asset spin (spec §3). Gates paused / staleness / band /
+    /// pending-spin cap, snapshots `price_at_commit = TWAP`, freezes k/tier from
+    /// the SMOOTHED token-side VALUE depth, enforces BOTH the value-curve max_bet
+    /// and the token-solvency bound (max_payout × (1+haircut) ≤ exposure × token
+    /// balance), escrows the SOL wager and reserves the token payout+haircut.
+    pub fn spin_commit_dual(ctx: Context<SpinCommitDual>, wager: u64, nonce: u64) -> Result<()> {
+        let m = &ctx.accounts.machine;
+        require!(!m.paused, HouseError::MachinePaused);
+        require!(wager > 0, HouseError::InvalidWager);
+        require!(m.pending_spins < m.max_pending_spins, HouseError::TooManyPendingSpins);
+
+        // --- price seam + shared gates (spec §2–3) ---
+        let reading = read_price(
+            &ctx.accounts.price_pool, &ctx.accounts.price_observation, m.pool, m.observation,
+        )?;
+        eval_price_gates(&reading, m.max_staleness_secs, m.band_bp)?;
+        let twap = reading.twap_1e12;
+        let dec = m.token_decimals;
+
+        let now = Clock::get()?.slot;
+
+        // value depth D = accrued SOL yield + token_balance valued at TWAP (§4).
+        let token_value = hm::payout::payout_value_lamports(m.token_balance, twap, dec);
+        let d_now = (m.pending_sol_yield as u128).checked_add(token_value).ok_or(HouseError::MathOverflow)?;
+
+        // SmoothedDepth on VALUE; cold-start seeds to D_now at the first spin (the
+        // first moment a TWAP exists to value the token side).
+        let mut sd = if m.smoothed_value == 0 {
+            hm::SmoothedDepth::new(d_now, now)
+        } else {
+            hm::SmoothedDepth { value: m.smoothed_value, last_slot: m.smoothed_last_slot }
+        };
+        let depth = sd.update(d_now, now, m.smooth_window);
+
+        let is_deep = depth >= m.d_mid as u128;
+        let tier = if is_deep { &hm::DEEP } else { &hm::SHALLOW };
+        let num = if is_deep { hm::DEEP_NUM } else { hm::SHALLOW_NUM };
+        // dual k-bounds respect the machine's validated RTP ceiling (spec §4).
+        let (k_min, k_max) = hm::k_bounds_dual(num, m.rtp_max_bp as u128);
+        let k = hm::k_of_depth(depth, m.d_low as u128, m.d_high as u128, k_min, k_max);
+
+        // constraint 1: value-curve max_bet (lamports).
+        let value_max_bet = hm::max_bet(depth, m.max_exposure_bp as u128, tier, k);
+        require!((wager as u128) <= value_max_bet, HouseError::BetExceedsMax);
+
+        // constraint 2: token-solvency (payouts are tokens) — the binding one wins.
+        let max_payout = hm::payout::max_payout_tokens(wager as u128, tier, k, twap, dec)
+            .ok_or(HouseError::MathOverflow)?;
+        let reserve = hm::payout::reserve_with_haircut(max_payout, m.haircut_bp as u128)
+            .ok_or(HouseError::MathOverflow)?;
+        let token_cap = (m.token_balance)
+            .checked_mul(m.max_exposure_bp as u128).ok_or(HouseError::MathOverflow)? / hm::BP;
+        require!(reserve <= token_cap, HouseError::BetExceedsMax);
+        // and the reserve must fit within the currently-free token balance.
+        let free_tokens = m.token_balance.checked_sub(m.reserved_tokens).ok_or(HouseError::MathOverflow)?;
+        require!(reserve <= free_tokens, HouseError::InsufficientTokenLiquidity);
+
+        // randomness commit (shared seam), then escrow the SOL wager.
+        let seed_slot = commit_seed_slot(&ctx.accounts.randomness, now)?;
+        invoke(
+            &system_instruction::transfer(&ctx.accounts.player.key(), &ctx.accounts.machine.key(), wager),
+            &[
+                ctx.accounts.player.to_account_info(),
+                ctx.accounts.machine.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        let m = &mut ctx.accounts.machine;
+        m.smoothed_value = sd.value;
+        m.smoothed_last_slot = sd.last_slot;
+        m.reserved_tokens = m.reserved_tokens.checked_add(reserve).ok_or(HouseError::MathOverflow)?;
+        m.escrowed_sol = m.escrowed_sol.checked_add(wager).ok_or(HouseError::MathOverflow)?;
+        m.pending_spins += 1;
+
+        let s = &mut ctx.accounts.pending_spin;
+        s.machine = ctx.accounts.machine.key();
+        s.player = ctx.accounts.player.key();
+        s.nonce = nonce;
+        s.wager = wager;
+        s.k_bp = k;
+        s.tier_is_deep = is_deep;
+        s.price_at_commit_1e12 = twap;
+        s.max_payout_tokens = max_payout;
+        s.reserved_tokens = reserve;
+        s.randomness = ctx.accounts.randomness.key();
+        s.rand_seed_slot = seed_slot;
+        s.commit_slot = now;
+        s.bump = ctx.bumps.pending_spin;
+        Ok(())
+    }
+
+    /// Settle a dual-asset spin (spec §3). Permissionless. Reads randomness via
+    /// the seam, prices the outcome at the SNAPSHOT price (never current), pays
+    /// tokens from the vault by CPI (signed by the machine PDA), releases the
+    /// token reserve, and accrues the SOL wager into `pending_sol_yield` (the
+    /// H6b-2 dividend ledger consumes it — here it just accumulates, auditably).
+    pub fn spin_settle_dual(ctx: Context<SpinSettleDual>, nonce: u64) -> Result<()> {
+        let _ = nonce;
+        let s = &ctx.accounts.pending_spin;
+        let now = Clock::get()?.slot;
+        let bytes = revealed_bytes(&ctx.accounts.randomness, s.randomness, s.rand_seed_slot, now)?;
+        let reels = hm::reels_from_randomness(&bytes);
+
+        let tier = if s.tier_is_deep { &hm::DEEP } else { &hm::SHALLOW };
+        let m = &ctx.accounts.machine;
+        // payout in tokens at the COMMITTED price (FX snapshot discipline).
+        let payout = hm::payout::spin_payout_tokens(
+            s.wager as u128, tier, s.k_bp, reels, s.price_at_commit_1e12, m.token_decimals,
+        ).ok_or(HouseError::MathOverflow)?;
+        require!(payout <= s.max_payout_tokens, HouseError::MathOverflow);
+        let payout_u64 = u64::try_from(payout).map_err(|_| HouseError::MathOverflow)?;
+
+        let wager = s.wager;
+        let reserve = s.reserved_tokens;
+
+        // pay tokens from the vault, signed by the machine PDA.
+        if payout_u64 > 0 {
+            let id = m.machine_id;
+            let bump = [m.bump];
+            let seeds: &[&[u8]] = &[b"dual-machine", id.as_ref(), &bump];
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.key(),
+                    Transfer {
+                        from: ctx.accounts.token_vault.to_account_info(),
+                        to: ctx.accounts.player_token_account.to_account_info(),
+                        authority: ctx.accounts.machine.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                payout_u64,
+            )?;
+        }
+
+        let m = &mut ctx.accounts.machine;
+        m.reserved_tokens = m.reserved_tokens.checked_sub(reserve).ok_or(HouseError::MathOverflow)?;
+        m.token_balance = m.token_balance.checked_sub(payout).ok_or(HouseError::MathOverflow)?;
+        // reclassify the escrowed wager as accrued SOL yield (same lamports; they
+        // stay in the machine PDA). Payouts are token-only, so SOL never leaves.
+        m.escrowed_sol = m.escrowed_sol.checked_sub(wager).ok_or(HouseError::MathOverflow)?;
+        m.pending_sol_yield = m.pending_sol_yield.checked_add(wager).ok_or(HouseError::MathOverflow)?;
+        m.pending_spins = m.pending_spins.checked_sub(1).ok_or(HouseError::MathOverflow)?;
+        Ok(())
+    }
+
+    /// Expire a dual-asset spin whose randomness never resolved (spec §3, §4.3
+    /// analog): refund the SOL wager, release the token reserve, close.
+    pub fn spin_expire_dual(ctx: Context<SpinExpireDual>, nonce: u64) -> Result<()> {
+        let _ = nonce;
+        let s = &ctx.accounts.pending_spin;
+        let now = Clock::get()?.slot;
+        require!(now.saturating_sub(s.commit_slot) > EXPIRE_SLOTS, HouseError::SpinNotExpired);
+        let wager = s.wager;
+        let reserve = s.reserved_tokens;
+
+        debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.player, wager)?;
+
+        let m = &mut ctx.accounts.machine;
+        m.reserved_tokens = m.reserved_tokens.checked_sub(reserve).ok_or(HouseError::MathOverflow)?;
+        m.escrowed_sol = m.escrowed_sol.checked_sub(wager).ok_or(HouseError::MathOverflow)?;
+        m.pending_spins = m.pending_spins.checked_sub(1).ok_or(HouseError::MathOverflow)?;
+        Ok(())
+    }
+
+    /// TEST-ONLY (mock-price feature): set the program-owned MockPrice account a
+    /// dual spin reads through the price seam. ABSENT from the default build — a
+    /// settable price is a mint-arbitrary-payout backdoor (spec §2 threat model).
+    #[cfg(feature = "mock-price")]
+    pub fn mock_set_price(ctx: Context<MockSetPrice>, id: [u8; 16], twap_1e12: u128, spot_1e12: u128, age_secs: u32) -> Result<()> {
+        let _ = id;
+        let p = &mut ctx.accounts.price;
+        p.authority = ctx.accounts.authority.key();
+        p.twap_1e12 = twap_1e12;
+        p.spot_1e12 = spot_1e12;
+        p.age_secs = age_secs;
+        p.bump = ctx.bumps.price;
+        Ok(())
+    }
+
     /// TEST-ONLY (mock-randomness feature): fill a program-owned MockRandomness
     /// account with the 32 bytes a spin will settle against. ABSENT from the
     /// default build — its presence there would be a drain-everything backdoor.
@@ -490,6 +785,67 @@ fn debit_credit<'info>(from: &AccountInfo<'info>, to: &AccountInfo<'info>, lampo
     Ok(())
 }
 
+// -------------------- price seam (H6b-1) --------------------
+//
+// Mirrors the randomness seam: one narrow boundary, two implementations chosen
+// at compile time. `read_price` returns ONLY a reading; ALL gate evaluation
+// lives in `eval_price_gates` (shared), so H6b-3 swaps the CLMM reader in
+// without touching a line of gate logic.
+//   * mock-price feature ON  → reads a program-owned MockPrice account (LiteSVM
+//     tests only; a settable price is a mint-arbitrary-payout backdoor).
+//   * feature OFF (default/deployable) → the CLMM backend: verify the pool +
+//     observation accounts, then (H6b-3) parse Raydium PoolState.sqrt_price and
+//     ObservationState cumulative-tick TWAP with the pinned H6a layouts. Stubbed
+//     to `PriceNotImplemented` until then.
+
+/// A price reading in the machine's fixed point: token-per-SOL × 1e12 for both
+/// TWAP and spot, plus the age of the newest observation the TWAP was built on.
+pub struct PriceReading {
+    pub twap_1e12: u128,
+    pub spot_1e12: u128,
+    pub newest_obs_age_secs: u32,
+}
+
+// ---- mock price backend (feature = "mock-price") ----
+#[cfg(feature = "mock-price")]
+fn read_price(
+    pool: &AccountInfo, _observation: &AccountInfo, expected_pool: Pubkey, _expected_obs: Pubkey,
+) -> Result<PriceReading> {
+    // the mock reuses the machine's `pool` field as the MockPrice account key.
+    require_keys_eq!(pool.key(), expected_pool, HouseError::InvalidPriceAccount);
+    require_keys_eq!(*pool.owner, crate::ID, HouseError::InvalidPriceAccount);
+    let data = pool.try_borrow_data()?;
+    let p = MockPrice::try_deserialize(&mut &data[..]).map_err(|_| HouseError::InvalidPriceAccount)?;
+    Ok(PriceReading { twap_1e12: p.twap_1e12, spot_1e12: p.spot_1e12, newest_obs_age_secs: p.age_secs })
+}
+
+// ---- CLMM backend (default / deployable), stubbed until H6b-3 ----
+#[cfg(not(feature = "mock-price"))]
+fn read_price(
+    pool: &AccountInfo, observation: &AccountInfo, expected_pool: Pubkey, expected_obs: Pubkey,
+) -> Result<PriceReading> {
+    require_keys_eq!(pool.key(), expected_pool, HouseError::InvalidPriceAccount);
+    require_keys_eq!(observation.key(), expected_obs, HouseError::InvalidPriceAccount);
+    // H6b-3: owner-check both accounts against the Raydium CLMM program, then
+    // read PoolState.sqrt_price (spot) and ObservationState (TWAP) via the pinned
+    // H6a offsets and house-math price/twap. Not yet trusted on-chain.
+    Err(HouseError::PriceNotImplemented.into())
+}
+
+/// Shared gate evaluation (spec §2–3), OUTSIDE the seam so both backends and
+/// H6b-3 use identical logic: refuse if the newest observation is stale, or if
+/// spot has drifted more than `band_bp` from the TWAP.
+fn eval_price_gates(r: &PriceReading, max_staleness_secs: u32, band_bp: u16) -> Result<()> {
+    require!(r.newest_obs_age_secs <= max_staleness_secs, HouseError::PriceStale);
+    require!(r.twap_1e12 > 0, HouseError::PriceUnstable);
+    // refuse if |spot − twap| / twap > band_bp/BP  ⇔  |spot−twap|·BP > twap·band_bp
+    let diff = r.spot_1e12.abs_diff(r.twap_1e12);
+    let lhs = diff.checked_mul(hm::BP).ok_or(HouseError::MathOverflow)?;
+    let rhs = r.twap_1e12.checked_mul(band_bp as u128).ok_or(HouseError::MathOverflow)?;
+    require!(lhs <= rhs, HouseError::PriceUnstable);
+    Ok(())
+}
+
 // -------------------- accounts --------------------
 
 /// Singleton house config (PDA `["house-config"]`). `reserved` pads to a fixed
@@ -594,6 +950,166 @@ impl PendingSpin {
     // rand_seed_slot(8) was carved out of the former 32-byte reserved tail, so
     // the account size is unchanged from H1.
     pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 16 + 1 + 8 + 32 + 8 + 8 + 1 + 24;
+}
+
+// ===================== DUAL-ASSET ACCOUNTS (H6b-1) =====================
+//
+// ACCOUNT-STRATEGY DECISION (task requirement). The dual-asset parameter set —
+// four Pubkeys (mint, pool, observation, vault) plus decimals, five bp/window
+// params, and token/reserve/yield accounting — is ~190 bytes, FAR beyond
+// `Machine`'s 56 reserved bytes. So the H3-style "carve a discriminant + append
+// fields into the existing account" is impossible without growing `Machine`,
+// which would break deserialization of the LIVE H3 SOL machines on devnet (their
+// accounts simply lack the bytes). We therefore use a SEPARATE `DualMachine`
+// account type: purely additive, legacy `Machine` accounts and code paths are
+// untouched, and the "denom" distinction is the account TYPE (Machine = SOL /
+// legacy, DualMachine = dual-asset) rather than a byte flag. PDA seed differs
+// (`["dual-machine", id]`) so the namespaces never collide.
+
+/// Parameters for `create_machine_dual`, bundled to dodge the arg-count limit.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct DualParams {
+    pub pool: Pubkey,          // Raydium CLMM pool (MockPrice PDA under mock-price)
+    pub observation: Pubkey,   // Raydium ObservationState (unused under mock-price)
+    pub token_decimals: u8,
+    pub d_low: u64,
+    pub d_mid: u64,
+    pub d_high: u64,
+    pub max_exposure_bp: u64,
+    pub smooth_window: u64,
+    pub epoch_length: u64,
+    pub twap_window_secs: u32,
+    pub max_staleness_secs: u32,
+    pub band_bp: u16,
+    pub m_bp: u16,
+    pub haircut_bp: u16,
+    pub rtp_max_bp: u16,
+    pub max_pending_spins: u16,
+}
+
+/// A dual-asset machine: SOL vault (the PDA's lamports) + token vault (an ATA the
+/// PDA owns) + price-source addresses + risk params + dual accounting. PDA
+/// `["dual-machine", machine_id]`.
+#[account]
+pub struct DualMachine {
+    pub machine_id: [u8; 16],
+    pub curator: Pubkey,
+    // price source (recorded now; parsed on-chain in H6b-3)
+    pub token_mint: Pubkey,
+    pub pool: Pubkey,
+    pub observation: Pubkey,
+    pub token_vault: Pubkey,
+    pub token_decimals: u8,
+    // curve params (value-denominated), mirror Machine
+    pub d_low: u64,
+    pub d_mid: u64,
+    pub d_high: u64,
+    pub max_exposure_bp: u64,
+    pub smooth_window: u64,
+    pub epoch_length: u64,
+    // price / risk params
+    pub twap_window_secs: u32,
+    pub max_staleness_secs: u32,
+    pub band_bp: u16,
+    pub m_bp: u16,
+    pub haircut_bp: u16,
+    pub rtp_max_bp: u16,
+    pub max_pending_spins: u16,
+    pub pending_spins: u16,
+    // accounting
+    pub token_balance: u128,     // internal token depth (mirrors the vault ATA)
+    pub reserved_tokens: u128,   // sum of haircut reserves across pending spins
+    pub escrowed_sol: u64,       // committed wagers held, not yet settled
+    pub pending_sol_yield: u64,  // settled wagers awaiting the H6b-2 dividend ledger
+    pub total_shares: u128,      // token-denominated LP shares
+    // anti-snipe smoothed depth on token-side VALUE (sol_yield + token×TWAP)
+    pub smoothed_value: u128,
+    pub smoothed_last_slot: u64,
+    pub paused: bool,
+    pub bump: u8,
+    pub reserved: [u8; DualMachine::RESERVED_LEN],
+}
+impl DualMachine {
+    pub const RESERVED_LEN: usize = 64;
+    pub const SIZE: usize = 8 + 16 + 32   // id, curator
+        + 32 + 32 + 32 + 32 + 1           // mint, pool, obs, vault, decimals
+        + (6 * 8)                         // d_low..epoch_length
+        + (2 * 4)                         // twap_window, max_staleness
+        + (7 * 2)                         // band..pending_spins (7 u16)
+        + 16 + 16 + 8 + 8 + 16            // token_balance, reserved_tokens, escrowed_sol, pending_sol_yield, total_shares
+        + 16 + 8 + 1 + 1                  // smoothed_value, smoothed_last_slot, paused, bump
+        + Self::RESERVED_LEN;
+    pub fn epoch_length_eff(&self) -> u64 {
+        if self.epoch_length == 0 { DEFAULT_EPOCH_LENGTH_SLOTS } else { self.epoch_length }
+    }
+    pub fn epoch_of(&self, slot: u64) -> u64 { slot / self.epoch_length_eff() }
+    /// Free (unreserved) tokens available to withdrawals in H6b-2.
+    pub fn free_tokens(&self) -> u128 { self.token_balance.saturating_sub(self.reserved_tokens) }
+}
+
+/// A dual-asset LP's stake. PDA `["dual-lp", machine, owner]`. The pending-
+/// withdrawal + dividend-ledger fields are sized NOW so H6b-2 needs no layout
+/// change (spec §5): `sol_debt` is the reward-debt marker of the pro-rata SOL
+/// dividend ledger, `reward_mode` selects accrue-vs-compound.
+#[account]
+pub struct DualLpPosition {
+    pub machine: Pubkey,
+    pub owner: Pubkey,
+    pub shares: u128,
+    // H6b-2 fields (laid out now; inert in H6b-1)
+    pub pending_shares: u128,
+    pub pending_epoch: u64,
+    pub sol_debt: u128,     // dividend-ledger reward debt (pending SOL owed marker)
+    pub reward_mode: u8,    // 0 = accrue SOL, 1 = (reserved) compound; defined in H6b-2
+    pub bump: u8,
+    pub reserved: [u8; 32],
+}
+impl DualLpPosition {
+    pub const SIZE: usize = 8 + 32 + 32 + 16 + 16 + 8 + 16 + 1 + 1 + 32;
+}
+
+/// A committed dual-asset spin. PDA `["dual-spin", machine, player, nonce]`.
+/// Holds the frozen odds+price snapshot and the randomness binding.
+#[account]
+pub struct DualPendingSpin {
+    pub machine: Pubkey,
+    pub player: Pubkey,
+    pub nonce: u64,
+    pub wager: u64, // SOL lamports
+    // snapshot frozen at commit (spec §3)
+    pub k_bp: u128,
+    pub tier_is_deep: bool,
+    pub price_at_commit_1e12: u128, // TWAP, token-per-SOL × 1e12
+    pub max_payout_tokens: u128,    // reserve basis (JACKPOT³)
+    pub reserved_tokens: u128,      // max_payout × (1 + haircut)
+    // randomness binding (shared seam)
+    pub randomness: Pubkey,
+    pub rand_seed_slot: u64,
+    pub commit_slot: u64,
+    pub bump: u8,
+    pub reserved: [u8; 16],
+}
+impl DualPendingSpin {
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8   // machine, player, nonce, wager
+        + 16 + 1 + 16 + 16 + 16                   // k, tier, price, max_payout, reserved
+        + 32 + 8 + 8 + 1 + 16;                    // randomness, seed_slot, commit_slot, bump, reserved
+}
+
+/// TEST-ONLY price source (mock-price feature). Program-owned so the price
+/// seam's owner check passes; never compiled into the deployable build. Set
+/// directly (twap, spot, age) — no clock math, so tests control staleness.
+#[cfg(feature = "mock-price")]
+#[account]
+pub struct MockPrice {
+    pub authority: Pubkey,
+    pub twap_1e12: u128,
+    pub spot_1e12: u128,
+    pub age_secs: u32,
+    pub bump: u8,
+}
+#[cfg(feature = "mock-price")]
+impl MockPrice {
+    pub const SIZE: usize = 8 + 32 + 16 + 16 + 4 + 1;
 }
 
 /// TEST-ONLY randomness source (mock-randomness feature). Program-owned so the
@@ -753,6 +1269,118 @@ pub struct SpinExpire<'info> {
     pub system_program: Program<'info, System>,
 }
 
+// -------------------- dual-asset contexts (H6b-1) --------------------
+
+#[derive(Accounts)]
+#[instruction(machine_id: [u8; 16])]
+pub struct CreateMachineDual<'info> {
+    #[account(seeds = [b"house-config"], bump = config.bump, has_one = admin @ HouseError::NotAdmin)]
+    pub config: Account<'info, HouseConfig>,
+    #[account(init, payer = admin, space = DualMachine::SIZE,
+              seeds = [b"dual-machine", machine_id.as_ref()], bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    pub token_mint: Box<Account<'info, Mint>>,
+    // the machine PDA's associated token account — created here, owned by the PDA.
+    #[account(init, payer = admin,
+              associated_token::mint = token_mint,
+              associated_token::authority = machine)]
+    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct LpDepositToken<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(init_if_needed, payer = owner, space = DualLpPosition::SIZE,
+              seeds = [b"dual-lp", machine.key().as_ref(), owner.key().as_ref()], bump)]
+    pub position: Box<Account<'info, DualLpPosition>>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(mut, token::mint = machine.token_mint, token::authority = owner)]
+    pub owner_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(mut, address = machine.token_vault)]
+    pub token_vault: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(wager: u64, nonce: u64)]
+pub struct SpinCommitDual<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(init, payer = player, space = DualPendingSpin::SIZE,
+              seeds = [b"dual-spin", machine.key().as_ref(), player.key().as_ref(), &nonce.to_le_bytes()], bump)]
+    pub pending_spin: Box<Account<'info, DualPendingSpin>>,
+    #[account(mut)]
+    pub player: Signer<'info>,
+    /// CHECK: randomness account; verified in the randomness seam at settle.
+    pub randomness: UncheckedAccount<'info>,
+    /// CHECK: price pool (Raydium PoolState or the MockPrice account); verified in the price seam.
+    pub price_pool: UncheckedAccount<'info>,
+    /// CHECK: Raydium ObservationState; verified in the price seam (unused under mock-price).
+    pub price_observation: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct SpinSettleDual<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = machine, has_one = player,
+              seeds = [b"dual-spin", machine.key().as_ref(), pending_spin.player.as_ref(), &nonce.to_le_bytes()],
+              bump = pending_spin.bump, close = player)]
+    pub pending_spin: Box<Account<'info, DualPendingSpin>>,
+    /// CHECK: receives the spin rent; validated by has_one = player.
+    #[account(mut)]
+    pub player: UncheckedAccount<'info>,
+    /// CHECK: revealed randomness, validated in the seam against pending_spin.randomness.
+    pub randomness: UncheckedAccount<'info>,
+    #[account(mut, address = machine.token_vault)]
+    pub token_vault: Box<Account<'info, TokenAccount>>,
+    // any token account the player owns for this mint receives the payout.
+    #[account(mut, token::mint = machine.token_mint, token::authority = player)]
+    pub player_token_account: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub cranker: Signer<'info>, // literally anyone
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(nonce: u64)]
+pub struct SpinExpireDual<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = machine, has_one = player,
+              seeds = [b"dual-spin", machine.key().as_ref(), pending_spin.player.as_ref(), &nonce.to_le_bytes()],
+              bump = pending_spin.bump, close = player)]
+    pub pending_spin: Box<Account<'info, DualPendingSpin>>,
+    /// CHECK: receives refund + spin rent; validated by has_one = player.
+    #[account(mut)]
+    pub player: UncheckedAccount<'info>,
+    pub cranker: Signer<'info>, // literally anyone
+    pub system_program: Program<'info, System>,
+}
+
+#[cfg(feature = "mock-price")]
+#[derive(Accounts)]
+#[instruction(id: [u8; 16])]
+pub struct MockSetPrice<'info> {
+    #[account(init_if_needed, payer = authority, space = MockPrice::SIZE,
+              seeds = [b"mock-price", id.as_ref()], bump)]
+    pub price: Account<'info, MockPrice>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
 #[cfg(feature = "mock-randomness")]
 #[derive(Accounts)]
 #[instruction(id: [u8; 16])]
@@ -784,6 +1412,14 @@ pub enum HouseError {
     #[msg("Not enough active shares to withdraw")] InsufficientShares,
     #[msg("No pending withdrawal to process or cancel")] NothingToWithdraw,
     #[msg("Withdrawal epoch has not elapsed yet")] EpochNotElapsed,
+    // dual-asset (H6b-1)
+    #[msg("Dual-asset params cross the margin floor")] MarginFloorViolation,
+    #[msg("Price account is wrong, foreign, or malformed")] InvalidPriceAccount,
+    #[msg("CLMM price backend not implemented yet (H6b-3)")] PriceNotImplemented,
+    #[msg("Price observations are stale")] PriceStale,
+    #[msg("Spot has drifted too far from TWAP (band gate)")] PriceUnstable,
+    #[msg("Machine has too many pending spins")] TooManyPendingSpins,
+    #[msg("Not enough free token liquidity to reserve payout")] InsufficientTokenLiquidity,
 }
 
 // ---------------------------------------------------------------------------
