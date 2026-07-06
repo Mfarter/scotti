@@ -29,6 +29,12 @@ mock-randomness = []
 # deployable build and enabled ONLY for LiteSVM tests. The default build gets the
 # `clmm` price backend (Raydium ObservationState parsing; stubbed until H6b-3).
 mock-price = []
+# Swaps compound_epoch's ONE AMM CPI for a mock fill (at the read price, from a
+# caller-supplied counterparty) so the compound ACCOUNTING is testable in LiteSVM,
+# which has no Raydium program. OFF in the deployable build — that gets the real
+# Raydium CLMM swap CPI. compound_epoch itself is present in both builds (the
+# feature only swaps the internal fill), so nothing mock reaches the IDL.
+mock-swap = []
 
 [dependencies]
 anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }

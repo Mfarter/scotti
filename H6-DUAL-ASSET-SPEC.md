@@ -1,6 +1,6 @@
 # Scotti House Module — H6: Dual-Asset Machines (SOL in, SPL out) — Spec v0 draft
 
-**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **H6b-2 shipped** (LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free epoch-gated withdrawals of BOTH assets; curve depth is now token-side-only; house-math gains the dividend conservation/no-dilution proofs) · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
+**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **H6b-2 shipped** (LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free epoch-gated withdrawals of BOTH assets; curve depth is now token-side-only; house-math gains the dividend conservation/no-dilution proofs) · **H6b-3 code shipped** (real on-chain CLMM price reader filled — parses PoolState/ObservationState via the pinned H6a offsets, ground-truthed against captured live bytes; `compound_epoch` + AMM swap seam with compound share-minting proofs and the 33% worked example; house-math 48 proofs. **Devnet upgrade + live spin deferred**: the 580KB binary needs a ~5.8-SOL peak to upgrade and the faucet is rate-limited — the reader is instead validated against live-captured account bytes) · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
 **Legal posture:** unchanged from HOUSE-SPEC and amplified: a token-denominated house adds a
 token-issuance/market dimension on top of the licensed-casino question. Devnet demonstration only.
 
@@ -152,9 +152,20 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
     swapped in H6b-3), and price-free epoch-gated withdrawals of BOTH assets (`request/cancel/
     process_withdrawal_token`). Curve depth is token-side only — accrued SOL is dividend income,
     never at-risk capital, never in `max_bet`. 15-test dual matrix incl. the literal worked example.
-  - **H6b-3 — CLMM price reader.** Fill the `read_price` CLMM backend: parse Raydium
-    PoolState.sqrt_price + ObservationState cumulative-tick TWAP via the pinned H6a offsets, under
-    the owner-check trust pattern. No gate logic changes (it lives outside the seam).
+  - **H6b-3 — CLMM price reader + compound. ✓ CODE SHIPPED (devnet upgrade deferred).** Filled the
+    `read_price` CLMM backend: `house-math::clmm` parses PoolState.sqrt_price (spot) +
+    ObservationState cumulative-tick TWAP via the pinned H6a offsets, under the owner-check trust
+    pattern (owner == CLMM program, keys match the machine, pool↔observation cross-link). No gate
+    logic changed — it lives outside the seam. Ground-truthed against CAPTURED LIVE devnet bytes:
+    spot_1e12 and the 300s TWAP avg_tick reproduce scripts/twap.ts exactly. `compound_epoch` (the
+    module's only AMM CPI) behind a swap seam — mock fill proves the accounting (books, non-dilution,
+    the 33% worked example); the real Raydium CLMM swap CPI is the one piece left for a live compound
+    run. house-math: `clmm` + `compound_mint_shares` proofs (48 total).
+    - **Deferred:** the on-chain upgrade and a live dual spin. The binary is ~580KB (switchboard
+      bloat); upgrading needs a ~5.8-SOL peak (extend + a refundable buffer) and the devnet faucet
+      was hard rate-limited at a 3.46-SOL balance. The CLMM reader's correctness is instead
+      established by the live-bytes ground-truth test; the live upgrade + spin will land when SOL is
+      available (H6c).
 - **H6c — devnet + frontend.** Deploy/upgrade, bootstrap a dual-asset machine on the floor,
   spin against the real pool, extend `verify-spin` to recompute price from the observation
   history, and the UI: token payouts with value equivalents, the third LP disclosure, and a

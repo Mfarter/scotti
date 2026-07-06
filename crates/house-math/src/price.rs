@@ -99,12 +99,19 @@ pub fn wide_mul_div(a: u128, b: u128, d: u128) -> u128 {
 /// price would exceed u128 at 1e12 scale — far outside any machine's operating
 /// range (|tick| well under ~207k, price under ~1e26).
 pub fn price_1e12_at_tick(tick: i32) -> u128 {
-    let s = sqrt_price_x64_at_tick(tick);
-    let (phi, plo) = full_mul(s, s); // s^2 as a 256-bit (hi, lo)
+    price_1e12_from_sqrt_x64(sqrt_price_x64_at_tick(tick))
+}
+
+/// price scaled by 1e12 directly from a Q64.64 sqrt price (PoolState.sqrt_price).
+/// price_1e12 = (sqrt_x64^2 · 1e12) >> 128, computed in 256-bit so the square and
+/// the scale never truncate. This is the SPOT price read used by the on-chain
+/// CLMM backend; `price_1e12_at_tick` is the same math on a tick-derived sqrt.
+pub fn price_1e12_from_sqrt_x64(sqrt_x64: u128) -> u128 {
+    let (phi, plo) = full_mul(sqrt_x64, sqrt_x64); // s^2 as a 256-bit (hi, lo)
     let (qhi, _qlo) = full_mul(plo, 1_000_000_000_000); // plo·1e12
     let (rhi, rlo) = full_mul(phi, 1_000_000_000_000); // phi·1e12  (aligned +128 bits)
     let (res, carry) = qhi.overflowing_add(rlo); // bits[128..256) of P·1e12
-    assert!(rhi == 0 && !carry, "price_1e12 overflow: tick {tick} out of supported range");
+    assert!(rhi == 0 && !carry, "price_1e12 overflow: sqrt_x64 out of supported range");
     res
 }
 

@@ -529,14 +529,17 @@ pub mod house {
         require!(m.pending_spins < m.max_pending_spins, HouseError::TooManyPendingSpins);
 
         // --- price seam + shared gates (spec §2–3) ---
+        let clock = Clock::get()?;
+        let now_secs = clock.unix_timestamp.max(0) as u32; // matches CLMM observation stamps
         let reading = read_price(
             &ctx.accounts.price_pool, &ctx.accounts.price_observation, m.pool, m.observation,
+            now_secs, m.twap_window_secs,
         )?;
         eval_price_gates(&reading, m.max_staleness_secs, m.band_bp)?;
         let twap = reading.twap_1e12;
         let dec = m.token_decimals;
 
-        let now = Clock::get()?.slot;
+        let now = clock.slot;
 
         // Curve depth is TOKEN-SIDE ONLY: D = token_balance valued at TWAP. The
         // accrued SOL (div_pool_sol) is LP dividend income, NOT at-risk capital —
@@ -876,6 +879,89 @@ pub mod house {
         Ok(())
     }
 
+    /// Compound an SPL-mode position's earmarked SOL back into token shares
+    /// (spec §5) — the module's ONLY AMM CPI. Permissionless epoch crank: reads
+    /// the price behind the SAME band gate as a spin, and only if spot is within
+    /// `band_bp` of the TWAP does it swap the earmarked SOL into token (ONE swap,
+    /// min_out = value at TWAP × (1 − band)), deposit the tokens into the vault,
+    /// and mint shares at the PRE-swap price (house-math `compound_mint_shares`,
+    /// proven non-dilutive). If the band is exceeded / price stale, it NO-OPs and
+    /// succeeds — it never force-fills. sol_debt is reset so the minted shares owe
+    /// 0 of prior SOL accruals. Per-position, one compound per epoch.
+    ///
+    /// The swap is behind the `amm_swap_sol_to_token` seam: mock fill (LiteSVM)
+    /// vs the real Raydium CLMM swap CPI; the crank passes the swap accounts as
+    /// remaining_accounts (Raydium tick arrays / the mock counterparty).
+    pub fn compound_epoch<'info>(ctx: Context<'info, CompoundEpoch<'info>>) -> Result<()> {
+        let m = &ctx.accounts.machine;
+        let pos = &ctx.accounts.position;
+        require!(pos.reward_mode == REWARD_MODE_SPL, HouseError::WrongRewardMode);
+        let amount = pos.earmarked_sol;
+        if amount == 0 {
+            return Ok(()); // nothing earmarked — noop success
+        }
+        let clock = Clock::get()?;
+        let epoch = m.epoch_of(clock.slot);
+        require!(epoch > pos.last_compound_epoch, HouseError::EpochNotElapsed);
+
+        // read price through the SAME seam + band as a spin. If not tradeable
+        // (stale or out of band), NO-OP: never force a fill (spec §5).
+        let now_secs = clock.unix_timestamp.max(0) as u32;
+        let reading = read_price(
+            &ctx.accounts.price_pool, &ctx.accounts.price_observation, m.pool, m.observation,
+            now_secs, m.twap_window_secs,
+        )?;
+        if eval_price_gates(&reading, m.max_staleness_secs, m.band_bp).is_err() {
+            return Ok(()); // wait for a calmer/fresher price — succeed as a noop
+        }
+        let twap = reading.twap_1e12;
+        let spot = reading.spot_1e12;
+        let dec = m.token_decimals;
+
+        // min_out = value of `amount` SOL at TWAP, haircut by the band.
+        let value_at_twap = hm::payout::payout_tokens(amount as u128, hm::BP, hm::BP, twap, dec)
+            .ok_or(HouseError::MathOverflow)?;
+        let min_out = value_at_twap
+            .checked_mul(hm::BP - m.band_bp as u128).ok_or(HouseError::MathOverflow)? / hm::BP;
+        let min_out_u64 = u64::try_from(min_out).map_err(|_| HouseError::MathOverflow)?;
+
+        // pre-swap snapshot: the share price the minted shares are priced at.
+        let pre_total_shares = m.total_shares;
+        let pre_token_balance = m.token_balance;
+        let acc = m.acc_sol_per_share;
+        let earning_before = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        let pending_before = hm::dividend::pending_sol(earning_before, pos.sol_debt, acc);
+        let machine_id = m.machine_id;
+        let bump = m.bump;
+
+        // THE swap (seam). Moves `amount` SOL out of the machine and `received`
+        // tokens into the vault.
+        let received = amm_swap_sol_to_token(
+            ctx.accounts.machine.to_account_info(),
+            &machine_id, bump,
+            ctx.accounts.token_vault.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.remaining_accounts,
+            amount, min_out_u64, spot, dec,
+        )?;
+        require!(received >= min_out_u64, HouseError::PriceUnstable); // slippage guard
+
+        let minted = hm::dividend::compound_mint_shares(received as u128, pre_total_shares, pre_token_balance);
+
+        let m = &mut ctx.accounts.machine;
+        m.token_balance = m.token_balance.checked_add(received as u128).ok_or(HouseError::MathOverflow)?;
+        m.total_shares = m.total_shares.checked_add(minted).ok_or(HouseError::MathOverflow)?;
+        m.earmarked_sol = m.earmarked_sol.checked_sub(amount).ok_or(HouseError::MathOverflow)?;
+
+        let pos = &mut ctx.accounts.position;
+        pos.earmarked_sol = pos.earmarked_sol.checked_sub(amount).ok_or(HouseError::MathOverflow)?;
+        pos.shares = pos.shares.checked_add(minted).ok_or(HouseError::MathOverflow)?;
+        pos.last_compound_epoch = epoch;
+        let earning_after = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        pos.sol_debt = hm::dividend::debt_preserving_pending(earning_after, acc, pending_before);
+        Ok(())
+    }
+
     /// TEST-ONLY (mock-price feature): set the program-owned MockPrice account a
     /// dual spin reads through the price seam. ABSENT from the default build — a
     /// settable price is a mint-arbitrary-payout backdoor (spec §2 threat model).
@@ -1012,6 +1098,15 @@ fn debit_credit<'info>(from: &AccountInfo<'info>, to: &AccountInfo<'info>, lampo
 //     ObservationState cumulative-tick TWAP with the pinned H6a layouts. Stubbed
 //     to `PriceNotImplemented` until then.
 
+/// Raydium CLMM program id on devnet, H6a-verified
+/// (DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH). The CLMM price backend owner-
+/// checks pool/observation accounts against this; `verify-layouts.ts` guards the
+/// byte offsets `house-math::clmm` reads.
+pub const CLMM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    184, 152, 151, 52, 252, 179, 140, 145, 104, 216, 83, 199, 83, 182, 184, 164,
+    54, 16, 205, 211, 37, 175, 187, 199, 47, 212, 21, 54, 219, 205, 194, 88,
+]);
+
 /// A price reading in the machine's fixed point: token-per-SOL × 1e12 for both
 /// TWAP and spot, plus the age of the newest observation the TWAP was built on.
 pub struct PriceReading {
@@ -1024,6 +1119,7 @@ pub struct PriceReading {
 #[cfg(feature = "mock-price")]
 fn read_price(
     pool: &AccountInfo, _observation: &AccountInfo, expected_pool: Pubkey, _expected_obs: Pubkey,
+    _now_secs: u32, _window_secs: u32,
 ) -> Result<PriceReading> {
     // the mock reuses the machine's `pool` field as the MockPrice account key.
     require_keys_eq!(pool.key(), expected_pool, HouseError::InvalidPriceAccount);
@@ -1037,13 +1133,34 @@ fn read_price(
 #[cfg(not(feature = "mock-price"))]
 fn read_price(
     pool: &AccountInfo, observation: &AccountInfo, expected_pool: Pubkey, expected_obs: Pubkey,
+    now_secs: u32, window_secs: u32,
 ) -> Result<PriceReading> {
+    // key checks: the accounts must be the ones the machine recorded at creation.
     require_keys_eq!(pool.key(), expected_pool, HouseError::InvalidPriceAccount);
     require_keys_eq!(observation.key(), expected_obs, HouseError::InvalidPriceAccount);
-    // H6b-3: owner-check both accounts against the Raydium CLMM program, then
-    // read PoolState.sqrt_price (spot) and ObservationState (TWAP) via the pinned
-    // H6a offsets and house-math price/twap. Not yet trusted on-chain.
-    Err(HouseError::PriceNotImplemented.into())
+    // owner-check trust pattern (spec §2): both must be owned by the Raydium CLMM
+    // program — the protocol's own accounts, not a look-alike we could be fed.
+    require!(pool.owner.to_bytes() == CLMM_PROGRAM_ID.to_bytes(), HouseError::InvalidPriceAccount);
+    require!(observation.owner.to_bytes() == CLMM_PROGRAM_ID.to_bytes(), HouseError::InvalidPriceAccount);
+
+    let pool_data = pool.try_borrow_data()?;
+    let obs_data = observation.try_borrow_data()?;
+    // cross-link: PoolState.observation_id == the observation account, and
+    // ObservationState.pool_id == the pool account (the pinned H6a offsets).
+    require!(hm::clmm::pool_observation_id(&pool_data) == observation.key().to_bytes(), HouseError::InvalidPriceAccount);
+    require!(hm::clmm::obs_pool_id(&obs_data) == pool.key().to_bytes(), HouseError::InvalidPriceAccount);
+
+    // read spot (sqrt_price) + TWAP (cumulative-tick ring) via house-math.
+    let r = hm::clmm::read_clmm_price(&pool_data, &obs_data, now_secs, window_secs)
+        .ok_or(HouseError::InvalidPriceAccount)?;
+    // Map the raw TWAP to the PriceReading contract WITHOUT touching gate logic:
+    // a covered window yields (twap price, real age); an uncovered/cold ring
+    // yields (0, u32::MAX) so eval_price_gates refuses it as PriceStale.
+    let (twap_1e12, age) = match r.twap {
+        hm::twap::TwapRead::Live { avg_tick } => (hm::price::price_1e12_at_tick(avg_tick as i32), r.newest_obs_age_secs),
+        hm::twap::TwapRead::NotReady(_) => (0u128, u32::MAX),
+    };
+    Ok(PriceReading { twap_1e12, spot_1e12: r.spot_1e12, newest_obs_age_secs: age })
 }
 
 /// Shared gate evaluation (spec §2–3), OUTSIDE the seam so both backends and
@@ -1058,6 +1175,78 @@ fn eval_price_gates(r: &PriceReading, max_staleness_secs: u32, band_bp: u16) -> 
     let rhs = r.twap_1e12.checked_mul(band_bp as u128).ok_or(HouseError::MathOverflow)?;
     require!(lhs <= rhs, HouseError::PriceUnstable);
     Ok(())
+}
+
+// -------------------- AMM swap seam (H6b-3, compound_epoch) --------------------
+//
+// compound_epoch's ONE AMM CPI, behind a seam like the price/randomness ones:
+//   * mock-swap feature ON  → fills at the read SPOT price from a caller-supplied
+//     counterparty (LiteSVM has no Raydium program). Proves the compound
+//     ACCOUNTING; a settable fill is test-only, so it is OFF in the deployable
+//     build. The mock takes remaining_accounts [counterparty_token, counterparty
+//     _authority(signer)].
+//   * feature OFF (default/deployable) → the REAL Raydium CLMM swap CPI (SOL/WSOL
+//     → token) signed by the machine PDA. Its ACCOUNTING is what the mock proves;
+//     the on-chain swap wiring itself is the one piece H6b-3 leaves for a live
+//     compound run (the CLMM READER, not this swap, is what H6b-3 proves live via
+//     a real dual spin). Returns CompoundSwapNotWired until then — exactly the
+//     stub discipline read_price used before its CLMM backend landed.
+
+/// Swap `amount_sol` of the machine's earmarked lamports into the token, into the
+/// vault. Returns tokens_received. The machine PDA is the swap authority.
+#[cfg(feature = "mock-swap")]
+#[allow(clippy::too_many_arguments)]
+fn amm_swap_sol_to_token<'info>(
+    machine: AccountInfo<'info>,
+    _machine_id: &[u8; 16],
+    _bump: u8,
+    vault: AccountInfo<'info>,
+    token_program: AccountInfo<'info>,
+    remaining: &[AccountInfo<'info>],
+    amount_sol: u64,
+    _min_out: u64,
+    spot_1e12: u128,
+    token_decimals: u8,
+) -> Result<u64> {
+    require!(remaining.len() >= 2, HouseError::InvalidPriceAccount);
+    let counterparty_token = &remaining[0];
+    let counterparty_auth = &remaining[1];
+    // fill at the SPOT price: tokens_out = value of amount_sol in token base units.
+    let tokens_out = u64::try_from(
+        hm::payout::payout_tokens(amount_sol as u128, hm::BP, hm::BP, spot_1e12, token_decimals)
+            .ok_or(HouseError::MathOverflow)?,
+    ).map_err(|_| HouseError::MathOverflow)?;
+    // machine SOL -> counterparty (the AMM side), tokens -> vault.
+    token::transfer(
+        CpiContext::new(
+            token_program.key(),
+            Transfer { from: counterparty_token.clone(), to: vault.clone(), authority: counterparty_auth.clone() },
+        ),
+        tokens_out,
+    )?;
+    **machine.try_borrow_mut_lamports()? -= amount_sol;
+    **counterparty_auth.try_borrow_mut_lamports()? += amount_sol;
+    Ok(tokens_out)
+}
+
+/// Real Raydium CLMM swap CPI — the deployable path. Left unwired until a
+/// dedicated live compound run (see the seam note above); compound_epoch's
+/// accounting is proven under mock-swap.
+#[cfg(not(feature = "mock-swap"))]
+#[allow(clippy::too_many_arguments)]
+fn amm_swap_sol_to_token<'info>(
+    _machine: AccountInfo<'info>,
+    _machine_id: &[u8; 16],
+    _bump: u8,
+    _vault: AccountInfo<'info>,
+    _token_program: AccountInfo<'info>,
+    _remaining: &[AccountInfo<'info>],
+    _amount_sol: u64,
+    _min_out: u64,
+    _spot_1e12: u128,
+    _token_decimals: u8,
+) -> Result<u64> {
+    Err(HouseError::CompoundSwapNotWired.into())
 }
 
 // -------------------- accounts --------------------
@@ -1283,13 +1472,15 @@ pub struct DualLpPosition {
     // SOL dividend ledger (H6b-2)
     pub sol_debt: u128,      // MasterChef reward debt (== entitlement at last settle)
     pub reward_mode: u8,     // REWARD_MODE_SOL (0) pays SOL; REWARD_MODE_SPL (1) earmarks it
-    pub earmarked_sol: u64,  // SPL-mode SOL set aside for this position (H6b-3 swaps it)
+    pub earmarked_sol: u64,  // SPL-mode SOL set aside for this position (compound_epoch swaps it)
+    pub last_compound_epoch: u64, // epoch of this position's last compound (H6b-3)
     pub bump: u8,
-    pub reserved: [u8; 24],
+    pub reserved: [u8; 16],
 }
 impl DualLpPosition {
-    // earmarked_sol(8) carved from the former 32-byte reserved tail; SIZE unchanged.
-    pub const SIZE: usize = 8 + 32 + 32 + 16 + 16 + 8 + 16 + 1 + 8 + 1 + 24;
+    // earmarked_sol(8) + last_compound_epoch(8) carved from the former 32-byte
+    // reserved tail; SIZE unchanged.
+    pub const SIZE: usize = 8 + 32 + 32 + 16 + 16 + 8 + 16 + 1 + 8 + 8 + 1 + 16;
 }
 
 /// Reward modes on a dual-asset LP position (spec §5).
@@ -1651,6 +1842,24 @@ pub struct ProcessWithdrawalToken<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct CompoundEpoch<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = machine,
+              seeds = [b"dual-lp", machine.key().as_ref(), position.owner.as_ref()], bump = position.bump)]
+    pub position: Box<Account<'info, DualLpPosition>>,
+    #[account(mut, address = machine.token_vault)]
+    pub token_vault: Box<Account<'info, TokenAccount>>,
+    /// CHECK: price pool (Raydium PoolState or MockPrice); verified in the price seam.
+    pub price_pool: UncheckedAccount<'info>,
+    /// CHECK: Raydium ObservationState; verified in the price seam.
+    pub price_observation: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    pub cranker: Signer<'info>, // literally anyone
+    // swap accounts (mock counterparty / real Raydium set) arrive via remaining_accounts.
+}
+
 #[cfg(feature = "mock-price")]
 #[derive(Accounts)]
 #[instruction(id: [u8; 16])]
@@ -1703,6 +1912,7 @@ pub enum HouseError {
     #[msg("Machine has too many pending spins")] TooManyPendingSpins,
     #[msg("Not enough free token liquidity to reserve payout")] InsufficientTokenLiquidity,
     #[msg("Instruction does not match the position's reward mode")] WrongRewardMode,
+    #[msg("Real Raydium CLMM swap CPI not wired yet (compound accounting proven under mock-swap)")] CompoundSwapNotWired,
 }
 
 // ---------------------------------------------------------------------------

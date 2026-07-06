@@ -10,6 +10,7 @@
 // H6 dual-asset price infrastructure (H6a): tick→price fixed point, TWAP from
 // cumulative ticks, and the margin-floor invariant. Each is proof-tested like
 // the game math below.
+pub mod clmm;
 pub mod dividend;
 pub mod margin;
 pub mod payout;

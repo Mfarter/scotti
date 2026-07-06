@@ -585,6 +585,22 @@ fn ix_process_wd(id: [u8; 16], owner: &Pubkey, mint: Pubkey, cranker: &Pubkey) -
             token_program: token_program(), cranker: *cranker, system_program: system_program::ID,
         }.to_account_metas(None))
 }
+#[cfg(feature = "mock-swap")]
+fn ix_compound(id: [u8; 16], owner: &Pubkey, mint: Pubkey, cranker: &Pubkey, amm: &Pubkey, amm_token: &Pubkey) -> Instruction {
+    use anchor_lang::solana_program::instruction::AccountMeta;
+    let m = dmachine(&id);
+    let mut metas = house::accounts::CompoundEpoch {
+        machine: m, position: dlp(&m, owner), token_vault: ata(&m, &mint),
+        price_pool: mock_price_pda(&id), price_observation: mock_price_pda(&id),
+        token_program: token_program(), cranker: *cranker,
+    }.to_account_metas(None);
+    // mock swap remaining accounts: [amm_token (mut source), amm (writable+signer sink/authority)].
+    // A DEDICATED amm account (not the fee-payer cranker) so its writable flag isn't
+    // shadowed by an earlier non-writable meta on dedup.
+    metas.push(AccountMeta::new(*amm_token, false));
+    metas.push(AccountMeta::new(*amm, true));
+    Instruction::new_with_bytes(pid(), &house::instruction::CompoundEpoch {}.data(), metas)
+}
 
 /// init + create a dual machine with a given exposure; set an in-band fresh
 /// price. No deposit (tests control deposits). Returns (svm, id, mint, admin).
@@ -667,11 +683,95 @@ fn worked_example_ten_sol_pool_yields_ten_sol() {
                1_000_000_000, "existing staker undiluted by the new deposit");
 }
 
-/// The "33% if existing stakers had compounded" clause lands with compound_epoch
-/// in H6b-3 (swap earmarked SOL back into token shares); stubbed here.
+/// THE WORKED EXAMPLE, compounding half (H6b-3). A 10-SOL-worth pool held by one
+/// SPL-mode staker, after compounding 10 SOL of yield into 10-SOL-worth of tokens
+/// (via the mock swap at par), holds 20-SOL-worth; a newcomer then depositing
+/// 10-SOL-worth of tokens holds EXACTLY 33% (10/30).
+#[cfg(feature = "mock-swap")]
 #[test]
-#[ignore = "compound_epoch (SPL-mode swap → new shares) is H6b-3"]
-fn worked_example_compounding_gives_33pct() {}
+fn worked_example_compounding_gives_33pct() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xE6, BP);
+    let staker = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &staker, 10_000); // sole LP, 10-SOL-worth (10k CHIP)
+    // SPL reward mode, then accrue exactly 10 SOL of yield and earmark it.
+    assert!(send(&mut svm, ix_set_mode(id, &staker.pubkey(), house::REWARD_MODE_SPL), &staker, &[&staker]));
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 100); // 10 SOL
+    assert!(send(&mut svm, ix_earmark_sol(id, &staker.pubkey()), &staker, &[&staker]));
+    assert_eq!(read_machine(&svm, &id).earmarked_sol, 10_000_000_000, "10 SOL earmarked");
+
+    // fund a dedicated mock-swap counterparty (the AMM), which fills at par.
+    let amm = funded(&mut svm);
+    let amm_tok = ata(&amm.pubkey(), &mint);
+    set_token_acct(&mut svm, &amm_tok, &mint, &amm.pubkey(), (50_000 * CHIP) as u64);
+
+    // compound: swap 10 SOL → 10_000 CHIP into the vault, mint shares at pre-swap price.
+    svm.warp_to_slot(2_000); // cross an epoch boundary (epoch_length 1000)
+    assert!(send(&mut svm, ix_compound(id, &staker.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "compound_epoch");
+
+    let m = read_machine(&svm, &id);
+    assert_eq!(m.token_balance, 20_000 * CHIP, "pool now 20-SOL-worth of tokens");
+    assert_eq!(m.earmarked_sol, 0, "earmark fully compounded");
+    assert_eq!(read_position(&svm, &id, &staker.pubkey()).earmarked_sol, 0);
+
+    // newcomer deposits 10-SOL-worth → holds exactly 10/30 == 33%.
+    let newcomer = funded(&mut svm);
+    deposit(&mut svm, id, mint, &newcomer, 10_000);
+    let m2 = read_machine(&svm, &id);
+    let pn = read_position(&svm, &id, &newcomer.pubkey());
+    assert_eq!(pn.shares * 3, m2.total_shares, "newcomer holds exactly 33% (10/30)");
+    // the staker holds the other 2/3.
+    let ps = read_position(&svm, &id, &staker.pubkey());
+    assert_eq!(ps.shares * 3, m2.total_shares * 2, "compounding staker holds 67%");
+}
+
+/// compound_epoch books: earmarked_sol → 0, token_balance up by exactly the tokens
+/// received, machine SOL down by exactly the swapped amount, and a NON-compounding
+/// SOL-mode LP is not diluted in token claim.
+#[cfg(feature = "mock-swap")]
+#[test]
+fn k_compound_books_and_no_dilution() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xE7, BP);
+    let spl_lp = funded(&mut svm);
+    let sol_lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &spl_lp, 6_000);
+    deposit(&mut svm, id, mint, &sol_lp, 4_000); // stays SOL-mode, does NOT compound
+    assert!(send(&mut svm, ix_set_mode(id, &spl_lp.pubkey(), house::REWARD_MODE_SPL), &spl_lp, &[&spl_lp]));
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 20); // 2 SOL yield
+    assert!(send(&mut svm, ix_earmark_sol(id, &spl_lp.pubkey()), &spl_lp, &[&spl_lp]));
+
+    let m = dmachine(&id);
+    let vault = ata(&m, &mint);
+    let earmarked = read_machine(&svm, &id).earmarked_sol;
+    assert!(earmarked > 0);
+    // sol_lp's token claim before compound
+    let m0 = read_machine(&svm, &id);
+    let sol_pos0 = read_position(&svm, &id, &sol_lp.pubkey());
+    let sol_claim0 = sol_pos0.shares * m0.token_balance / m0.total_shares;
+
+    let amm = funded(&mut svm);
+    let amm_tok = ata(&amm.pubkey(), &mint);
+    set_token_acct(&mut svm, &amm_tok, &mint, &amm.pubkey(), (50_000 * CHIP) as u64);
+    let mach_sol_before = lamports(&svm, &m);
+    let vault_before = tok_bal(&svm, &vault);
+
+    svm.warp_to_slot(2_000);
+    assert!(send(&mut svm, ix_compound(id, &spl_lp.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "compound");
+
+    let m1 = read_machine(&svm, &id);
+    let received = tok_bal(&svm, &vault) - vault_before;
+    assert_eq!(m1.token_balance as u64, tok_bal(&svm, &vault), "token_balance mirrors vault");
+    assert_eq!(m1.token_balance - m0.token_balance, received as u128, "token_balance += received");
+    assert_eq!(mach_sol_before - lamports(&svm, &m), earmarked, "machine SOL down by exactly the swapped amount");
+    assert_eq!(m1.earmarked_sol, 0, "earmark cleared");
+    // non-compounding SOL-mode LP: token claim never decreased.
+    let sol_pos1 = read_position(&svm, &id, &sol_lp.pubkey());
+    let sol_claim1 = sol_pos1.shares * m1.token_balance / m1.total_shares;
+    assert!(sol_claim1 >= sol_claim0, "SOL-mode LP diluted by a compound: {sol_claim0} -> {sol_claim1}");
+}
 
 // ---------------------------------------------------------------------
 // deposit → accrue → claim happy path (SOL mode)

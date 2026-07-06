@@ -57,6 +57,7 @@ fn default_build_idl_has_no_mock_surface() {
         "create_machine_dual", "lp_deposit_token", "spin_commit_dual", "spin_settle_dual", "spin_expire_dual",
         "claim_sol", "earmark_sol", "set_reward_mode",
         "request_withdraw_token", "cancel_withdraw_token", "process_withdrawal_token",
+        "compound_epoch",
     ] {
         assert!(instrs.iter().any(|n| n == needed),
             "dual-asset instruction '{needed}' missing from the default-build IDL");

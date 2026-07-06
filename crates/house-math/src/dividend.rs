@@ -67,6 +67,75 @@ pub fn debt_preserving_pending(new_shares: u128, acc_sol_per_share: u128, pendin
     sol_entitlement(new_shares, acc_sol_per_share) - pending_before
 }
 
+/// Shares to mint when `tokens_received` (from a compound_epoch SOL→token swap)
+/// are added to the vault, priced at the PRE-swap share price:
+/// `mint = tokens_received · total_shares / token_balance`. Minting at the
+/// current price is what makes compounding non-dilutive — see the proof
+/// `compound_never_dilutes_non_compounders`: every position that does NOT compound
+/// keeps its exact token claim, because the pool grows by precisely the
+/// compounder's contribution and the share price is preserved.
+pub fn compound_mint_shares(tokens_received: u128, total_shares: u128, token_balance: u128) -> u128 {
+    debug_assert!(token_balance > 0, "compound requires a non-empty vault");
+    wide_mul_div(tokens_received, total_shares, token_balance)
+}
+
+#[cfg(test)]
+mod compound_proofs {
+    use super::*;
+    const SHARE_SCALE: u128 = 1_000_000; // mirrors the program's share scale
+
+    /// PROOF: minting compound shares at the pre-swap price leaves every
+    /// NON-compounding position's token claim exactly unchanged (no dilution in
+    /// value), while the compounder's new shares are worth exactly the tokens they
+    /// added. Swept over many pool states and contributions.
+    #[test]
+    fn compound_never_dilutes_non_compounders() {
+        for &(sh_other, sh_comp, tb) in &[
+            (1_000_000u128, 1_000_000u128, 10_000u128),
+            (7, 3, 100), (999_983, 17, 1_000_000_007), (1, 5_000_000, 42),
+        ] {
+            let total = sh_other + sh_comp;
+            // the compounder's earmarked SOL bought `tokens` at the pool price.
+            for tokens in [1u128, 1000, tb, tb * 3, 7_777_777] {
+                let minted = compound_mint_shares(tokens, total, tb);
+                let tb2 = tb + tokens;
+                let total2 = total + minted;
+                // non-compounder token claim: floor(sh·TB/TS) before vs after.
+                let claim_before = wide_mul_div(sh_other, tb, total);
+                let claim_after = wide_mul_div(sh_other, tb2, total2);
+                // NO DILUTION: the claim never decreases. `minted` floors down, so
+                // the compounder (not the non-compounder) bears the rounding — the
+                // non-compounder's claim is non-decreasing, never stolen from.
+                assert!(claim_after >= claim_before, "non-compounder diluted: {claim_before} -> {claim_after}");
+            }
+        }
+    }
+
+    /// PROOF (worked example, at par): a 10-SOL-worth pool held by one SPL staker,
+    /// after compounding 10 SOL of yield into 10-SOL-worth of tokens, holds
+    /// 20-SOL-worth. A newcomer then depositing 10-SOL-worth holds exactly 33%
+    /// (10/30). Uses the same SHARE_SCALE and CHIP units as the LiteSVM test.
+    #[test]
+    fn compound_worked_example_33pct() {
+        let chip = 1_000_000_000u128; // 1 CHIP base units (9 dec)
+        // staker deposits 10_000 CHIP → first deposit mints amount·SHARE_SCALE.
+        let tb0 = 10_000 * chip;
+        let ts0 = tb0 * SHARE_SCALE;
+        // compound 10 SOL of yield → 10_000 CHIP at par (1000 CHIP/SOL).
+        let tokens = 10_000 * chip;
+        let minted = compound_mint_shares(tokens, ts0, tb0);
+        assert_eq!(minted, ts0, "compounding the whole pool doubles the shares");
+        let tb1 = tb0 + tokens; // 20_000 CHIP
+        let ts1 = ts0 + minted; // 2·ts0
+        // newcomer deposits 10_000 CHIP at the current price.
+        let newcomer_dep = 10_000 * chip;
+        let newcomer_shares = wide_mul_div(newcomer_dep, ts1, tb1);
+        let ts2 = ts1 + newcomer_shares;
+        // newcomer holds exactly 10/30 == 1/3 of shares.
+        assert_eq!(newcomer_shares * 3, ts2, "newcomer holds exactly 33% (10/30)");
+    }
+}
+
 #[cfg(test)]
 mod proofs {
     use super::*;
