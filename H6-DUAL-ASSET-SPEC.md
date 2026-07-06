@@ -1,8 +1,21 @@
 # Scotti House Module — H6: Dual-Asset Machines (SOL in, SPL out) — Spec v0 draft
 
-**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **H6b-2 shipped** (LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free epoch-gated withdrawals of BOTH assets; curve depth is now token-side-only; house-math gains the dividend conservation/no-dilution proofs) · **H6b-3 shipped + LIVE on devnet** (real on-chain CLMM price reader — parses PoolState/ObservationState via the pinned H6a offsets, ground-truthed against captured live bytes; `compound_epoch` + AMM swap seam with compound share-minting proofs and the 33% worked example; house-math 48 proofs. Program **upgraded in place** and a **full dual spin ran live**: SOL wager priced by the real CLMM TWAP, Switchboard-settled, CHIP paid, verified by independent recompute — see README "Live dual spin") · **H6c-1 shipped + LIVE on devnet** (real Raydium CLMM `swap_v2` CPI wired into `compound_epoch` — ground-truthed against a live keeper swap, proven with a live compound: machine SOL down by exactly the earmark, vault CHIP up by the swap output ≥ TWAP×(1−band), shares minted non-dilutively — all by independent recompute; mock-swap suite unchanged, zero mock surface in the deployable IDL — see README "Live compound") · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
-**Legal posture:** unchanged from HOUSE-SPEC and amplified: a token-denominated house adds a
-token-issuance/market dimension on top of the licensed-casino question. Devnet demonstration only.
+**Status** — spec text below remains v0 draft for review; the build is complete and live on devnet. Per-milestone detail is in §7.
+
+| milestone | scope | state |
+|---|---|---|
+| H6a | price-infra ground-truth spike: verified devnet CLMM, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs | shipped |
+| H6b-1 | dual-asset `DualMachine` account + token vault + spin path (mock price seam); house-math token-payout / value-RTP-invariance / haircut-solvency proofs | shipped |
+| H6b-2 | LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free both-asset withdrawals; house-math dividend conservation / no-dilution proofs | shipped |
+| H6b-3 | real on-chain CLMM price reader (pinned H6a offsets, ground-truthed to live bytes) + `compound_epoch` behind a swap seam; house-math to 48 proofs | shipped + live |
+| H6c-1 | real Raydium CLMM `swap_v2` CPI wired into `compound_epoch` | shipped + live |
+| H6c-2 | dual-asset frontend + price-verifying spin verifier (no program change) | shipped + live |
+
+**Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
+
+**Legal posture (fixed):** unchanged from HOUSE-SPEC and amplified. A token-denominated house
+adds a **token-issuance / market** dimension on top of the licensed-casino-plus-pooled-investment
+question — this is the regulated thing itself, not a gray zone. **Devnet demonstration only.**
 
 ---
 
@@ -174,8 +187,13 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
   system-transfer source) and reimbursed out of the machine as the swap's last op (so the only
   balance check is at instruction return). Mock-swap LiteSVM suite unchanged; zero mock surface in
   the deployable IDL; legacy + dual machines unaffected.
-- **H6c — devnet + frontend.** Deploy/upgrade, bootstrap a dual-asset machine on the floor,
-  spin against the real pool, extend `verify-spin` to recompute price from the observation
-  history, and the UI: token payouts with value equivalents, the third LP disclosure, and a
-  "price status" chip (TWAP/spot/band/staleness) on the machine page — the protection made
-  visible.
+- **H6c-2 shipped + LIVE on devnet.** Frontend + verifier, no program change. `dual-chip-1` is
+  bootstrapped on the floor (`6vyARZoi…`); the Scotti app renders it as its own card with token
+  payouts + value equivalents, a live "price status" chip (TWAP/spot/band/staleness) computed
+  client-side from the real pool/observation accounts, the dual LP dashboard (price-free deposit,
+  pending SOL dividend, reward-mode choice), and the third LP disclosure. `verify-spin` was
+  extended to dual spins — it reconstructs the spin from chain and INDEPENDENTLY recomputes
+  `price_at_commit` from the observation ring, flagging any CHIP paid that could not have come from
+  that price and a valid k. Verified by a live UI-driven dual spin (CHERRY·BLANK·CHERRY, 3.83 CHIP,
+  recompute == paid to the base unit; ring price 977.67 vs 977.65 snapshot, 0.15bp) — see README
+  "The app · Verified". The protection made visible, end to end.

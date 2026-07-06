@@ -195,7 +195,8 @@ anything.
   bundled in the settle tx); never-revealed spins route to `spin_expire`. Unit-tested against
   crafted account bytes; the mock backend stays feature-gated and out of the deployed IDL.
   Deployed program `EewsDJqfDEEfF8mKhQRED6NSB987LhkKL9wawjM7SBQ`; `scripts/devnet-spin.ts` +
-  `scripts/verify-spin.ts` produced three public, independently-audited spins (see README Devnet).
+  `scripts/verify-spin.ts` produced three public, independently-audited spins (see README, *What's
+live on devnet*).
   Reveal latency observed ~2–4 s. (The `verifySpin` TypeScript SDK export is folded into H3's SDK
   work; the standalone `verify-spin.ts` delivers the runnable audit now.)
 - **H3 (shipped):** LP withdrawal side — `request_withdraw` / `cancel_withdraw` /
