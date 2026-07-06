@@ -1,0 +1,20 @@
+
+===== twap-demo @ 2026-07-06T01:33:42.027Z =====
+time     | phase      |    spot |    twap | coverage| fresh | band       | gate
+01:33:41 | start      | spot   964.0 | twap     —   | cov 484s | fresh 102s | band  —  STALE | REFUSE(stale)
+01:33:45 | A:warmup   | spot   960.8 | twap   964.1 | cov 587s | fresh   3s | band   34bp IN  | ALLOW
+>> NUDGE: 0.06 SOL WSOL→CHIP (move spot down, TWAP should lag)
+01:33:49 | B:nudged   | spot   871.8 | twap   961.8 | cov 587s | fresh   7s | band  936bp OUT | REFUSE(unstable)
+01:34:06 | B:nudged   | spot   874.9 | twap   956.2 | cov 611s | fresh   0s | band  850bp OUT | REFUSE(unstable)
+01:34:23 | B:nudged   | spot   872.2 | twap   950.8 | cov 628s | fresh   0s | band  827bp OUT | REFUSE(unstable)
+>> RECOVER: counter-swap ~60 CHIP → WSOL to bring spot back toward TWAP
+01:34:45 | C:recover  | spot   973.0 | twap   945.3 | cov 645s | fresh   5s | band  293bp IN  | ALLOW
+>> STOP keeper — observations should age past max_staleness (90s) → STALE
+01:34:45 | D:idle     | spot   973.0 | twap   945.3 | cov 645s | fresh   5s | band  293bp IN  | ALLOW
+01:35:04 | D:idle     | spot   973.0 | twap   945.8 | cov 645s | fresh  24s | band  287bp IN  | ALLOW
+01:35:24 | D:idle     | spot   973.0 | twap   946.4 | cov 645s | fresh  44s | band  281bp IN  | ALLOW
+01:35:45 | D:idle     | spot   973.0 | twap   947.1 | cov 645s | fresh  65s | band  274bp IN  | ALLOW
+01:36:05 | D:idle     | spot   973.0 | twap   947.7 | cov 645s | fresh  85s | band  267bp IN  | ALLOW
+01:36:25 | D:idle     | spot   973.0 | twap     —   | cov 645s | fresh 105s | band  —  STALE | REFUSE(stale)
+===== demo end. net SOL spent this run: -0.005528 SOL =====
+

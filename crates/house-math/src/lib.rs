@@ -7,6 +7,13 @@
 
 #![deny(unsafe_code)]
 
+// H6 dual-asset price infrastructure (H6a): tick→price fixed point, TWAP from
+// cumulative ticks, and the margin-floor invariant. Each is proof-tested like
+// the game math below.
+pub mod margin;
+pub mod price;
+pub mod twap;
+
 pub const REELS: usize = 3;
 pub const STOPS: usize = 32;
 pub const BP: u128 = 10_000; // basis points denominator

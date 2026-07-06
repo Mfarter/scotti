@@ -12,9 +12,10 @@ licensed-casino activity *and* a pooled investment product — out of scope by d
 | path | what | status |
 |---|---|---|
 | `HOUSE-SPEC.md` | module design v0 | draft for review |
-| `crates/house-math` | exact machine math: paytables, RTP curve `k(D)`, exposure cap, depth smoothing, books-balance — all integer-exact, with full 32³ enumeration proofs | tested (11 proofs, `cargo test`) |
+| `crates/house-math` | exact machine math: paytables, RTP curve `k(D)`, exposure cap, depth smoothing, books-balance, **tick→price fixed point, TWAP-from-cumulative-ticks, margin-floor invariant** — all integer-exact, with full 32³ enumeration proofs | tested (30 proofs, `cargo test`) |
 | `programs/house` | House program: config/machine/LP/spin accounts, LP share minting, spin commit/settle/expire, epoch-gated withdrawals | **H3 shipped** — upgraded in place on devnet |
-| `scripts` | devnet ops: bootstrap, live spin + verifier, machine/LP status read layer, live withdrawal | live on devnet (see below) |
+| `scripts` | devnet ops: bootstrap, live spin + verifier, machine/LP status read layer, live withdrawal, **CLMM pool + layout ground-truth + TWAP/keeper** | live on devnet (see below) |
+| `H6-DUAL-ASSET-SPEC.md` | dual-asset machines (SOL in, SPL out): Raydium CLMM TWAP price, band gate, haircut reserve, dual-asset LP | **H6a shipped** (price infra spike) |
 
 H1 shipped the on-chain skeleton (mock randomness); **H2** wired in real
 Switchboard On-Demand randomness on devnet; **H3** adds the LP withdrawal side
@@ -201,6 +202,112 @@ and a permissionless `process_withdrawals` (cranked by the deploy wallet) paid:
 Exact to the lamport; the 1-lamport gap vs the deposit is flooring dust that
 stays in the pool (accrues to the remaining LP). Process tx:
 [`3BT9ez…fjAfPe`](https://solscan.io/tx/3BT9ezJT6kV5eag8ypLc7WaedcyKBdrgHZUHrBfRUrrVJ6tyXjs18ju7fPM5vRZztvxFDN1i2eJ3zaR8s4fjAfPe?cluster=devnet).
+
+## Price infrastructure (H6a — devnet)
+
+H6a is the ground-truth spike for **dual-asset machines** (SOL wagers, SPL-token
+payouts, price from a Raydium CLMM TWAP — see `H6-DUAL-ASSET-SPEC.md`). Scripts
+and pure math only; **no program changes.** It de-risks the two external
+unknowns before H6b builds against them: the deployed CLMM's *real* account
+layouts, and devnet pool operability.
+
+**Verified devnet CLMM program id.** From the Raydium SDK v2 `programId.ts`
+(`DEVNET_PROGRAM_ID`, read verbatim — the remembered `devi51mZ…` id is a
+documented trap; Raydium migrated devnet to `DRay…` vanity addresses), then
+confirmed on-chain: `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH` —
+owner `BPFLoaderUpgradeab1e…`, executable, 1,470,141 bytes of bytecode, live
+upgrade authority. Not a dead shell.
+
+**Demo market — Scotti Chip (CHIP).** A 9-decimal SPL token (10,000,000 supply),
+paired with WSOL in a CLMM pool at **1 CHIP = 0.001 SOL** (pool orientation
+mintA = WSOL, mintB = CHIP → internal price 1000 CHIP/SOL), seeded with a
+concentrated position of **0.3 WSOL + 266 CHIP** over ticks [63970, 74950]
+(≈ 600–1800 CHIP/SOL, AmmConfig index 2: tickSpacing 10, 0.05% fee).
+
+| thing | address |
+|---|---|
+| CLMM program (devnet) | `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH` |
+| CHIP mint (9 dec) | `75zyWBYdFSNNFKDaTdEu9nZWdHaZCuuCd7tgCCxi2w6p` |
+| CLMM pool (PoolState) | `9n6LAVickwVAnDL4rHUZXAXkoMSG5794fKRgrXSfXn1n` |
+| ObservationState (TWAP ring) | `7nPBDXZVazj9w4GsuwjHx3qF5EffQCpvSKPj9p55QsgU` |
+| AmmConfig (tickSpacing 10) | `FZdkW5jiYsjTnCVqFqPrxrQisQkCYrohd7ArZhoKnM8q` |
+| pool vaults (WSOL / CHIP) | `3EUFyDquUtefjCbBzVb4u489XULqedKH14LJxwU57Fi9` / `EhArexxoDzkBeymW5UuJJvRPMLn6AZMTTzZ2nvHMHz1S` |
+
+Costs (devnet, deploy wallet): token mint+ATA+supply **0.0035 SOL**, pool
+creation **0.0615 SOL**, seed liquidity + tick-array/position rents **0.4658
+SOL** (~0.3 recoverable as position, ~0.16 as reclaimable rent), all swaps net
+**~0.016 SOL**. Session total **0.547 SOL**.
+
+**Layout ground-truth (the headline).** The deployed PoolState/ObservationState
+are `#[repr(C, packed)]` zero-copy accounts. Offsets were pinned in
+`scripts/layouts.ts` and proven against the *live* accounts by executing known
+swaps and watching them move (`scripts/prove-layouts-with-swaps.ts`):
+tick @269 and sqrt_price @253 shifted on every swap and stayed mutually
+consistent (`1.0001^tick ≈ price`); the observation index @17 advanced once per
+>15 s window; the new observation's `tick_cumulative` accrued exactly
+`prior_tick × Δt` (e.g. `ΔtickCum/Δt = 68912.0`, the standing tick). Reconciled
+against the published structs: the packed layout is the trap — a naive
+`#[repr(C)]` CPI struct would mis-place `recent_epoch`/`observation_index` and
+read `tick_cumulative` at +8 instead of +4. Confirmed the practitioner warning
+from bytes: **observations store cumulative tick only** (block_timestamp u32 +
+tick_cumulative i64 + 32 zero pad bytes — no Uniswap-style sqrt/secondsPerLiq),
+and the ring is **100** wide with the index living in ObservationState, not
+PoolState. `scripts/verify-layouts.ts` re-checks every pin against live accounts
+and exits non-zero on drift.
+
+**TWAP + keeper.** `scripts/twap-status.ts` prints spot (from sqrt_price), the
+5-minute TWAP (`avg_tick = ΔtickCum/Δt`, `price = 1.0001^avg_tick`), observation
+freshness vs `max_staleness`, band status vs 300bp, and the `price_at_commit`
+the machine would snapshot — with cold-start (too little history) and staleness
+as explicit **STALE** states. `scripts/keeper.ts` is a paced alternating-
+direction dust-swap loop that keeps the ring fresh; with balanced legs its cost
+is ≈ break-even (base tx fee ~5000 lamports/swap, largely offset by the 0.05%
+fee returning to the keeper-as-LP).
+
+**The artifact** — `twap-demo.ts` driving the live pool through the full story
+(STALE → LIVE → band flip OUT → recovery IN → staleness fires):
+
+```
+time     | phase      |    spot |    twap | coverage| fresh | band       | gate
+01:33:41 | start      |   964.0 |     —   | 484s | 102s |  —  STALE | REFUSE(stale)
+01:33:45 | A:warmup   |   960.8 |   964.1 | 587s |   3s |   34bp IN  | ALLOW
+>> NUDGE: 0.06 SOL WSOL→CHIP (move spot down, TWAP should lag)
+01:33:49 | B:nudged   |   871.8 |   961.8 | 587s |   7s |  936bp OUT | REFUSE(unstable)
+01:34:06 | B:nudged   |   874.9 |   956.2 | 611s |   0s |  850bp OUT | REFUSE(unstable)
+01:34:23 | B:nudged   |   872.2 |   950.8 | 628s |   0s |  827bp OUT | REFUSE(unstable)
+>> RECOVER: counter-swap ~60 CHIP → WSOL to bring spot back toward TWAP
+01:34:45 | C:recover  |   973.0 |   945.3 | 645s |   5s |  293bp IN  | ALLOW
+>> STOP keeper — observations age past max_staleness (90s) → STALE
+01:34:45 | D:idle     |   973.0 |   945.3 | 645s |   5s |  293bp IN  | ALLOW
+01:35:24 | D:idle     |   973.0 |   946.4 | 645s |  44s |  281bp IN  | ALLOW
+01:36:05 | D:idle     |   973.0 |   947.7 | 645s |  85s |  267bp IN  | ALLOW
+01:36:25 | D:idle     |   973.0 |     —   | 645s | 105s |  —  STALE | REFUSE(stale)
+```
+
+The 5-minute TWAP visibly **lags** the keeper-induced move (spot 960→872 while
+TWAP holds ~960), the band gate flips **OUT** past 300bp and **back IN** as spot
+returns, and staleness fires once the keeper stops and the newest observation
+ages past 90 s — the price protection made observable, end to end, on devnet.
+
+**house-math (pure Rust, proof-tested).** `crates/house-math` gains
+`price.rs` (tick→`sqrt_price_x64` via the 19 per-bit magic multipliers, pinned
+vectors cross-checked two independent ways by
+`proofs/tick_price_crosscheck.py` — the H0 discipline — with boundary ticks
+matching Raydium's published MIN/MAX_SQRT_PRICE_X64 and tick 69081 bracketing
+the live pool), `twap.rs` (TWAP-from-cumulative with wraparound / single-obs /
+stale-window edge cases), and `margin.rs` (the margin-floor invariant
+`RTP_MAX × (BP+band) ≤ (BP−m)·BP` — 95% × 1.03 = 97.85% ≤ 98% — plus an
+exhaustive ~15M-config sweep proving no accepted parameter set can cross it).
+**30 proofs green.**
+
+```
+node create-clmm-pool.ts && node seed-clmm-lp.ts   # create + seed the pool
+node prove-layouts-with-swaps.ts                    # ground-truth the offsets
+node verify-layouts.ts                              # regression guard (exit≠0 on drift)
+node twap-status.ts [--watch]                       # spot / TWAP / band / staleness
+node keeper.ts --interval 20                        # keep observations fresh
+node twap-demo.ts                                   # the full STALE→LIVE→band→stale artifact
+```
 
 ## App (H4/H5 — the Scotti frontend)
 

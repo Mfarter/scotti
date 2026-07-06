@@ -1,6 +1,6 @@
 # Scotti House Module — H6: Dual-Asset Machines (SOL in, SPL out) — Spec v0 draft
 
-**Status:** Draft for review · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
+**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
 **Legal posture:** unchanged from HOUSE-SPEC and amplified: a token-denominated house adds a
 token-issuance/market dimension on top of the licensed-casino question. Devnet demonstration only.
 
@@ -117,7 +117,7 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
 
 ## 7. Sessions
 
-- **H6a — ground truth + demo market.** Verify devnet Raydium CLMM program id + PoolState/
+- **H6a — ground truth + demo market. ✓ SHIPPED.** Verify devnet Raydium CLMM program id + PoolState/
   ObservationState layouts against live accounts (raw bytes vs known swaps; pin offsets with a
   regression test). Create the demo token (9 decimals), seed a token/WSOL CLMM pool, write the
   keeper (dust-swap cron) and a `twap-status` script proving TWAP/spot/staleness reads off
