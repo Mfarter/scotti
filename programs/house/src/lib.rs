@@ -24,6 +24,13 @@ use anchor_lang::solana_program::program::invoke;
 use anchor_lang::solana_program::system_instruction;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+// Real Raydium CLMM swap CPI (compound_epoch's deployable path). The mock-swap
+// build uses none of these — they are pulled in only when the real seam compiles.
+#[cfg(not(feature = "mock-swap"))]
+use anchor_lang::solana_program::{
+    instruction::{AccountMeta, Instruction},
+    program::invoke_signed,
+};
 use yvone_house_math as hm;
 // Switchboard On-Demand parsing lives only in the deployable (non-mock) build.
 #[cfg(not(feature = "mock-randomness"))]
@@ -1177,7 +1184,7 @@ fn eval_price_gates(r: &PriceReading, max_staleness_secs: u32, band_bp: u16) -> 
     Ok(())
 }
 
-// -------------------- AMM swap seam (H6b-3, compound_epoch) --------------------
+// -------------------- AMM swap seam (H6b-3 accounting, H6c-1 real CPI) --------------------
 //
 // compound_epoch's ONE AMM CPI, behind a seam like the price/randomness ones:
 //   * mock-swap feature ON  → fills at the read SPOT price from a caller-supplied
@@ -1185,12 +1192,11 @@ fn eval_price_gates(r: &PriceReading, max_staleness_secs: u32, band_bp: u16) -> 
 //     ACCOUNTING; a settable fill is test-only, so it is OFF in the deployable
 //     build. The mock takes remaining_accounts [counterparty_token, counterparty
 //     _authority(signer)].
-//   * feature OFF (default/deployable) → the REAL Raydium CLMM swap CPI (SOL/WSOL
-//     → token) signed by the machine PDA. Its ACCOUNTING is what the mock proves;
-//     the on-chain swap wiring itself is the one piece H6b-3 leaves for a live
-//     compound run (the CLMM READER, not this swap, is what H6b-3 proves live via
-//     a real dual spin). Returns CompoundSwapNotWired until then — exactly the
-//     stub discipline read_price used before its CLMM backend landed.
+//   * feature OFF (default/deployable) → the REAL Raydium CLMM `swap_v2` CPI
+//     (WSOL → token) signed by the machine PDA (H6c-1). Its ACCOUNTING is what the
+//     mock proves in LiteSVM; the on-chain wiring is proven live on devnet by
+//     scripts/devnet-compound.ts (LiteSVM has no Raydium program), mirroring how
+//     the CLMM price reader was proven via a real dual spin.
 
 /// Swap `amount_sol` of the machine's earmarked lamports into the token, into the
 /// vault. Returns tokens_received. The machine PDA is the swap authority.
@@ -1229,24 +1235,157 @@ fn amm_swap_sol_to_token<'info>(
     Ok(tokens_out)
 }
 
-/// Real Raydium CLMM swap CPI — the deployable path. Left unwired until a
-/// dedicated live compound run (see the seam note above); compound_epoch's
-/// accounting is proven under mock-swap.
+/// Raydium CLMM `swap_v2` anchor discriminator = sha256("global:swap_v2")[..8],
+/// pinned from the live reference tx (verified in `compound_swap_wiring_tests`).
+#[cfg(not(feature = "mock-swap"))]
+const SWAP_V2_DISCRIMINATOR: [u8; 8] = [0x2b, 0x04, 0xed, 0x0b, 0x1a, 0xc9, 0x1e, 0x62];
+
+/// Real Raydium CLMM `swap_v2` CPI — the deployable path (H6c-1). The crank fronts
+/// the WSOL (creates + funds + sync_natives the machine PDA's WSOL ATA with
+/// `amount_sol`, in the same tx, right before this call); this seam swaps that
+/// WSOL→token straight into the machine's own vault (min_out enforced as
+/// `other_amount_threshold`, swap signed by the machine PDA), then reimburses the
+/// cranker `amount_sol` out of the machine as its LAST lamport op. Net: the
+/// machine's lamport balance falls by EXACTLY `amount_sol`, the cranker is whole.
+///
+/// GROUND TRUTH — pinned against a live devnet keeper swap on the CHIP/WSOL pool
+/// (`prove-layouts-with-swaps.ts` / `keeper.ts` produce these):
+///   reference txid 5XcKLeGcHVcdDf8faCutjZ1BH22dgWYgjE49Dg56S6MoE4iSPMdzc6DcC2xF1m26jkEoTjETN4KhAV9XWehKXFVk
+///   (devnet, slot 474331936, 2026-07-06T07:50:08Z; log "Instruction: SwapV2", 52929 CU).
+/// Instruction data (41 bytes): disc sha256("global:swap_v2")[..8] = 2b04ed0b1ac91e62,
+///   then amount:u64, other_amount_threshold:u64, sqrt_price_limit_x64:u128, is_base_input:bool.
+/// swap_v2 account order (13 fixed + remaining): [0] payer/authority, [1] amm_config,
+///   [2] pool_state, [3] input_token_account, [4] output_token_account, [5] input_vault,
+///   [6] output_vault, [7] observation_state, [8] token_program, [9] token_program_2022,
+///   [10] memo_program, [11] input_vault_mint, [12] output_vault_mint, then
+///   [tickarray_bitmap_extension, tick_array..] as remaining accounts.
+///
+/// The crank supplies the Raydium + wrap accounts through `remaining` (the seam
+/// keeps its signature; the CompoundEpoch struct is unchanged). Order:
+///   [0] cranker (writable — fronted the WSOL wrap, reimbursed by the machine)
+///   [1] wsol_mint (NATIVE_MINT; swap_v2 input_vault_mint)
+///   [2] wsol_ata  (writable; the machine PDA's WSOL ATA, funded by the crank)
+///   [3] clmm_program (owner-checked == CLMM_PROGRAM_ID)
+///   [4] amm_config          [5] pool_state
+///   [6] pool_input_vault (WSOL)   [7] pool_output_vault (token)
+///   [8] observation_state  [9] token_program_2022   [10] memo_program
+///   [11] output_vault_mint (== machine token mint)
+///   [12..] tickarray_bitmap_extension, tick_array.. (SDK `remainingAccounts`)
 #[cfg(not(feature = "mock-swap"))]
 #[allow(clippy::too_many_arguments)]
 fn amm_swap_sol_to_token<'info>(
-    _machine: AccountInfo<'info>,
-    _machine_id: &[u8; 16],
-    _bump: u8,
-    _vault: AccountInfo<'info>,
-    _token_program: AccountInfo<'info>,
-    _remaining: &[AccountInfo<'info>],
-    _amount_sol: u64,
-    _min_out: u64,
+    machine: AccountInfo<'info>,
+    machine_id: &[u8; 16],
+    bump: u8,
+    vault: AccountInfo<'info>,
+    token_program: AccountInfo<'info>,
+    remaining: &[AccountInfo<'info>],
+    amount_sol: u64,
+    min_out: u64,
     _spot_1e12: u128,
     _token_decimals: u8,
 ) -> Result<u64> {
-    Err(HouseError::CompoundSwapNotWired.into())
+    // fixed prefix (13) + at least one tick array.
+    require!(remaining.len() >= 14, HouseError::InvalidPriceAccount);
+    let cranker = &remaining[0];
+    let wsol_mint = &remaining[1];
+    let wsol_ata = &remaining[2];
+    let clmm_program = &remaining[3];
+    let amm_config = &remaining[4];
+    let pool_state = &remaining[5];
+    let pool_input_vault = &remaining[6];
+    let pool_output_vault = &remaining[7];
+    let observation = &remaining[8];
+    let token_program_2022 = &remaining[9];
+    let memo_program = &remaining[10];
+    let output_vault_mint = &remaining[11];
+    let bitmap_and_ticks = &remaining[12..];
+
+    // trust the REAL CLMM program only (owner-check pattern, spec §2): a look-alike
+    // can't be the swap target. Output lands in `vault` (constrained to the
+    // machine's token_vault by the accounts struct) and must clear `min_out`
+    // priced off the machine's own pool TWAP — so mis-routing can only help or fail.
+    require_keys_eq!(*clmm_program.key, CLMM_PROGRAM_ID, HouseError::InvalidPriceAccount);
+
+    let signer_seeds: &[&[u8]] = &[b"dual-machine", machine_id.as_ref(), std::slice::from_ref(&bump)];
+
+    // FUNDING MODEL. The machine PDA is program-owned, so it can be neither a
+    // system-transfer source nor (having modified a non-owned account's lamports
+    // mid-instruction) followed by a CPI without tripping the runtime's per-CPI
+    // balance check. So the WSOL for the swap is fronted by the CRANK: it creates
+    // + funds + sync_natives the machine PDA's WSOL ATA with EXACTLY `amount_sol`
+    // in the SAME transaction, right before this instruction. This seam swaps that
+    // WSOL, then — as the LAST lamport operation, so the only balance check is at
+    // the instruction's RETURN (the Anchor `close` primitive) — reimburses the
+    // cranker `amount_sol` out of the machine. Net: machine −amount_sol, cranker ±0.
+
+    // measure the vault, then swap_v2 WSOL→token straight into it.
+    let before = token_amount(&vault)?;
+    let mut data = Vec::with_capacity(41);
+    data.extend_from_slice(&SWAP_V2_DISCRIMINATOR);
+    data.extend_from_slice(&amount_sol.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes()); // other_amount_threshold
+    data.extend_from_slice(&0u128.to_le_bytes()); // sqrt_price_limit_x64 = 0 (no limit)
+    data.push(1); // is_base_input = true
+
+    let mut metas = vec![
+        AccountMeta::new_readonly(*machine.key, true), // [0] payer/authority (PDA-signed)
+        AccountMeta::new_readonly(*amm_config.key, false),
+        AccountMeta::new(*pool_state.key, false),
+        AccountMeta::new(*wsol_ata.key, false), // input_token_account
+        AccountMeta::new(*vault.key, false),    // output_token_account (machine vault)
+        AccountMeta::new(*pool_input_vault.key, false),
+        AccountMeta::new(*pool_output_vault.key, false),
+        AccountMeta::new(*observation.key, false),
+        AccountMeta::new_readonly(*token_program.key, false),
+        AccountMeta::new_readonly(*token_program_2022.key, false),
+        AccountMeta::new_readonly(*memo_program.key, false),
+        AccountMeta::new_readonly(*wsol_mint.key, false), // input_vault_mint
+        AccountMeta::new_readonly(*output_vault_mint.key, false),
+    ];
+    for a in bitmap_and_ticks {
+        metas.push(AccountMeta::new(*a.key, false)); // bitmap ext + tick arrays are writable
+    }
+    let mut infos = vec![
+        machine.clone(), amm_config.clone(), pool_state.clone(), wsol_ata.clone(),
+        vault.clone(), pool_input_vault.clone(), pool_output_vault.clone(),
+        observation.clone(), token_program.clone(), token_program_2022.clone(),
+        memo_program.clone(), wsol_mint.clone(), output_vault_mint.clone(),
+    ];
+    infos.extend(bitmap_and_ticks.iter().cloned());
+    infos.push(clmm_program.clone()); // program account for the invoke
+
+    invoke_signed(
+        &Instruction { program_id: *clmm_program.key, accounts: metas, data },
+        &infos,
+        &[signer_seeds],
+    )?;
+    let after = token_amount(&vault)?;
+    let received = after.checked_sub(before).ok_or(HouseError::MathOverflow)?;
+
+    // reimburse the cranker for the WSOL it fronted — the LAST lamport op, so the
+    // only balance check is at instruction RETURN (owned-debit + non-owned-credit,
+    // the Anchor `close` primitive; a credit interleaved before a CPI would trip
+    // the per-CPI subset balance check). Machine's net lamport delta is EXACTLY
+    // `amount_sol`; the cranker is made whole; the machine keeps the swapped token.
+    **machine.try_borrow_mut_lamports()? = machine
+        .lamports()
+        .checked_sub(amount_sol)
+        .ok_or(HouseError::MathOverflow)?;
+    **cranker.try_borrow_mut_lamports()? = cranker
+        .lamports()
+        .checked_add(amount_sol)
+        .ok_or(HouseError::MathOverflow)?;
+    Ok(received)
+}
+
+/// SPL token account balance (u64 @ offset 64) read straight from account bytes —
+/// used to measure the vault before/after the swap CPI (the CPI returns no amount).
+#[cfg(not(feature = "mock-swap"))]
+fn token_amount(acct: &AccountInfo) -> Result<u64> {
+    let data = acct.try_borrow_data()?;
+    require!(data.len() >= 72, HouseError::InvalidPriceAccount);
+    Ok(u64::from_le_bytes(data[64..72].try_into().unwrap()))
 }
 
 // -------------------- accounts --------------------
@@ -1912,7 +2051,6 @@ pub enum HouseError {
     #[msg("Machine has too many pending spins")] TooManyPendingSpins,
     #[msg("Not enough free token liquidity to reserve payout")] InsufficientTokenLiquidity,
     #[msg("Instruction does not match the position's reward mode")] WrongRewardMode,
-    #[msg("Real Raydium CLMM swap CPI not wired yet (compound accounting proven under mock-swap)")] CompoundSwapNotWired,
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,5 +2200,46 @@ mod switchboard_seam_tests {
         let info = AccountInfo::new(&key, false, false, &mut lam, &mut data, &owner, false);
         let e = revealed_bytes(&info, key, 100, 555).unwrap_err();
         assert_eq!(code(e), want(HouseError::RandomnessNotResolved));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deployable-build wiring check for compound_epoch's real Raydium CLMM swap CPI.
+// Compiled ONLY in the default (non-mock-swap) build — the same build that ships
+// — so `cargo test --workspace` forces the real `amm_swap_sol_to_token` to
+// compile and guards the pinned `swap_v2` discriminator against the anchor
+// derivation. The CPI's on-chain CORRECTNESS is proven live on devnet by
+// scripts/devnet-compound.ts (mirroring how the CLMM price reader was proven via
+// a real dual spin, not in LiteSVM which has no Raydium program).
+#[cfg(all(test, not(feature = "mock-swap")))]
+mod compound_swap_wiring_tests {
+    use super::*;
+
+    /// GROUND TRUTH: encode a `swap_v2` instruction body the way the seam does and
+    /// assert it byte-reproduces the pinned LIVE reference tx's 41-byte data
+    /// (5XcKLeGcHVc… on devnet, log "Instruction: SwapV2"). Its decoded args were
+    /// amount 2_000_000_000, other_amount_threshold 1_850_366, sqrt_price_limit 0,
+    /// is_base_input true. This forces the real (non-mock-swap) seam to compile
+    /// under `cargo test --workspace` and pins the exact on-wire layout.
+    #[test]
+    fn swap_v2_encoding_matches_live_tx() {
+        let (amount, threshold): (u64, u64) = (2_000_000_000, 1_850_366);
+        let mut data = Vec::with_capacity(41);
+        data.extend_from_slice(&SWAP_V2_DISCRIMINATOR);
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&threshold.to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes()); // sqrt_price_limit_x64
+        data.push(1); // is_base_input
+
+        let live = hex_to_bytes(
+            "2b04ed0b1ac91e620094357700000000fe3b1c00000000000000000000000000000000000000000001",
+        );
+        assert_eq!(data.len(), 41, "swap_v2 data is 8 disc + 33 args");
+        assert_eq!(data, live, "seam encoding reproduces the live swap_v2 tx byte-for-byte");
+        assert_eq!(SWAP_V2_DISCRIMINATOR, live[..8], "pinned discriminator == live tx prefix");
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 }

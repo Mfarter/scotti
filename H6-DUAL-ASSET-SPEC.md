@@ -1,6 +1,6 @@
 # Scotti House Module — H6: Dual-Asset Machines (SOL in, SPL out) — Spec v0 draft
 
-**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **H6b-2 shipped** (LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free epoch-gated withdrawals of BOTH assets; curve depth is now token-side-only; house-math gains the dividend conservation/no-dilution proofs) · **H6b-3 shipped + LIVE on devnet** (real on-chain CLMM price reader — parses PoolState/ObservationState via the pinned H6a offsets, ground-truthed against captured live bytes; `compound_epoch` + AMM swap seam with compound share-minting proofs and the 33% worked example; house-math 48 proofs. Program **upgraded in place** and a **full dual spin ran live**: SOL wager priced by the real CLMM TWAP, Switchboard-settled, CHIP paid, verified by independent recompute — see README "Live dual spin") · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
+**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **H6b-2 shipped** (LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free epoch-gated withdrawals of BOTH assets; curve depth is now token-side-only; house-math gains the dividend conservation/no-dilution proofs) · **H6b-3 shipped + LIVE on devnet** (real on-chain CLMM price reader — parses PoolState/ObservationState via the pinned H6a offsets, ground-truthed against captured live bytes; `compound_epoch` + AMM swap seam with compound share-minting proofs and the 33% worked example; house-math 48 proofs. Program **upgraded in place** and a **full dual spin ran live**: SOL wager priced by the real CLMM TWAP, Switchboard-settled, CHIP paid, verified by independent recompute — see README "Live dual spin") · **H6c-1 shipped + LIVE on devnet** (real Raydium CLMM `swap_v2` CPI wired into `compound_epoch` — ground-truthed against a live keeper swap, proven with a live compound: machine SOL down by exactly the earmark, vault CHIP up by the swap output ≥ TWAP×(1−band), shares minted non-dilutively — all by independent recompute; mock-swap suite unchanged, zero mock surface in the deployable IDL — see README "Live compound") · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
 **Legal posture:** unchanged from HOUSE-SPEC and amplified: a token-denominated house adds a
 token-issuance/market dimension on top of the licensed-casino question. Devnet demonstration only.
 
@@ -159,14 +159,21 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
     logic changed — it lives outside the seam. Ground-truthed against CAPTURED LIVE devnet bytes:
     spot_1e12 and the 300s TWAP avg_tick reproduce scripts/twap.ts exactly. `compound_epoch` (the
     module's only AMM CPI) behind a swap seam — mock fill proves the accounting (books, non-dilution,
-    the 33% worked example); the real Raydium CLMM swap CPI is the one piece left for a live compound
-    run. house-math: `clmm` + `compound_mint_shares` proofs (48 total).
+    the 33% worked example). house-math: `clmm` + `compound_mint_shares` proofs (48 total).
     - **LIVE on devnet:** the program was upgraded in place (extend 240KB + redeploy) and a full
       dual spin ran against the real H6a CHIP/WSOL pool — keeper-freshened TWAP, SOL wager priced by
       the on-chain CLMM reader (972.00 CHIP/SOL snapshot, spot within 18bp), Switchboard-settled, CHIP
       paid, and the payout matched an independent recompute to the base unit. `claim_sol` paid the
-      accrued dividend; the live H3 single-asset machines still read/spin. The only residual is the
-      REAL Raydium swap CPI in `compound_epoch` (behind the mock-swap seam; accounting proven).
+      accrued dividend; the live H3 single-asset machines still read/spin.
+- **H6c-1 shipped + LIVE on devnet.** `compound_epoch`'s AMM CPI is now the REAL Raydium CLMM
+  `swap_v2` (WSOL→CHIP into the vault, signed by the machine PDA), ground-truthed against a live
+  keeper swap (`5XcKLe…`, log `Instruction: SwapV2`) and proven with a live compound on
+  `dual-chip-1` (`5P8zLq…`, 174,732 CU): machine SOL down by EXACTLY the earmark, vault CHIP up by
+  the swap output (≥ TWAP×(1−band)), shares minted == `compound_mint_shares` at the pre-swap price
+  — all by independent recompute. The WSOL is fronted by the crank (a program-owned PDA can't be a
+  system-transfer source) and reimbursed out of the machine as the swap's last op (so the only
+  balance check is at instruction return). Mock-swap LiteSVM suite unchanged; zero mock surface in
+  the deployable IDL; legacy + dual machines unaffected.
 - **H6c — devnet + frontend.** Deploy/upgrade, bootstrap a dual-asset machine on the floor,
   spin against the real pool, extend `verify-spin` to recompute price from the observation
   history, and the UI: token payouts with value equivalents, the third LP disclosure, and a

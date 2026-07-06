@@ -336,9 +336,28 @@ node keeper.ts --interval 16       # freshen the pool TWAP (needs pool liquidity
 node devnet-dual-spin.ts           # create machine, deposit CHIP, commit→settle→claim, verify
 ```
 
-The one residual is the REAL Raydium CLMM swap CPI inside `compound_epoch` (behind
-the `mock-swap` seam — its accounting is proven in LiteSVM, incl. the 33% compound
-worked example; the on-chain swap wiring awaits a dedicated live compound run).
+### Live compound (H6c-1)
+
+`compound_epoch`'s AMM CPI is now the REAL Raydium CLMM `swap_v2` — the machine's
+earmarked SOL is wrapped to WSOL and swapped into CHIP straight into the vault
+(swap signed by the machine PDA), minted into shares at the pre-swap price. The
+`swap_v2` instruction was ground-truthed against a live devnet keeper swap
+([`5XcKLe…`](https://solscan.io/tx/5XcKLeGcHVcdDf8faCutjZ1BH22dgWYgjE49Dg56S6MoE4iSPMdzc6DcC2xF1m26jkEoTjETN4KhAV9XWehKXFVk?cluster=devnet),
+log `Instruction: SwapV2`), and proven with a live compound on `dual-chip-1`:
+
+| step | tx |
+| --- | --- |
+| `compound_epoch` (real swap_v2, 174,732 CU) | [`5P8zLq…`](https://solscan.io/tx/5P8zLq6tqBtX35xvH2k8VeksddoJ6VoXmkjnKKsubc2JTGm4mJ5j95xBn9ALCndv1UWPbYL6cPUsTDov7KF9zWQP?cluster=devnet) |
+
+Independent recompute confirmed: machine SOL **down by exactly the earmark**
+(0.004 SOL), vault CHIP **up by the swap output** (3,913,661,140 base units ≥
+`min_out` = TWAP×(1−band)), and shares minted == `compound_mint_shares` at the
+pre-swap price — on both the machine and the position. The WSOL for the swap is
+fronted by the crank (the machine PDA can't be a system-transfer source) and
+reimbursed out of the machine as the swap's last op, so the machine's lamport
+delta is exactly the earmark. The mock-swap LiteSVM suite (compound accounting +
+the 33% worked example) is unchanged; the deployable IDL carries zero mock surface.
+Reproduce with `node keeper.ts` (freshen the TWAP) then `node devnet-compound.ts`.
 
 ## App (H4/H5 — the Scotti frontend)
 
