@@ -1,6 +1,6 @@
 # Scotti House Module — H6: Dual-Asset Machines (SOL in, SPL out) — Spec v0 draft
 
-**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3; LP dividend ledger is H6b-2. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
+**Status:** Draft for review · **H6a shipped** (price-infra ground-truth spike: verified devnet CLMM `DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH`, demo CHIP/WSOL pool, layout ground-truth + regression guard, twap-status/keeper, house-math tick→price/TWAP/margin proofs — see README "Price infrastructure") · **H6b-1 shipped** (dual-asset `DualMachine` account + token vault + spin path against a MOCK price seam; the CLMM price reader is stubbed until H6b-3. house-math gains the token-payout + value-RTP-invariance + haircut-solvency proofs) · **H6b-2 shipped** (LP layer: MasterChef SOL dividend ledger, SOL/SPL reward modes, price-free token deposits, price-free epoch-gated withdrawals of BOTH assets; curve depth is now token-side-only; house-math gains the dividend conservation/no-dilution proofs) · **Extends:** HOUSE-SPEC v0 (H1–H5 shipped) · **Cluster:** devnet only
 **Legal posture:** unchanged from HOUSE-SPEC and amplified: a token-denominated house adds a
 token-issuance/market dimension on top of the licensed-casino question. Devnet demonstration only.
 
@@ -86,8 +86,16 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
 
 ## 5. LP mechanics (dual-asset)
 
-- **Deposit: tokens only**, priced by TWAP behind the band gate:
-  `mint = token_amount × TWAP × total_shares ÷ D`. (First deposit 1:1 at 1e6 scale on value.)
+- **Deposit: tokens only, PRICE-FREE** (H6b-2 locked decision, superseding this
+  section's earlier "priced by TWAP" sketch). Shares are minted pro-rata on the
+  token side only: `mint = token_amount × total_shares ÷ token_balance` (first
+  deposit 1:1 at 1e6 scale). No TWAP is read — `spin_commit` stays the ONLY
+  price-touching instruction. This is strictly SAFER than value-pricing: pricing
+  the deposit would let an attacker inflate the TWAP at deposit to mint excess
+  shares (the deposit-timing game, threat model §6). The SOL side is made correct
+  without a price by the **SOL dividend ledger** (below): a MasterChef per-share
+  accumulator `acc_sol_per_share` with position `sol_debt`, so a deposit is
+  entitled to ZERO of any prior accrual (no dilution, proven in house-math).
 - **Withdraw: pro-rata of BOTH assets, price-free.** A processed request pays
   `shares/total_shares` of the token balance AND of the SOL balance. No price input ⇒ the
   withdrawal path is manipulation-immune, and "excess SOL evenly distributed between stakers"
@@ -136,9 +144,14 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
     CLMM stub) with gate evaluation in shared code. house-math: token payout + value-RTP-invariance
     + haircut-solvency. 27-test LiteSVM matrix; legacy SOL machines pass untouched; mocks absent
     from the deployable IDL.
-  - **H6b-2 — LP dividend ledger.** Value-priced token deposits behind the band gate, dual-asset
-    pro-rata withdrawals (price-free), and the `pending_sol_yield` → per-share SOL dividend ledger
-    (`DualLpPosition.sol_debt`/`reward_mode` are laid out now).
+  - **H6b-2 — LP dividend ledger. ✓ SHIPPED (mock price).** PRICE-FREE token deposits (not
+    value-priced — the locked, safer decision; see §5), a MasterChef per-share SOL dividend ledger
+    (`acc_sol_per_share` + position `sol_debt`, house-math `dividend` module: conservation via a
+    pool-balance cap, no-dilution, rounding-favors-the-pool), SOL/SPL reward modes (`claim_sol`,
+    `earmark_sol`, `set_reward_mode`; SPL earmarks into `earmarked_sol`, excluded from everything,
+    swapped in H6b-3), and price-free epoch-gated withdrawals of BOTH assets (`request/cancel/
+    process_withdrawal_token`). Curve depth is token-side only — accrued SOL is dividend income,
+    never at-risk capital, never in `max_bet`. 15-test dual matrix incl. the literal worked example.
   - **H6b-3 — CLMM price reader.** Fill the `read_price` CLMM backend: parse Raydium
     PoolState.sqrt_price + ObservationState cumulative-tick TWAP via the pinned H6a offsets, under
     the owner-check trust pattern. No gate logic changes (it lives outside the seam).

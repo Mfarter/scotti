@@ -12,10 +12,10 @@ licensed-casino activity *and* a pooled investment product — out of scope by d
 | path | what | status |
 |---|---|---|
 | `HOUSE-SPEC.md` | module design v0 | draft for review |
-| `crates/house-math` | exact machine math: paytables, RTP curve `k(D)`, exposure cap, depth smoothing, books-balance, tick→price fixed point, TWAP-from-cumulative-ticks, margin-floor invariant, **token payout + value-RTP-invariance + haircut-solvency** — all integer-exact, with full 32³ enumeration proofs | tested (38 proofs, `cargo test`) |
-| `programs/house` | House program: config/machine/LP/spin accounts, LP share minting, spin commit/settle/expire, epoch-gated withdrawals, **dual-asset `DualMachine` (SOL in / SPL out): token vault, price seam + band/staleness gates, haircut reserve, token deposit** | **H3 shipped** on devnet · **H6b-1** dual-asset core (mock price, not yet deployed) |
+| `crates/house-math` | exact machine math: paytables, RTP curve `k(D)`, exposure cap, depth smoothing, books-balance, tick→price fixed point, TWAP-from-cumulative-ticks, margin-floor invariant, token payout + value-RTP-invariance + haircut-solvency, **MasterChef SOL dividend ledger (conservation, no-dilution)** — all integer-exact, with full 32³ enumeration proofs | tested (42 proofs, `cargo test`) |
+| `programs/house` | House program: config/machine/LP/spin accounts, LP share minting, spin commit/settle/expire, epoch-gated withdrawals, **dual-asset `DualMachine` (SOL in / SPL out): token vault, price seam + band/staleness gates, haircut reserve, price-free token deposits, SOL dividend ledger + SOL/SPL reward modes, price-free dual-asset withdrawals** | **H3 shipped** on devnet · **H6b-1/2** dual-asset core + LP layer (mock price, not yet deployed) |
 | `scripts` | devnet ops: bootstrap, live spin + verifier, machine/LP status read layer, live withdrawal, **CLMM pool + layout ground-truth + TWAP/keeper** | live on devnet (see below) |
-| `H6-DUAL-ASSET-SPEC.md` | dual-asset machines (SOL in, SPL out): Raydium CLMM TWAP price, band gate, haircut reserve, dual-asset LP | **H6a + H6b-1 shipped** (price infra + program core vs mock price) |
+| `H6-DUAL-ASSET-SPEC.md` | dual-asset machines (SOL in, SPL out): Raydium CLMM TWAP price, band gate, haircut reserve, dual-asset LP | **H6a + H6b-1 + H6b-2 shipped** (price infra + program core + LP dividend layer vs mock price) |
 
 H1 shipped the on-chain skeleton (mock randomness); **H2** wired in real
 Switchboard On-Demand randomness on devnet; **H3** adds the LP withdrawal side

@@ -277,7 +277,7 @@ fn a_happy_dual_spin_reconciles() {
     assert_eq!(m1.token_balance, dep - expected, "token_balance -= payout");
     assert_eq!(m1.reserved_tokens, 0, "reserve released");
     assert_eq!(m1.escrowed_sol, 0, "wager no longer escrowed");
-    assert_eq!(m1.pending_sol_yield, wager as u64, "wager accrued to SOL yield");
+    assert_eq!(m1.div_pool_sol, wager as u64, "wager accrued to the dividend pool");
     assert_eq!(m1.pending_spins, 0);
     // player only regains the spin rent in SOL (payout is token-only)
     assert_eq!(lamports(&svm, &player.pubkey()), player_sol_before + spin_rent, "SOL side: only rent back");
@@ -492,7 +492,7 @@ fn j_books_reconcile_over_mixed_sequence() {
     let check_books = |svm: &LiteSVM| {
         let mach = read_machine(svm, &id);
         // SOL: machine PDA lamports − rent == escrowed_sol + pending_sol_yield.
-        assert_eq!(lamports(svm, &m) - base_rent, mach.escrowed_sol + mach.pending_sol_yield, "SOL books");
+        assert_eq!(lamports(svm, &m) - base_rent, mach.escrowed_sol + mach.div_pool_sol + mach.earmarked_sol, "SOL books");
         // token: internal token_balance == the vault ATA balance.
         assert_eq!(mach.token_balance as u64, tok_bal(svm, &vault), "token books");
         // reserves never exceed the balance.
@@ -530,5 +530,310 @@ fn j_books_reconcile_over_mixed_sequence() {
     let mach = read_machine(&svm, &id);
     assert_eq!(mach.pending_spins, 0);
     assert_eq!(mach.reserved_tokens, 0);
-    assert_eq!(mach.pending_sol_yield, 50_000_000 + 40_000_000, "only settled wagers accrued (expire refunded)");
+    assert_eq!(mach.div_pool_sol, 50_000_000 + 40_000_000, "only settled wagers accrued (expire refunded)");
+}
+
+// ======================================================================
+// H6b-2 — LP dividend ledger, reward modes, price-free withdrawals
+// ======================================================================
+
+const BP: u64 = 10_000;
+
+fn params_expo(id: &[u8; 16], expo_bp: u64) -> house::DualParams {
+    let mut p = params(id);
+    p.max_exposure_bp = expo_bp;
+    p
+}
+fn read_position(svm: &LiteSVM, id: &[u8; 16], owner: &Pubkey) -> house::DualLpPosition {
+    let a = svm.get_account(&dlp(&dmachine(id), owner)).unwrap();
+    house::DualLpPosition::try_deserialize(&mut &a.data[..]).unwrap()
+}
+fn pos_closed(svm: &LiteSVM, id: &[u8; 16], owner: &Pubkey) -> bool {
+    lamports(svm, &dlp(&dmachine(id), owner)) == 0
+}
+fn ix_claim_sol(id: [u8; 16], owner: &Pubkey) -> Instruction {
+    let m = dmachine(&id);
+    Instruction::new_with_bytes(pid(), &house::instruction::ClaimSol {}.data(),
+        house::accounts::ClaimDividend { machine: m, position: dlp(&m, owner), owner: *owner }.to_account_metas(None))
+}
+fn ix_earmark_sol(id: [u8; 16], owner: &Pubkey) -> Instruction {
+    let m = dmachine(&id);
+    Instruction::new_with_bytes(pid(), &house::instruction::EarmarkSol {}.data(),
+        house::accounts::ClaimDividend { machine: m, position: dlp(&m, owner), owner: *owner }.to_account_metas(None))
+}
+fn ix_set_mode(id: [u8; 16], owner: &Pubkey, mode: u8) -> Instruction {
+    let m = dmachine(&id);
+    Instruction::new_with_bytes(pid(), &house::instruction::SetRewardMode { mode }.data(),
+        house::accounts::ClaimDividend { machine: m, position: dlp(&m, owner), owner: *owner }.to_account_metas(None))
+}
+fn ix_request_wd(id: [u8; 16], owner: &Pubkey, shares: u128) -> Instruction {
+    let m = dmachine(&id);
+    Instruction::new_with_bytes(pid(), &house::instruction::RequestWithdrawToken { shares }.data(),
+        house::accounts::RequestWithdrawToken { machine: m, position: dlp(&m, owner), owner: *owner }.to_account_metas(None))
+}
+fn ix_cancel_wd(id: [u8; 16], owner: &Pubkey) -> Instruction {
+    let m = dmachine(&id);
+    Instruction::new_with_bytes(pid(), &house::instruction::CancelWithdrawToken {}.data(),
+        house::accounts::CancelWithdrawToken { machine: m, position: dlp(&m, owner), owner: *owner }.to_account_metas(None))
+}
+fn ix_process_wd(id: [u8; 16], owner: &Pubkey, mint: Pubkey, cranker: &Pubkey) -> Instruction {
+    let m = dmachine(&id);
+    Instruction::new_with_bytes(pid(), &house::instruction::ProcessWithdrawalToken {}.data(),
+        house::accounts::ProcessWithdrawalToken {
+            machine: m, position: dlp(&m, owner), owner: *owner,
+            token_vault: ata(&m, &mint), owner_token_account: ata(owner, &mint),
+            token_program: token_program(), cranker: *cranker, system_program: system_program::ID,
+        }.to_account_metas(None))
+}
+
+/// init + create a dual machine with a given exposure; set an in-band fresh
+/// price. No deposit (tests control deposits). Returns (svm, id, mint, admin).
+fn boot_machine(seed: u8, expo_bp: u64) -> (LiteSVM, [u8; 16], Pubkey, Keypair) {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let id = [seed; 16];
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create_dual(id, &admin.pubkey(), admin.pubkey(), mint, params_expo(&id, expo_bp)), &admin, &[&admin]), "create");
+    assert!(send(&mut svm, ix_set_price(id, &admin.pubkey(), PRICE, PRICE, 5), &admin, &[&admin]), "set_price");
+    (svm, id, mint, admin)
+}
+/// fund `owner`'s CHIP ATA and deposit `chip` whole tokens.
+fn deposit(svm: &mut LiteSVM, id: [u8; 16], mint: Pubkey, owner: &Keypair, chip: u128) {
+    let base = (chip * CHIP) as u64;
+    set_token_acct(svm, &ata(&owner.pubkey(), &mint), &mint, &owner.pubkey(), base);
+    assert!(send(svm, ix_deposit(id, &owner.pubkey(), mint, base), owner, &[owner]), "deposit");
+}
+/// accrue SOL yield by settling `count` losing spins of `wager` lamports each.
+/// Returns the total accrued (count·wager). Player token ATA seeded empty.
+fn accrue_yield(svm: &mut LiteSVM, id: [u8; 16], mint: Pubkey, player: &Keypair, cranker: &Keypair, wager: u64, count: u64) -> u64 {
+    if svm.get_account(&ata(&player.pubkey(), &mint)).is_none() {
+        set_token_acct(svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    }
+    let blanks = { let mut b = [0u8; 32]; b[0] = 22; b[1] = 23; b[2] = 24; b }; // 3 BLANK → payout 0
+    assert!(send(svm, ix_fill(id, &player.pubkey(), blanks), player, &[player]));
+    for n in 0..count {
+        assert!(send(svm, ix_commit(id, &player.pubkey(), wager, n), player, &[player]), "commit {n}");
+        assert!(send(svm, ix_settle(id, &player.pubkey(), mint, n, &cranker.pubkey()), cranker, &[cranker]), "settle {n}");
+    }
+    wager * count
+}
+
+// ---------------------------------------------------------------------
+// THE WORKED EXAMPLE (spec §5), as a literal test.
+// ---------------------------------------------------------------------
+#[test]
+fn worked_example_ten_sol_pool_yields_ten_sol() {
+    // Pool worth 10 SOL of tokens (10,000 CHIP @ 1000 CHIP/SOL), EXPO 100% so
+    // 0.1-SOL wagers are allowed. Two stakers: 90% and 10%.
+    let (mut svm, id, mint, _admin) = boot_machine(0xE0, BP);
+    let big = funded(&mut svm);
+    let small = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &big, 9_000);   // 90%
+    deposit(&mut svm, id, mint, &small, 1_000); // 10%
+
+    // the small staker holds exactly 10% of shares
+    let m0 = read_machine(&svm, &id);
+    let ps = read_position(&svm, &id, &small.pubkey());
+    assert_eq!(ps.shares * 10, m0.total_shares, "small staker holds exactly 10%");
+
+    // yield exactly 10 SOL via 100 losing spins of 0.1 SOL
+    let accrued = accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 100);
+    assert_eq!(accrued, 10_000_000_000, "10 SOL accrued");
+    assert_eq!(read_machine(&svm, &id).div_pool_sol, 10_000_000_000, "div pool holds 10 SOL");
+
+    // THE ASSERTION: a 10% staker's pending == exactly 1 SOL.
+    let m = read_machine(&svm, &id);
+    let ps = read_position(&svm, &id, &small.pubkey());
+    let earning = ps.shares + ps.pending_shares;
+    let pending = hm::dividend::pending_sol(earning, ps.sol_debt, m.acc_sol_per_share);
+    assert_eq!(pending, 1_000_000_000, "10% of 10 SOL yield == exactly 1 SOL");
+
+    // A new depositor bringing 10-SOL-worth of tokens (== the whole existing token
+    // pool, 10,000 CHIP) then holds exactly 50% of shares and pending == 0.
+    let newcomer = funded(&mut svm);
+    deposit(&mut svm, id, mint, &newcomer, 10_000);
+    let m2 = read_machine(&svm, &id);
+    let pn = read_position(&svm, &id, &newcomer.pubkey());
+    assert_eq!(pn.shares * 2, m2.total_shares, "newcomer holds exactly 50%");
+    let pend_new = hm::dividend::pending_sol(pn.shares + pn.pending_shares, pn.sol_debt, m2.acc_sol_per_share);
+    assert_eq!(pend_new, 0, "newcomer owes 0 from prior accrual (no dilution)");
+    // and the 10% staker is UNDILUTED by the newcomer: still exactly 1 SOL.
+    let ps2 = read_position(&svm, &id, &small.pubkey());
+    assert_eq!(hm::dividend::pending_sol(ps2.shares + ps2.pending_shares, ps2.sol_debt, m2.acc_sol_per_share),
+               1_000_000_000, "existing staker undiluted by the new deposit");
+}
+
+/// The "33% if existing stakers had compounded" clause lands with compound_epoch
+/// in H6b-3 (swap earmarked SOL back into token shares); stubbed here.
+#[test]
+#[ignore = "compound_epoch (SPL-mode swap → new shares) is H6b-3"]
+fn worked_example_compounding_gives_33pct() {}
+
+// ---------------------------------------------------------------------
+// deposit → accrue → claim happy path (SOL mode)
+// ---------------------------------------------------------------------
+#[test]
+fn k_deposit_accrue_claim() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xE1, BP);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp, 10_000); // sole LP → 100% of yield
+    let accrued = accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 20); // 2 SOL
+    assert_eq!(accrued, 2_000_000_000);
+
+    let before = lamports(&svm, &lp.pubkey());
+    assert!(send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]), "claim");
+    let gained = lamports(&svm, &lp.pubkey()) - before; // dividend paid − tx fee
+    // sole LP with an exactly-divisible yield claims the full 2 SOL (net of the
+    // ~5000-lamport tx fee it paid as signer); the dividend pool drains to 0.
+    assert!(gained >= 2_000_000_000 - 10_000 && gained <= 2_000_000_000, "sole LP claims the yield: {gained}");
+    assert_eq!(read_machine(&svm, &id).div_pool_sol, 0, "dividend pool drained (exact division, no dust)");
+}
+
+// ---------------------------------------------------------------------
+// claim twice pays once
+// ---------------------------------------------------------------------
+#[test]
+fn k_claim_twice_pays_once() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xE2, BP);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp, 10_000);
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 10); // 1 SOL
+
+    let b0 = lamports(&svm, &lp.pubkey());
+    assert!(send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]));
+    let first = lamports(&svm, &lp.pubkey()) as i128 - b0 as i128; // net of fee
+    assert!(first > 0, "first claim pays");
+    // second claim with no new accrual: only a tx fee is spent, no dividend paid.
+    // (fresh blockhash so this isn't rejected as a duplicate of the first claim.)
+    svm.expire_blockhash();
+    let b1 = lamports(&svm, &lp.pubkey());
+    assert!(send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]));
+    let second_net = b1 as i128 - lamports(&svm, &lp.pubkey()) as i128; // fee only (positive)
+    assert!(second_net >= 0 && second_net < 100_000, "second claim pays no dividend (fee only)");
+}
+
+// ---------------------------------------------------------------------
+// no-dilution: deposit after accrual owes 0
+// ---------------------------------------------------------------------
+#[test]
+fn k_no_dilution() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xE3, BP);
+    let lp0 = funded(&mut svm);
+    let lp1 = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp0, 10_000);
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 30); // 3 SOL to lp0
+    let m = read_machine(&svm, &id);
+    let p0 = read_position(&svm, &id, &lp0.pubkey());
+    let owed0 = hm::dividend::pending_sol(p0.shares + p0.pending_shares, p0.sol_debt, m.acc_sol_per_share);
+    assert!(owed0 > 0);
+    // lp1 deposits AFTER the accrual
+    deposit(&mut svm, id, mint, &lp1, 5_000);
+    let m2 = read_machine(&svm, &id);
+    let p1 = read_position(&svm, &id, &lp1.pubkey());
+    assert_eq!(hm::dividend::pending_sol(p1.shares + p1.pending_shares, p1.sol_debt, m2.acc_sol_per_share), 0,
+        "late depositor owes 0");
+    let p0b = read_position(&svm, &id, &lp0.pubkey());
+    assert_eq!(hm::dividend::pending_sol(p0b.shares + p0b.pending_shares, p0b.sol_debt, m2.acc_sol_per_share), owed0,
+        "existing LP undiluted");
+}
+
+// ---------------------------------------------------------------------
+// SPL-mode earmarking excluded from withdrawable SOL
+// ---------------------------------------------------------------------
+#[test]
+fn k_spl_mode_earmark_excluded() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xE4, BP);
+    let lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp, 10_000);
+    // switch to SPL mode, then accrue
+    assert!(send(&mut svm, ix_set_mode(id, &lp.pubkey(), house::REWARD_MODE_SPL), &lp, &[&lp]));
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 20); // 2 SOL
+
+    // earmark: SOL moves from div_pool into earmarked, none leaves the machine.
+    let m_before = read_machine(&svm, &id);
+    let mach_lamports_before = lamports(&svm, &dmachine(&id));
+    assert!(send(&mut svm, ix_earmark_sol(id, &lp.pubkey()), &lp, &[&lp]), "earmark");
+    let m_after = read_machine(&svm, &id);
+    assert_eq!(lamports(&svm, &dmachine(&id)), mach_lamports_before, "no SOL left the machine on earmark");
+    assert!(m_after.earmarked_sol > 0, "SOL earmarked");
+    assert_eq!(m_before.div_pool_sol - m_after.div_pool_sol, m_after.earmarked_sol, "div_pool → earmarked, 1:1");
+    let ps = read_position(&svm, &id, &lp.pubkey());
+    assert_eq!(ps.earmarked_sol, m_after.earmarked_sol, "position earmark == machine earmark (sole LP)");
+    // a SOL-mode claim is rejected for an SPL-mode position.
+    assert!(try_send(&mut svm, ix_claim_sol(id, &lp.pubkey()), &lp, &[&lp]).unwrap_err().contains("WrongRewardMode"));
+    // earmarked SOL is NOT in div_pool (not claimable/withdrawable as yield).
+    assert_eq!(m_after.div_pool_sol, 0, "all yield earmarked, none left as dividend");
+}
+
+// ---------------------------------------------------------------------
+// withdraw pays BOTH assets, price-free, and books balance to the lamport
+// across a mixed sequence (deposits, spins won/lost/expired, claims, withdraw)
+// ---------------------------------------------------------------------
+#[test]
+fn k_withdraw_both_assets_books_balance() {
+    let (mut svm, id, mint, admin) = boot_machine(0xE5, BP);
+    let lp0 = funded(&mut svm);
+    let lp1 = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    deposit(&mut svm, id, mint, &lp0, 8_000);
+    deposit(&mut svm, id, mint, &lp1, 2_000);
+    let m = dmachine(&id);
+    let vault = ata(&m, &mint);
+    let base_rent = lamports(&svm, &m); // machine rent (before any SOL flows in)
+
+    // books: machine SOL beyond rent == escrowed + div_pool + earmarked; token internal == vault.
+    let check = |svm: &LiteSVM| {
+        let mach = read_machine(svm, &id);
+        assert_eq!(lamports(svm, &m) - base_rent, mach.escrowed_sol + mach.div_pool_sol + mach.earmarked_sol, "SOL books");
+        assert_eq!(mach.token_balance as u64, tok_bal(svm, &vault), "token books");
+        assert!(mach.reserved_tokens <= mach.token_balance);
+    };
+
+    // a mix: a losing spin, a winning spin, an expired spin.
+    let blanks = { let mut b = [0u8; 32]; b[0]=22; b[1]=23; b[2]=24; b };
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), blanks), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), 100_000_000, 0), &player, &[&player])); check(&svm);
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mint, 0, &cranker.pubkey()), &cranker, &[&cranker])); check(&svm);
+    let cherries = { let mut b=[0u8;32]; b[0]=13; b[1]=13; b[2]=22; b }; // 2 cherry → small token win
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), cherries), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), 100_000_000, 1), &player, &[&player])); check(&svm);
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mint, 1, &cranker.pubkey()), &cranker, &[&cranker])); check(&svm);
+    // expired spin: commit then warp past the window and expire (SOL refunded).
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), 50_000_000, 2), &player, &[&player])); check(&svm);
+    svm.warp_to_slot(house::EXPIRE_SLOTS + 50);
+    assert!(send(&mut svm, ix_expire(id, &player.pubkey(), 2, &cranker.pubkey()), &cranker, &[&cranker])); check(&svm);
+
+    // lp1 claims its SOL dividend, then withdraws ALL its shares → gets tokens too.
+    assert!(send(&mut svm, ix_claim_sol(id, &lp1.pubkey()), &lp1, &[&lp1])); check(&svm);
+    let sh = read_position(&svm, &id, &lp1.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_wd(id, &lp1.pubkey(), sh), &lp1, &[&lp1]));
+    svm.warp_to_slot(house::EXPIRE_SLOTS + 50 + 5_000); // cross an epoch boundary
+    let tok_before = tok_bal(&svm, &ata(&lp1.pubkey(), &mint));
+    let sol_before = lamports(&svm, &lp1.pubkey());
+    // fund lp1's token ATA (must exist to receive)
+    if svm.get_account(&ata(&lp1.pubkey(), &mint)).is_none() {
+        set_token_acct(&mut svm, &ata(&lp1.pubkey(), &mint), &mint, &lp1.pubkey(), 0);
+    }
+    assert!(send(&mut svm, ix_process_wd(id, &lp1.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "process");
+    check(&svm);
+    // lp1 received TOKENS (its pro-rata of the vault) — the token side of withdraw.
+    assert!(tok_bal(&svm, &ata(&lp1.pubkey(), &mint)) > tok_before, "withdraw paid tokens");
+    // lp1 SOL only grew by the (already-claimed→0) dividend + rent; the point is it
+    // did not lose SOL and the token side moved. Books still balance (checked).
+    assert!(lamports(&svm, &lp1.pubkey()) >= sol_before, "withdraw never costs the LP SOL");
+    let _ = admin;
 }

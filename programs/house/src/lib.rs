@@ -444,7 +444,9 @@ pub mod house {
         m.token_balance = 0;
         m.reserved_tokens = 0;
         m.escrowed_sol = 0;
-        m.pending_sol_yield = 0;
+        m.div_pool_sol = 0;
+        m.acc_sol_per_share = 0;
+        m.earmarked_sol = 0;
         m.total_shares = 0;
         m.smoothed_value = 0; // cold until the first spin (first time a TWAP is read)
         m.smoothed_last_slot = now;
@@ -454,10 +456,15 @@ pub mod house {
         Ok(())
     }
 
-    /// Minimal token deposit (H6b-1): fund the vault so the spin path has tokens
-    /// to pay. Token-denominated shares (value-priced deposits + the band gate +
-    /// dividend ledger are H6b-2). `mint = amount × total_shares / token_balance`,
-    /// first deposit 1:1 at 1e6 scale. Tokens move by token-program CPI.
+    /// Token deposit (spec §5) — PRICE-FREE by design. Shares are minted pro-rata
+    /// on the TOKEN side only (`mint = amount × total_shares / token_balance`,
+    /// first deposit 1:1 at 1e6 scale); no TWAP is read. This is the locked
+    /// decision, and it is strictly SAFER than value-pricing: pricing the deposit
+    /// would let an attacker inflate the TWAP at deposit to mint excess shares
+    /// (the deposit-timing game of threat model §6). The SOL side is made correct
+    /// WITHOUT a price by the dividend ledger — `sol_debt` is set so these shares
+    /// are entitled to ZERO of any prior accrual (no dilution). `spin_commit` is
+    /// the only price-touching instruction. See the H6b-2 report / spec §5 note.
     pub fn lp_deposit_token(ctx: Context<LpDepositToken>, amount: u64) -> Result<()> {
         require!(amount > 0, HouseError::InvalidWager);
         let m = &ctx.accounts.machine;
@@ -472,6 +479,13 @@ pub mod house {
         };
         require!(shares > 0, HouseError::DepositTooSmall);
 
+        // The position's dividend entitlement up to now must be preserved across
+        // the share change (a fresh position has pending 0 → no-dilution). Earning
+        // shares are shares + pending_shares (queued withdrawals keep earning).
+        let pos = &ctx.accounts.position;
+        let earning_before = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        let pending_before = hm::dividend::pending_sol(earning_before, pos.sol_debt, m.acc_sol_per_share);
+
         // owner ATA -> vault, authority = owner.
         token::transfer(
             CpiContext::new(
@@ -485,6 +499,7 @@ pub mod house {
             amount,
         )?;
 
+        let acc = ctx.accounts.machine.acc_sol_per_share;
         let m = &mut ctx.accounts.machine;
         m.token_balance = m.token_balance.checked_add(amount as u128).ok_or(HouseError::MathOverflow)?;
         m.total_shares = m.total_shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
@@ -493,6 +508,11 @@ pub mod house {
         pos.machine = ctx.accounts.machine.key();
         pos.owner = ctx.accounts.owner.key();
         pos.shares = pos.shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
+        // sol_debt = entitlement(new_earning_shares) − pending_before, so old
+        // pending is preserved and the new shares earn from now on only (proof
+        // `debt_preserving_pending`).
+        let earning_after = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        pos.sol_debt = hm::dividend::debt_preserving_pending(earning_after, acc, pending_before);
         pos.bump = ctx.bumps.position;
         Ok(())
     }
@@ -518,12 +538,14 @@ pub mod house {
 
         let now = Clock::get()?.slot;
 
-        // value depth D = accrued SOL yield + token_balance valued at TWAP (§4).
-        let token_value = hm::payout::payout_value_lamports(m.token_balance, twap, dec);
-        let d_now = (m.pending_sol_yield as u128).checked_add(token_value).ok_or(HouseError::MathOverflow)?;
+        // Curve depth is TOKEN-SIDE ONLY: D = token_balance valued at TWAP. The
+        // accrued SOL (div_pool_sol) is LP dividend income, NOT at-risk capital —
+        // payouts are token-only, so accrued SOL can never back a payout and must
+        // never inflate max_bet (H6b-2 refinement of spec §4).
+        let d_now = hm::payout::payout_value_lamports(m.token_balance, twap, dec);
 
-        // SmoothedDepth on VALUE; cold-start seeds to D_now at the first spin (the
-        // first moment a TWAP exists to value the token side).
+        // SmoothedDepth on the token-side value; cold-start seeds to D_now at the
+        // first spin (the first moment a TWAP exists to value the token side).
         let mut sd = if m.smoothed_value == 0 {
             hm::SmoothedDepth::new(d_now, now)
         } else {
@@ -592,8 +614,8 @@ pub mod house {
     /// Settle a dual-asset spin (spec §3). Permissionless. Reads randomness via
     /// the seam, prices the outcome at the SNAPSHOT price (never current), pays
     /// tokens from the vault by CPI (signed by the machine PDA), releases the
-    /// token reserve, and accrues the SOL wager into `pending_sol_yield` (the
-    /// H6b-2 dividend ledger consumes it — here it just accumulates, auditably).
+    /// token reserve, and accrues the full SOL wager into the per-share dividend
+    /// ledger (`acc_sol_per_share` + `div_pool_sol`) for the LPs (H6b-2).
     pub fn spin_settle_dual(ctx: Context<SpinSettleDual>, nonce: u64) -> Result<()> {
         let _ = nonce;
         let s = &ctx.accounts.pending_spin;
@@ -635,10 +657,15 @@ pub mod house {
         let m = &mut ctx.accounts.machine;
         m.reserved_tokens = m.reserved_tokens.checked_sub(reserve).ok_or(HouseError::MathOverflow)?;
         m.token_balance = m.token_balance.checked_sub(payout).ok_or(HouseError::MathOverflow)?;
-        // reclassify the escrowed wager as accrued SOL yield (same lamports; they
-        // stay in the machine PDA). Payouts are token-only, so SOL never leaves.
+        // The whole wager is house SOL income (payouts are token-only, so SOL
+        // never leaves): route it into the dividend ledger. On a win the token
+        // vault took the hit; on a loss it didn't — either way 100% of the wager
+        // is LP yield (H6b-2). Accrue it to the per-share index and hold it in
+        // div_pool_sol. total_shares > 0 here (token_balance > 0 ⇒ a deposit
+        // minted shares); if somehow 0, it falls through as pool dust.
         m.escrowed_sol = m.escrowed_sol.checked_sub(wager).ok_or(HouseError::MathOverflow)?;
-        m.pending_sol_yield = m.pending_sol_yield.checked_add(wager).ok_or(HouseError::MathOverflow)?;
+        m.acc_sol_per_share = hm::dividend::accrue(m.acc_sol_per_share, m.total_shares, wager as u128);
+        m.div_pool_sol = m.div_pool_sol.checked_add(wager).ok_or(HouseError::MathOverflow)?;
         m.pending_spins = m.pending_spins.checked_sub(1).ok_or(HouseError::MathOverflow)?;
         Ok(())
     }
@@ -659,6 +686,193 @@ pub mod house {
         m.reserved_tokens = m.reserved_tokens.checked_sub(reserve).ok_or(HouseError::MathOverflow)?;
         m.escrowed_sol = m.escrowed_sol.checked_sub(wager).ok_or(HouseError::MathOverflow)?;
         m.pending_spins = m.pending_spins.checked_sub(1).ok_or(HouseError::MathOverflow)?;
+        Ok(())
+    }
+
+    // ---------- dual-asset LP dividend ledger (H6b-2) ----------
+
+    /// Claim accrued SOL dividends (SOL reward mode). Permissioned to the owner,
+    /// callable anytime. Pays `min(pending, div_pool_sol)` — the pool cap is what
+    /// keeps the books exact (house-math `dividend` conservation) — and lifts
+    /// `sol_debt` by exactly what was paid. Claiming again with no new accrual
+    /// pays 0.
+    pub fn claim_sol(ctx: Context<ClaimDividend>) -> Result<()> {
+        let m = &ctx.accounts.machine;
+        let pos = &ctx.accounts.position;
+        require!(pos.reward_mode == REWARD_MODE_SOL, HouseError::WrongRewardMode);
+        let earning = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        let pending = hm::dividend::pending_sol(earning, pos.sol_debt, m.acc_sol_per_share);
+        let paid = pending.min(m.div_pool_sol as u128);
+        let paid_u64 = u64::try_from(paid).map_err(|_| HouseError::MathOverflow)?;
+        if paid_u64 > 0 {
+            let new_debt = pos.sol_debt.checked_add(paid).ok_or(HouseError::MathOverflow)?;
+            debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.owner.to_account_info(), paid_u64)?;
+            ctx.accounts.machine.div_pool_sol -= paid_u64;
+            ctx.accounts.position.sol_debt = new_debt;
+        }
+        Ok(())
+    }
+
+    /// Earmark accrued SOL dividends (SPL reward mode). No SOL leaves the machine:
+    /// the pending is moved from `div_pool_sol` into `earmarked_sol` (machine and
+    /// position), reserved for a swap-to-token in H6b-3. Earmarked SOL is excluded
+    /// from dividends, house capital, and everyone else's withdrawals.
+    pub fn earmark_sol(ctx: Context<ClaimDividend>) -> Result<()> {
+        let m = &ctx.accounts.machine;
+        let pos = &ctx.accounts.position;
+        require!(pos.reward_mode == REWARD_MODE_SPL, HouseError::WrongRewardMode);
+        let earning = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        let pending = hm::dividend::pending_sol(earning, pos.sol_debt, m.acc_sol_per_share);
+        let moved = pending.min(m.div_pool_sol as u128);
+        let moved_u64 = u64::try_from(moved).map_err(|_| HouseError::MathOverflow)?;
+        if moved_u64 > 0 {
+            let new_debt = pos.sol_debt.checked_add(moved).ok_or(HouseError::MathOverflow)?;
+            let m = &mut ctx.accounts.machine;
+            m.div_pool_sol -= moved_u64;
+            m.earmarked_sol = m.earmarked_sol.checked_add(moved_u64).ok_or(HouseError::MathOverflow)?;
+            let pos = &mut ctx.accounts.position;
+            pos.sol_debt = new_debt;
+            pos.earmarked_sol = pos.earmarked_sol.checked_add(moved_u64).ok_or(HouseError::MathOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Switch a position's reward mode. Realizes the current pending in the OLD
+    /// mode first (pays if SOL, earmarks if SPL), so the switch never strands or
+    /// re-buckets already-earned dividends, then flips the mode.
+    pub fn set_reward_mode(ctx: Context<ClaimDividend>, mode: u8) -> Result<()> {
+        require!(mode == REWARD_MODE_SOL || mode == REWARD_MODE_SPL, HouseError::InvalidParams);
+        let m = &ctx.accounts.machine;
+        let pos = &ctx.accounts.position;
+        let old_mode = pos.reward_mode;
+        let earning = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        let pending = hm::dividend::pending_sol(earning, pos.sol_debt, m.acc_sol_per_share);
+        let realized = pending.min(m.div_pool_sol as u128);
+        let realized_u64 = u64::try_from(realized).map_err(|_| HouseError::MathOverflow)?;
+        let new_debt = pos.sol_debt.checked_add(realized).ok_or(HouseError::MathOverflow)?;
+        if realized_u64 > 0 && old_mode == REWARD_MODE_SOL {
+            debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.owner.to_account_info(), realized_u64)?;
+        }
+        let m = &mut ctx.accounts.machine;
+        if realized_u64 > 0 {
+            m.div_pool_sol -= realized_u64;
+            if old_mode == REWARD_MODE_SPL { m.earmarked_sol = m.earmarked_sol.checked_add(realized_u64).ok_or(HouseError::MathOverflow)?; }
+        }
+        let pos = &mut ctx.accounts.position;
+        pos.sol_debt = new_debt;
+        if realized_u64 > 0 && old_mode == REWARD_MODE_SPL { pos.earmarked_sol = pos.earmarked_sol.checked_add(realized_u64).ok_or(HouseError::MathOverflow)?; }
+        pos.reward_mode = mode;
+        Ok(())
+    }
+
+    // ---------- dual-asset withdrawals (H3 pattern, both assets, price-free) ----------
+
+    /// Queue `shares` for epoch-gated withdrawal (spec §5). Shares move from
+    /// active to pending; they KEEP earning dividends until processed (the
+    /// position's earning total, shares + pending_shares, is unchanged, so the
+    /// SOL ledger is untouched). Requesting again re-stamps the epoch.
+    pub fn request_withdraw_token(ctx: Context<RequestWithdrawToken>, shares: u128) -> Result<()> {
+        require!(shares > 0, HouseError::InvalidWithdrawAmount);
+        let now = Clock::get()?.slot;
+        let epoch = ctx.accounts.machine.epoch_of(now);
+        let pos = &mut ctx.accounts.position;
+        require!(pos.shares >= shares, HouseError::InsufficientShares);
+        pos.shares -= shares;
+        pos.pending_shares = pos.pending_shares.checked_add(shares).ok_or(HouseError::MathOverflow)?;
+        pos.pending_epoch = epoch;
+        Ok(())
+    }
+
+    /// Cancel a pending withdrawal, restoring the shares to active (spec §5).
+    pub fn cancel_withdraw_token(ctx: Context<CancelWithdrawToken>) -> Result<()> {
+        let pos = &mut ctx.accounts.position;
+        require!(pos.pending_shares > 0, HouseError::NothingToWithdraw);
+        pos.shares = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        pos.pending_shares = 0;
+        pos.pending_epoch = 0;
+        Ok(())
+    }
+
+    /// Permissionless epoch crank (spec §5): process ONE position's pending
+    /// request once its epoch has elapsed, paying pro-rata of BOTH assets, ENTIRELY
+    /// PRICE-FREE. Harvests the position's accrued SOL dividend (pay in SOL mode,
+    /// earmark in SPL mode) and pays `fill/total_shares` of the token vault. The
+    /// token fill is capped by the free (unreserved) token balance so pending
+    /// spins stay funded; any remainder stays queued (partial fill). No price is
+    /// read — the withdrawal path is manipulation-immune.
+    pub fn process_withdrawal_token(ctx: Context<ProcessWithdrawalToken>) -> Result<()> {
+        let now = Clock::get()?.slot;
+        let m = &ctx.accounts.machine;
+        let pos = &ctx.accounts.position;
+        let pending_sh = pos.pending_shares;
+        require!(pending_sh > 0, HouseError::NothingToWithdraw);
+        require!(m.epoch_of(now) > pos.pending_epoch, HouseError::EpochNotElapsed);
+        require!(m.total_shares > 0 && m.token_balance > 0, HouseError::MathOverflow);
+
+        // SOL dividend harvest (the whole position's pending, per reward mode).
+        let acc = m.acc_sol_per_share;
+        let earning = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        let pending_div = hm::dividend::pending_sol(earning, pos.sol_debt, acc);
+        let sol_realized = pending_div.min(m.div_pool_sol as u128);
+        let sol_realized_u64 = u64::try_from(sol_realized).map_err(|_| HouseError::MathOverflow)?;
+        let reward_mode = pos.reward_mode;
+
+        // token pro-rata, price-free, capped by the free (unreserved) balance.
+        let total_shares = m.total_shares;
+        let token_balance = m.token_balance;
+        let free_tokens = m.free_tokens();
+        // wide_mul_div: free_tokens·total_shares and fill·token_balance can exceed u128.
+        let free_shares = hm::price::wide_mul_div(free_tokens, total_shares, token_balance);
+        let fill = pending_sh.min(free_shares);
+        let token_payout = hm::price::wide_mul_div(fill, token_balance, total_shares);
+        let token_payout_u64 = u64::try_from(token_payout).map_err(|_| HouseError::MathOverflow)?;
+
+        // ----- money movement -----
+        // SOL side: pay the owner (SOL mode); SPL mode earmarks (below, no transfer).
+        if sol_realized_u64 > 0 && reward_mode == REWARD_MODE_SOL {
+            debit_credit(&ctx.accounts.machine.to_account_info(), &ctx.accounts.owner.to_account_info(), sol_realized_u64)?;
+        }
+        // token side: vault -> owner ATA, signed by the machine PDA.
+        if token_payout_u64 > 0 {
+            let id = m.machine_id;
+            let bump = [m.bump];
+            let seeds: &[&[u8]] = &[b"dual-machine", id.as_ref(), &bump];
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.key(),
+                    Transfer {
+                        from: ctx.accounts.token_vault.to_account_info(),
+                        to: ctx.accounts.owner_token_account.to_account_info(),
+                        authority: ctx.accounts.machine.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                token_payout_u64,
+            )?;
+        }
+
+        // ----- accounting -----
+        let m = &mut ctx.accounts.machine;
+        m.div_pool_sol = m.div_pool_sol.checked_sub(sol_realized_u64).ok_or(HouseError::MathOverflow)?;
+        if reward_mode == REWARD_MODE_SPL {
+            m.earmarked_sol = m.earmarked_sol.checked_add(sol_realized_u64).ok_or(HouseError::MathOverflow)?;
+        }
+        m.total_shares = m.total_shares.checked_sub(fill).ok_or(HouseError::MathOverflow)?;
+        m.token_balance = m.token_balance.checked_sub(token_payout).ok_or(HouseError::MathOverflow)?;
+
+        let pos = &mut ctx.accounts.position;
+        if reward_mode == REWARD_MODE_SPL {
+            pos.earmarked_sol = pos.earmarked_sol.checked_add(sol_realized_u64).ok_or(HouseError::MathOverflow)?;
+        }
+        pos.pending_shares = pos.pending_shares.checked_sub(fill).ok_or(HouseError::MathOverflow)?;
+        // reset dividend debt to the remaining earning shares (harvested → pending 0).
+        let remaining = pos.shares.checked_add(pos.pending_shares).ok_or(HouseError::MathOverflow)?;
+        pos.sol_debt = hm::dividend::sol_entitlement(remaining, acc);
+
+        // fully-emptied position with no earmark closes; rent to owner.
+        if pos.shares == 0 && pos.pending_shares == 0 && pos.earmarked_sol == 0 {
+            ctx.accounts.position.close(ctx.accounts.owner.to_account_info())?;
+        }
         Ok(())
     }
 
@@ -1020,9 +1234,12 @@ pub struct DualMachine {
     pub token_balance: u128,     // internal token depth (mirrors the vault ATA)
     pub reserved_tokens: u128,   // sum of haircut reserves across pending spins
     pub escrowed_sol: u64,       // committed wagers held, not yet settled
-    pub pending_sol_yield: u64,  // settled wagers awaiting the H6b-2 dividend ledger
+    pub div_pool_sol: u64,       // SOL held for SOL-mode dividends (== accrued − claimed)
     pub total_shares: u128,      // token-denominated LP shares
-    // anti-snipe smoothed depth on token-side VALUE (sol_yield + token×TWAP)
+    // H6b-2 SOL dividend ledger (MasterChef): per-share index + SPL-mode earmark
+    pub acc_sol_per_share: u128, // 1e24-scaled per-share accumulator (house-math dividend)
+    pub earmarked_sol: u64,      // SOL set aside for SPL-mode positions (excluded from all else)
+    // anti-snipe smoothed depth on token-side VALUE (token_balance × TWAP)
     pub smoothed_value: u128,
     pub smoothed_last_slot: u64,
     pub paused: bool,
@@ -1030,13 +1247,17 @@ pub struct DualMachine {
     pub reserved: [u8; DualMachine::RESERVED_LEN],
 }
 impl DualMachine {
-    pub const RESERVED_LEN: usize = 64;
+    // acc_sol_per_share(16) + earmarked_sol(8) carved from the former 64-byte
+    // reserved tail; SIZE unchanged (H6b-1 was never deployed, but the discipline
+    // keeps the on-disk layout stable).
+    pub const RESERVED_LEN: usize = 40;
     pub const SIZE: usize = 8 + 16 + 32   // id, curator
         + 32 + 32 + 32 + 32 + 1           // mint, pool, obs, vault, decimals
         + (6 * 8)                         // d_low..epoch_length
         + (2 * 4)                         // twap_window, max_staleness
         + (7 * 2)                         // band..pending_spins (7 u16)
-        + 16 + 16 + 8 + 8 + 16            // token_balance, reserved_tokens, escrowed_sol, pending_sol_yield, total_shares
+        + 16 + 16 + 8 + 8 + 16            // token_balance, reserved_tokens, escrowed_sol, div_pool_sol, total_shares
+        + 16 + 8                          // acc_sol_per_share, earmarked_sol
         + 16 + 8 + 1 + 1                  // smoothed_value, smoothed_last_slot, paused, bump
         + Self::RESERVED_LEN;
     pub fn epoch_length_eff(&self) -> u64 {
@@ -1056,17 +1277,24 @@ pub struct DualLpPosition {
     pub machine: Pubkey,
     pub owner: Pubkey,
     pub shares: u128,
-    // H6b-2 fields (laid out now; inert in H6b-1)
+    // epoch-gated withdrawal queue (H3 pattern, dual-asset)
     pub pending_shares: u128,
     pub pending_epoch: u64,
-    pub sol_debt: u128,     // dividend-ledger reward debt (pending SOL owed marker)
-    pub reward_mode: u8,    // 0 = accrue SOL, 1 = (reserved) compound; defined in H6b-2
+    // SOL dividend ledger (H6b-2)
+    pub sol_debt: u128,      // MasterChef reward debt (== entitlement at last settle)
+    pub reward_mode: u8,     // REWARD_MODE_SOL (0) pays SOL; REWARD_MODE_SPL (1) earmarks it
+    pub earmarked_sol: u64,  // SPL-mode SOL set aside for this position (H6b-3 swaps it)
     pub bump: u8,
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 24],
 }
 impl DualLpPosition {
-    pub const SIZE: usize = 8 + 32 + 32 + 16 + 16 + 8 + 16 + 1 + 1 + 32;
+    // earmarked_sol(8) carved from the former 32-byte reserved tail; SIZE unchanged.
+    pub const SIZE: usize = 8 + 32 + 32 + 16 + 16 + 8 + 16 + 1 + 8 + 1 + 24;
 }
+
+/// Reward modes on a dual-asset LP position (spec §5).
+pub const REWARD_MODE_SOL: u8 = 0; // claim pays pending SOL to the owner
+pub const REWARD_MODE_SPL: u8 = 1; // pending SOL earmarked for a later swap-to-token (H6b-3)
 
 /// A committed dual-asset spin. PDA `["dual-spin", machine, player, nonce]`.
 /// Holds the frozen odds+price snapshot and the randomness binding.
@@ -1369,6 +1597,60 @@ pub struct SpinExpireDual<'info> {
     pub system_program: Program<'info, System>,
 }
 
+// ---- dual-asset LP ledger + withdrawal contexts (H6b-2) ----
+
+/// Used by claim_sol, earmark_sol, and set_reward_mode — all owner-signed and may
+/// move SOL to the owner, so `owner` is a mutable signer.
+#[derive(Accounts)]
+pub struct ClaimDividend<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = owner, has_one = machine,
+              seeds = [b"dual-lp", machine.key().as_ref(), owner.key().as_ref()], bump = position.bump)]
+    pub position: Box<Account<'info, DualLpPosition>>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RequestWithdrawToken<'info> {
+    #[account(seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = owner, has_one = machine,
+              seeds = [b"dual-lp", machine.key().as_ref(), owner.key().as_ref()], bump = position.bump)]
+    pub position: Box<Account<'info, DualLpPosition>>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelWithdrawToken<'info> {
+    #[account(seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = owner, has_one = machine,
+              seeds = [b"dual-lp", machine.key().as_ref(), owner.key().as_ref()], bump = position.bump)]
+    pub position: Box<Account<'info, DualLpPosition>>,
+    pub owner: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ProcessWithdrawalToken<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(mut, has_one = machine,
+              seeds = [b"dual-lp", machine.key().as_ref(), position.owner.as_ref()], bump = position.bump)]
+    pub position: Box<Account<'info, DualLpPosition>>,
+    /// CHECK: receives the SOL dividend + (on close) rent; constrained to position.owner.
+    #[account(mut, address = position.owner)]
+    pub owner: UncheckedAccount<'info>,
+    #[account(mut, address = machine.token_vault)]
+    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut, token::mint = machine.token_mint, token::authority = owner)]
+    pub owner_token_account: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub cranker: Signer<'info>, // literally anyone
+    pub system_program: Program<'info, System>,
+}
+
 #[cfg(feature = "mock-price")]
 #[derive(Accounts)]
 #[instruction(id: [u8; 16])]
@@ -1420,6 +1702,7 @@ pub enum HouseError {
     #[msg("Spot has drifted too far from TWAP (band gate)")] PriceUnstable,
     #[msg("Machine has too many pending spins")] TooManyPendingSpins,
     #[msg("Not enough free token liquidity to reserve payout")] InsufficientTokenLiquidity,
+    #[msg("Instruction does not match the position's reward mode")] WrongRewardMode,
 }
 
 // ---------------------------------------------------------------------------

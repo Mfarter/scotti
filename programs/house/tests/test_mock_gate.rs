@@ -50,9 +50,14 @@ fn default_build_idl_has_no_mock_surface() {
         }
     }
 
-    // Positive check: the REAL dual-asset surface (H6b-1) must be present — the
-    // clmm price backend ships even though its reader is stubbed until H6b-3.
-    for needed in ["create_machine_dual", "lp_deposit_token", "spin_commit_dual", "spin_settle_dual", "spin_expire_dual"] {
+    // Positive check: the REAL dual-asset surface must be present — the clmm price
+    // backend ships even though its reader is stubbed until H6b-3. Includes the
+    // H6b-2 LP dividend-ledger + price-free withdrawal instructions.
+    for needed in [
+        "create_machine_dual", "lp_deposit_token", "spin_commit_dual", "spin_settle_dual", "spin_expire_dual",
+        "claim_sol", "earmark_sol", "set_reward_mode",
+        "request_withdraw_token", "cancel_withdraw_token", "process_withdrawal_token",
+    ] {
         assert!(instrs.iter().any(|n| n == needed),
             "dual-asset instruction '{needed}' missing from the default-build IDL");
     }
