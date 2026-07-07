@@ -7,8 +7,8 @@ import { JACKPOT, SEVEN, BELL, BAR, CHERRY, BLANK, SYMBOL_NAME } from "../lib/ho
 // stock clip-art, so the symbols are restrained coloured marks.
 const GLYPH: Record<number, string> = { [JACKPOT]: "◆", [SEVEN]: "7", [BELL]: "✦", [BAR]: "▬", [CHERRY]: "●", [BLANK]: "·" };
 const GCOLOR: Record<number, string> = {
-  [JACKPOT]: "var(--gold)", [SEVEN]: "var(--neon)", [BELL]: "#7aa2ff",
-  [BAR]: "#e0b866", [CHERRY]: "#ff5a6e", [BLANK]: "var(--ink-faint)",
+  [JACKPOT]: "var(--gold)", [SEVEN]: "var(--ink)", [BELL]: "var(--ink2)",
+  [BAR]: "var(--ink2)", [CHERRY]: "var(--gold)", [BLANK]: "var(--ink-faint)",
 };
 
 export function Sol({ lamports, dp = 4, unit = true }: { lamports: bigint; dp?: number; unit?: boolean }) {
@@ -33,13 +33,14 @@ export function TierBadge({ tier, topMult, paused }: { tier: string; topMult: nu
 }
 
 /** The client-side price-status of a dual machine's pool: the SAME gate the
- * on-chain spin_commit_dual applies (staleness → STALE, band → PRICE UNSTABLE). */
+ * on-chain spin_commit_dual applies (staleness → STALE, band → PRICE UNSTABLE).
+ * LIVE → sage, PRICE UNSTABLE → amber (warning), STALE → neutral — the only two
+ * status colours the OS look allows, used strictly to signal state. */
 export function PriceChip({ kind, label, title }: { kind: "LIVE" | "UNSTABLE" | "STALE"; label: string; title?: string }) {
-  const color = kind === "LIVE" ? "var(--good, #57d9a3)" : kind === "UNSTABLE" ? "var(--gold)" : "var(--ink-faint)";
-  const bg = kind === "LIVE" ? "rgba(87,217,163,0.10)" : kind === "UNSTABLE" ? "rgba(245,196,81,0.10)" : "rgba(255,255,255,0.05)";
+  const tone = kind === "LIVE" ? "sage" : kind === "UNSTABLE" ? "amber" : "neutral";
   return (
-    <span title={title} className="badge" style={{ color, borderColor: color, background: bg, display: "inline-flex", gap: 6, alignItems: "center" }}>
-      <span aria-hidden style={{ width: 7, height: 7, borderRadius: 99, background: color, boxShadow: kind === "LIVE" ? `0 0 8px ${color}` : "none" }} />
+    <span title={title} className={`os-chip ${tone}`}>
+      <span className="os-chip-dot" aria-hidden />
       {label}
     </span>
   );
@@ -70,7 +71,7 @@ export function Reels({ symbols, spinning, glow }: { symbols: number[] | null; s
       {[0, 1, 2].map((i) => {
         const s = shown(i);
         return (
-          <div key={i} className={`reel${spinning ? " spinning" : ""}`} style={glow && !spinning && symbols ? { borderColor: glow, boxShadow: `0 0 26px -6px ${glow}, inset 0 0 30px rgba(0,0,0,0.6)` } : undefined}>
+          <div key={i} className={`reel${spinning ? " spinning" : ""}`} style={glow && !spinning && symbols ? { borderColor: glow, boxShadow: `0 0 22px -6px ${glow}, inset 0 -10px 18px rgba(58,39,51,0.06)` } : undefined}>
             <span className="sym" style={{ color: GCOLOR[s] }} title={SYMBOL_NAME[s]}>{GLYPH[s]}</span>
           </div>
         );

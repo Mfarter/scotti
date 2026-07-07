@@ -20,15 +20,15 @@ export function IndexerNote({ compact }: { compact?: boolean }) {
 }
 
 const VERIFY_STYLE: Record<VerifyStatus, { color: string; label: string; title: string }> = {
-  verified: { color: "#57d9a3", label: "✓ verified", title: "recompute from chain matched the paid amount" },
-  partial: { color: "var(--gold)", label: "~ partial", title: "reels + payout verified from chain; a dual price aged out of the observation ring" },
+  verified: { color: "var(--sage-ink)", label: "✓ verified", title: "recompute from chain matched the paid amount" },
+  partial: { color: "var(--amber-ink)", label: "~ partial", title: "reels + payout verified from chain; a dual price aged out of the observation ring" },
   unverifiable: { color: "var(--ink-faint)", label: "? unverifiable", title: "randomness account closed or commit aged out of RPC history — stored honestly as such" },
-  mismatch: { color: "#ff3d5a", label: "✗ mismatch", title: "paid amount did NOT recompute — investigate" },
+  mismatch: { color: "var(--amber-ink)", label: "✗ mismatch", title: "paid amount did NOT recompute — investigate" },
 };
 export function VerifyBadge({ status, title }: { status: VerifyStatus; title?: string }) {
   const s = VERIFY_STYLE[status];
   return (
-    <span className="badge mono" title={title ?? s.title} style={{ color: s.color, borderColor: s.color, background: "rgba(255,255,255,0.04)", fontSize: 11.5 }}>
+    <span className="badge mono" title={title ?? s.title} style={{ color: s.color, borderColor: s.color, background: "var(--paper)", fontSize: 11.5 }}>
       {s.label}
     </span>
   );
@@ -91,7 +91,7 @@ export function SharePriceChart({ machine, kind }: { machine: string; kind: "sin
     const { norm, changePct } = drift(pts);
     return (
       <div className="stack" style={{ gap: 8 }}>
-        <div className="spread"><span className="tag">share price · trailing drift</span><span className="mono" style={{ color: changePct >= 0 ? "var(--good)" : "#ff5a6e" }}>{fmtChange(changePct)}</span></div>
+        <div className="spread"><span className="tag">share price · trailing drift</span><span className="mono" style={{ color: changePct >= 0 ? "var(--sage-ink)" : "var(--amber-ink)" }}>{fmtChange(changePct)}</span></div>
         <MiniChart pts={norm} stroke="var(--gold)" />
         <div className="faint" style={{ fontSize: 11.5 }}>history begins {since} · {pts.length} samples · lamports per share, indexed to 100 at the first sample</div>
         <IndexerNote compact />
@@ -106,7 +106,7 @@ export function SharePriceChart({ machine, kind }: { machine: string; kind: "sin
   return (
     <div className="stack" style={{ gap: 14 }}>
       <div className="stack" style={{ gap: 6 }}>
-        <div className="spread"><span className="tag">token per share · price-free (primary)</span><span className="mono" style={{ color: p1.changePct >= 0 ? "var(--good)" : "#ff5a6e" }}>{fmtChange(p1.changePct)}</span></div>
+        <div className="spread"><span className="tag">token per share · price-free (primary)</span><span className="mono" style={{ color: p1.changePct >= 0 ? "var(--sage-ink)" : "var(--amber-ink)" }}>{fmtChange(p1.changePct)}</span></div>
         <MiniChart pts={p1.norm} stroke="var(--gold)" />
       </div>
       <div className="stack" style={{ gap: 6 }}>
@@ -115,7 +115,7 @@ export function SharePriceChart({ machine, kind }: { machine: string; kind: "sin
           <span className="mono faint">{sec.length >= 2 ? fmtChange(p2.changePct) : "—"}</span>
         </div>
         {sec.length >= 2
-          ? <MiniChart pts={p2.norm} stroke="#7aa2ff" height={70} />
+          ? <MiniChart pts={p2.norm} stroke="var(--ink2)" height={70} />
           : <div className="faint" style={{ fontSize: 11.5 }}>needs LIVE-price samples (keeper up) — the price-dependent series is withheld while the pool is stale.</div>}
         <div className="faint" style={{ fontSize: 11.5 }}>the primary series is manipulation-immune; this one moves with the AMM price and is shown only when the CLMM TWAP was LIVE.</div>
       </div>

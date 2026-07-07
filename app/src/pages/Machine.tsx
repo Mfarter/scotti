@@ -8,6 +8,7 @@ import { runSpin, SpinResult, SpinStage } from "../lib/spin.ts";
 import { DEEP, SHALLOW, payoutBp, BP, SYMBOL_NAME } from "../lib/housemath.ts";
 import { fmtPctBp, fmtSol, fmtLamports, heatColor, rtpHeat } from "../lib/format.ts";
 import { Reels, Sol, Stat, TierBadge, Solscan } from "../components/ui.tsx";
+import { Window } from "../components/os/index.ts";
 import { RecentSpins } from "../components/Indexed.tsx";
 import { VerifyButton } from "../components/Verify.tsx";
 import { MachineStatus } from "../lib/status.ts";
@@ -81,7 +82,7 @@ export function MachinePage() {
           </div>
         </div>
         <div className="stack" style={{ alignItems: "flex-end", gap: 2 }}>
-          <div className="num" style={{ fontFamily: "var(--display)", fontWeight: 900, fontSize: 40, lineHeight: 1, color: glow, textShadow: `0 0 26px ${heatColor(heat, 0.5)}` }}>{fmtPctBp(status.realizedRtpBp)}</div>
+          <div className="num" style={{ fontFamily: "var(--serif)", fontWeight: 700, fontSize: 42, lineHeight: 1, color: "var(--ink)" }}>{fmtPctBp(status.realizedRtpBp)}</div>
           <span className="tag">realized RTP · k {status.kBp.toString()}</span>
         </div>
       </div>
@@ -94,7 +95,7 @@ export function MachinePage() {
       </div>
 
       {/* spin console */}
-      <div className="card pad stack" style={{ gap: 20, alignItems: "center", position: "relative" }}>
+      <Window icon="◇" title="Spin" bodyStyle={{ display: "flex", flexDirection: "column", gap: 20, alignItems: "center", position: "relative" }}>
         <Reels symbols={result ? result.reels : null} spinning={spinning} glow={glow} />
 
         {status.paused && <div className="note warn">This machine is paused by its curator — new spins are halted.</div>}
@@ -137,7 +138,7 @@ export function MachinePage() {
         )}
 
         {phase === "error" && err && <div className="note bad" style={{ width: "100%" }}>{err}</div>}
-      </div>
+      </Window>
 
       {result && <Outcome r={result} status={status} />}
 
@@ -168,7 +169,7 @@ function Outcome({ r, status }: { r: SpinResult; status: MachineStatus }) {
     <div className="card pad stack" style={{ gap: 14 }}>
       <div className="spread">
         <h3 style={{ fontSize: 22 }}>{r.reels.map((s) => SYMBOL_NAME[s]).join(" · ")}</h3>
-        <span className={`badge ${win ? "shallow" : "deep"}`} style={win ? { color: "#bff0dc", borderColor: "rgba(87,217,163,0.4)", background: "rgba(87,217,163,0.08)" } : undefined}>{win ? "player win" : "house win"}</span>
+        <span className={`os-chip ${win ? "sage" : "neutral"}`}>{win ? "player win" : "house win"}</span>
       </div>
       <div className="note" style={{ fontFamily: "var(--mono)", fontSize: 13.5 }}>
         payout = wager {fmtLamports(r.wager)} × {baseMult}× (paytable) × {kx.toFixed(4)} (k snapshot) = <b>{fmtLamports(r.payout)}</b> lamports

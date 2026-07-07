@@ -9,6 +9,7 @@ import { SpinStage } from "../lib/spin.ts";
 import { DEEP, SHALLOW, payoutBp, payoutValueLamports, BP, SYMBOL_NAME } from "../lib/housemath.ts";
 import { fmtPctBp, fmtSol, fmtTokens, heatColor, rtpHeat } from "../lib/format.ts";
 import { Reels, Sol, Stat, Solscan, PriceChip } from "../components/ui.tsx";
+import { Window } from "../components/os/index.ts";
 import { RecentSpins } from "../components/Indexed.tsx";
 import { DualVerifyButton } from "../components/Verify.tsx";
 import { DualStatus } from "../lib/dualstatus.ts";
@@ -81,13 +82,13 @@ export function DualMachinePage() {
         <div className="stack" style={{ gap: 6 }}>
           <h1 style={{ fontSize: 38 }}>{status.name}</h1>
           <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-            <span className="badge" style={{ color: "var(--neon,#7ce7c4)", borderColor: "rgba(124,231,196,0.4)" }}>dual · SOL in → CHIP out</span>
+            <span className="os-chip peach">dual · SOL in → CHIP out</span>
             <PriceChip kind={status.price.kind} label={status.price.label} title={status.price.reason} />
             <Solscan acct={status.machine} />
           </div>
         </div>
         <div className="stack" style={{ alignItems: "flex-end", gap: 2 }}>
-          <div className="num" style={{ fontFamily: "var(--display)", fontWeight: 900, fontSize: 40, lineHeight: 1, color: glow, textShadow: live ? `0 0 26px ${heatColor(heat, 0.5)}` : "none" }}>
+          <div className="num" style={{ fontFamily: "var(--serif)", fontWeight: 700, fontSize: 42, lineHeight: 1, color: "var(--ink)" }}>
             {status.realizedRtpBp !== null ? fmtPctBp(status.realizedRtpBp) : "—"}
           </div>
           <span className="tag">nominal RTP · band {fmtPctBp(status.rtpFloorBp, 0)}–{fmtPctBp(status.rtpMaxBp, 0)}</span>
@@ -95,7 +96,7 @@ export function DualMachinePage() {
       </div>
 
       {/* price + effective-RTP readout */}
-      <div className="card pad stack" style={{ gap: 12 }}>
+      <Window icon="◈" title="Price · effective RTP" bodyStyle={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
           <Stat k="spot">{status.price.spot !== null ? <span className="mono">{status.price.spot.toFixed(2)} <span className="faint">CHIP/SOL</span></span> : "—"}</Stat>
           <Stat k="TWAP (price_at_commit)">{status.price.twap !== null ? <span className="mono">{status.price.twap.toFixed(2)} <span className="faint">CHIP/SOL</span></span> : "—"}</Stat>
@@ -106,7 +107,7 @@ export function DualMachinePage() {
           <div className="note stack" style={{ gap: 4 }}>
             <span className="tag">effective RTP at current spot</span>
             <div className="mono" style={{ fontSize: 14 }}>
-              nominal <b>{fmtPctBp(status.realizedRtpBp)}</b> × spot/TWAP ({(status.price.spot! / status.price.twap!).toFixed(4)}) = <b style={{ color: status.effectiveRtpAtSpotBp < Number(status.realizedRtpBp) ? "var(--gold)" : "var(--good,#57d9a3)" }}>{(status.effectiveRtpAtSpotBp / 100).toFixed(2)}%</b>
+              nominal <b>{fmtPctBp(status.realizedRtpBp)}</b> × spot/TWAP ({(status.price.spot! / status.price.twap!).toFixed(4)}) = <b style={{ color: status.effectiveRtpAtSpotBp < Number(status.realizedRtpBp) ? "var(--gold)" : "var(--good)" }}>{(status.effectiveRtpAtSpotBp / 100).toFixed(2)}%</b>
             </div>
             <div className="faint" style={{ fontSize: 12.5 }}>
               Payouts are priced at the TWAP but you receive CHIP worth the <i>spot</i> price. When spot sits
@@ -115,7 +116,7 @@ export function DualMachinePage() {
             </div>
           </div>
         )}
-      </div>
+      </Window>
 
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
         <Stat k="pool depth"><span className="mono">{fmtTokens(status.tokenBalance, dec, 0)}</span> <span className="faint">CHIP</span></Stat>
@@ -125,7 +126,7 @@ export function DualMachinePage() {
       </div>
 
       {/* spin console */}
-      <div className="card pad stack" style={{ gap: 20, alignItems: "center", position: "relative" }}>
+      <Window icon="◈" title="Spin — win CHIP" bodyStyle={{ display: "flex", flexDirection: "column", gap: 20, alignItems: "center", position: "relative" }}>
         <Reels symbols={result ? result.reels : null} spinning={busy} glow={glow} />
 
         {status.paused && <div className="note warn">This machine is paused by its curator — new spins are halted.</div>}
@@ -169,7 +170,7 @@ export function DualMachinePage() {
         )}
 
         {phase === "error" && err && <div className="note bad" style={{ width: "100%" }}>{err}</div>}
-      </div>
+      </Window>
 
       {result && <DualOutcome r={result} status={status} />}
 
@@ -214,7 +215,7 @@ function DualOutcome({ r, status }: { r: DualSpinResult; status: DualStatus }) {
     <div className="card pad stack" style={{ gap: 14 }}>
       <div className="spread">
         <h3 style={{ fontSize: 22 }}>{r.reels.map((s) => SYMBOL_NAME[s]).join(" · ")}</h3>
-        <span className={`badge ${win ? "shallow" : "deep"}`} style={win ? { color: "#bff0dc", borderColor: "rgba(87,217,163,0.4)", background: "rgba(87,217,163,0.08)" } : undefined}>{win ? "player win" : "house win"}</span>
+        <span className={`os-chip ${win ? "sage" : "neutral"}`}>{win ? "player win" : "house win"}</span>
       </div>
       <div className="note" style={{ fontFamily: "var(--mono)", fontSize: 13.5 }}>
         payout = wager {fmtSol(r.wager, 6)} SOL × {baseMult}× (paytable) × {kx.toFixed(4)} (k) × <b>{priceAtCommit.toFixed(2)} CHIP/SOL</b> (price_at_commit) = <b>{fmtTokens(r.paidTokens, dec, 6)} CHIP</b>

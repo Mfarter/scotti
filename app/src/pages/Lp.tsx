@@ -8,6 +8,7 @@ import { confirm } from "../lib/rpc.ts";
 import { SOL } from "../lib/constants.ts";
 import { fmtPctBp, fmtLamports } from "../lib/format.ts";
 import { Sol, Stat } from "../components/ui.tsx";
+import { Window, SectionHeader } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
 import { DualLpPanel } from "./DualLpPanel.tsx";
@@ -50,14 +51,13 @@ export function Lp() {
 
   return (
     <div className="stack" style={{ gap: 22 }}>
-      <header className="stack" style={{ gap: 8 }}>
-        <div className="eyebrow">Liquidity</div>
-        <h1 style={{ fontSize: 36 }}>Back the house.</h1>
-        <p className="muted" style={{ maxWidth: 640, margin: 0 }}>
-          LPs own the bankroll pro-rata. The house edge on every spin accrues to the pool, so your
-          share price drifts up with volume and down when jackpots land. Yield is share-price
-          appreciation — never a promised rate.
-        </p>
+      <header>
+        <SectionHeader kicker="Liquidity" title="Back the house." titleSize={34}
+          subline={<span style={{ display: "block", maxWidth: 640 }}>
+            LPs own the bankroll pro-rata. The house edge on every spin accrues to the pool, so your
+            share price drifts up with volume and down when jackpots land. Yield is share-price
+            appreciation — never a promised rate.
+          </span>} />
       </header>
 
       <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
@@ -80,8 +80,7 @@ export function Lp() {
         <div className="grid" style={{ gridTemplateColumns: "1.1fr 0.9fr", alignItems: "start" }}>
           {/* left: position + actions */}
           <div className="stack" style={{ gap: 16 }}>
-            <div className="card pad stack" style={{ gap: 14 }}>
-              <h3 style={{ fontSize: 19 }}>Your position</h3>
+            <Window icon="◇" title="Your position" bodyStyle={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {!connected || !lp?.exists ? (
                 <div className="muted">No position on this machine yet.</div>
               ) : (
@@ -148,12 +147,11 @@ export function Lp() {
                   )}
                 </>
               )}
-            </div>
+            </Window>
 
             {/* permissionless crank */}
             {connected && (
-              <div className="card pad stack" style={{ gap: 10 }}>
-                <h3 style={{ fontSize: 17 }}>Crank someone's withdrawal</h3>
+              <Window icon="◇" title="Crank someone's withdrawal" bodyStyle={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 <p className="muted" style={{ margin: 0, fontSize: 13.5 }}>The processing crank is permissionless — anyone can settle any LP's due request. Paste an LP owner address.</p>
                 <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                   <input className="input mono" placeholder="LP owner pubkey" value={crankAddr} onChange={(e) => setCrankAddr(e.target.value)} style={{ fontSize: 13 }} />
@@ -162,7 +160,7 @@ export function Lp() {
                     send("process_withdrawals", () => new Transaction().add(ixProcessWithdrawals(m, owner, publicKey!)));
                   }}>Crank</button>
                 </div>
-              </div>
+              </Window>
             )}
           </div>
 
@@ -188,8 +186,7 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
   const maxDrawdownPct = Number(status.maxExposureBp) / 100; // one jackpot ≤ this % of pool
 
   return (
-    <div className="card pad stack" style={{ gap: 14 }}>
-      <h3 style={{ fontSize: 19 }}>What to expect</h3>
+    <Window icon="◇" title="What to expect" bodyStyle={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
         <Stat k="share price"><span className="mono">{(Number(status.sharePrice1e12) / 1e12).toPrecision(5)}</span></Stat>
         <Stat k="house edge"><span className="num">{fmtPctBp(edgeBp)}</span></Stat>
@@ -225,6 +222,6 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
       {indexerEnabled()
         ? <><div className="hr" /><SharePriceChart machine={status.machine} kind="single" /></>
         : <div className="faint" style={{ fontSize: 12 }}>Trailing 7d/30d share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>}
-    </div>
+    </Window>
   );
 }

@@ -14,6 +14,7 @@ import {
 import { confirm } from "../lib/rpc.ts";
 import { fmtTokens, fmtLamports } from "../lib/format.ts";
 import { Sol, Stat, PriceChip } from "../components/ui.tsx";
+import { Window } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
 
@@ -76,8 +77,7 @@ export function DualLpPanel() {
         <div className="grid" style={{ gridTemplateColumns: "1.1fr 0.9fr", alignItems: "start", gap: 16 }}>
           {/* left: position + actions */}
           <div className="stack" style={{ gap: 16 }}>
-            <div className="card pad stack" style={{ gap: 14 }}>
-              <h3 style={{ fontSize: 19 }}>Your position</h3>
+            <Window icon="◈" title="Your position" bodyStyle={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {!connected || !lp?.exists || lp.shares === 0n ? (
                 <div className="muted">No position on this machine yet.</div>
               ) : (
@@ -169,13 +169,12 @@ export function DualLpPanel() {
                   )}
                 </>
               )}
-            </div>
+            </Window>
           </div>
 
           {/* right: honest disclosures */}
           <div className="stack" style={{ gap: 14 }}>
-            <div className="card pad stack" style={{ gap: 12 }}>
-              <h3 style={{ fontSize: 19 }}>Reward modes, honestly</h3>
+            <Window icon="◈" title="Reward modes, honestly" bodyStyle={{ display: "flex", flexDirection: "column", gap: 12 }}>
               <div className="note stack" style={{ gap: 4 }}>
                 <span style={{ fontWeight: 800 }}>SOL — claim anytime</span>
                 <span style={{ fontSize: 13 }}>Your share of the house edge accrues as SOL you can <b>claim_sol</b> whenever. Simple; you hold SOL.</span>
@@ -192,10 +191,9 @@ export function DualLpPanel() {
                   is a real market buy. Good for CHIP holders, but it means your yield is only as liquid as the pool.
                 </span>
               </div>
-            </div>
+            </Window>
 
-            <div className="card pad stack" style={{ gap: 8 }}>
-              <h3 style={{ fontSize: 17 }}>What you're taking on</h3>
+            <Window icon="◈" title="What you're taking on" bodyStyle={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <div className="note bad stack" style={{ gap: 4 }}>
                 <span style={{ fontWeight: 800 }}>Token-denominated risk</span>
                 <span style={{ fontSize: 13 }}>
@@ -208,7 +206,7 @@ export function DualLpPanel() {
               {indexerEnabled() && m
                 ? <><div className="hr" /><SharePriceChart machine={m.toBase58()} kind="dual" /></>
                 : <div className="faint" style={{ fontSize: 12 }}>Trailing share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>}
-            </div>
+            </Window>
           </div>
         </div>
       )}

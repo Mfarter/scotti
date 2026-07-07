@@ -2,11 +2,12 @@ import { H2_ARTIFACTS } from "../lib/artifacts.ts";
 import { fmtLamports } from "../lib/format.ts";
 import { VerifyButton } from "../components/Verify.tsx";
 import { Solscan } from "../components/ui.tsx";
+import { Window } from "../components/os/index.ts";
 
 function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
   return (
     <div className="row" style={{ gap: 16, alignItems: "flex-start" }}>
-      <div style={{ flex: "none", width: 34, height: 34, borderRadius: 10, display: "grid", placeItems: "center", background: "rgba(245,196,81,0.1)", color: "var(--gold)", fontWeight: 900, fontFamily: "var(--display)" }}>{n}</div>
+      <div style={{ flex: "none", width: 34, height: 34, borderRadius: 10, display: "grid", placeItems: "center", background: "var(--gloss-hi), var(--gloss-pink)", border: "1px solid var(--line2)", boxShadow: "var(--inset-top)", color: "var(--ink)", fontWeight: 700, fontFamily: "var(--serif)" }}>{n}</div>
       <div className="stack" style={{ gap: 4 }}>
         <h3 style={{ fontSize: 18 }}>{title}</h3>
         <div className="muted" style={{ fontSize: 14.5 }}>{children}</div>
@@ -27,7 +28,7 @@ export function Fair() {
         </p>
       </header>
 
-      <div className="card pad stack" style={{ gap: 20 }}>
+      <Window icon="◇" title="The trust story" bodyStyle={{ display: "flex", flexDirection: "column", gap: 20 }}>
         <Step n={1} title="Odds are a published function of pool state">
           A machine's payout scaler <span className="mono">k</span> and its tier are a deterministic,
           on-chain function of pool depth (run through an anti-snipe smoothing so a jackpot can't open a
@@ -50,7 +51,7 @@ export function Fair() {
           determined. The Verify buttons below re-read the randomness account and the settle transaction
           straight from the chain and check the recomputed payout equals what was actually paid.
         </Step>
-      </div>
+      </Window>
 
       <div className="stack" style={{ gap: 12 }}>
         <h2 style={{ fontSize: 24 }}>Three real spins, verify them now</h2>
@@ -83,7 +84,7 @@ export function Fair() {
           on-chain price. The same "verify everything" discipline applies, with three extra guards
           worth stating plainly (full detail in <b>H6-DUAL-ASSET-SPEC.md</b>).
         </p>
-        <div className="card pad stack" style={{ gap: 20 }}>
+        <Window icon="◈" title="Dual-asset guards" bodyStyle={{ display: "flex", flexDirection: "column", gap: 20 }}>
           <Step n={1} title="Priced at the TWAP, not the spot">
             The prize is priced at a <span className="mono">time-weighted average price</span> snapshotted at
             commit — never the instantaneous spot. A single-block price wick can't move your payout, and (like
@@ -110,7 +111,7 @@ export function Fair() {
             <span className="mono"> nominal RTP × spot/TWAP</span>. When spot is below the TWAP it reads <b>below</b> nominal;
             above, above. The machine page shows this live and never clamps it — the price hedge, stated both ways.
           </Step>
-        </div>
+        </Window>
       </div>
 
       <div className="note stack" style={{ gap: 6 }}>

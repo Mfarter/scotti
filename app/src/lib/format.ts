@@ -31,15 +31,17 @@ export function fmtTokens(base: bigint, dec: number, dp = 2): string {
   return `${neg ? "-" : ""}${wholeStr}${dp > 0 ? "." + frac.toString().padStart(dp, "0") : ""}`;
 }
 
-// -------------------- RTP heat glow --------------------
-// A machine's colour is its live odds. High realized RTP (a "cold" machine —
-// few players, best odds) glows HOT; the deep/floor machines glow cool. Three
-// stops: cool blue → gold → hot red, keyed on realized RTP across the band.
+// -------------------- RTP heat wash --------------------
+// A machine's tint is its live odds. High realized RTP (a "cold" machine — few
+// players, best odds) washes WARM; the deep/floor machines wash cool. Kept
+// strictly on-palette (the SCOTTI OS look is four tones + ink, no decorative
+// colour): muted plum (cool) → pink → peach (warm), keyed on RTP across the band.
+// Used only as a soft panel wash; readouts themselves stay --ink for legibility.
 
 type RGB = [number, number, number];
-const COOL: RGB = [63, 169, 255];  // electric blue — floor odds / deep
-const MID: RGB = [245, 196, 81];   // Scotti gold
-const HOT: RGB = [255, 61, 90];    // hot red — best odds / cold machine
+const COOL: RGB = [133, 96, 112];   // --ink2 muted plum — floor odds / deep
+const MID: RGB = [233, 195, 220];   // --pink
+const HOT: RGB = [248, 216, 198];   // --peach — best odds / cold machine
 
 function lerp(a: RGB, b: RGB, t: number): RGB {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];

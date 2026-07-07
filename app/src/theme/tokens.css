@@ -1,0 +1,67 @@
+/* SCOTTI OS — token layer.
+   The whole visual system is four tones + one ink, plus two desaturated status
+   colours used ONLY to signal state. Nothing else. Every panel, button, chip and
+   readout in the app resolves its colour from a variable defined here. */
+
+:root {
+  /* ---- the locked palette (four tones + ink) ---- */
+  --paper: #fdfcfa;   /* panel / base */
+  --pink:  #e9c3dc;   /* primary gloss, accents */
+  --peach: #f8d8c6;   /* secondary gloss, tags */
+  --ink:   #3a2733;   /* deep plum — all text + outlines (never black) */
+  --ink2:  #856070;   /* muted plum — secondary text / labels */
+
+  /* ---- status colours (desaturated; state only, never decoration) ---- */
+  --sage:      #9cc7b2;   --sage-ink:  #2f5546;   /* LIVE / connected / verified */
+  --amber:     #e6c48a;   --amber-ink: #7a5410;   /* STALE / warning / unverifiable */
+
+  /* ---- ink-derived hairlines & fills ---- */
+  --ink-faint: #a78a99;                    /* tertiary text */
+  --line:  rgba(58, 39, 51, 0.12);         /* soft panel hairline */
+  --line2: rgba(58, 39, 51, 0.22);         /* stronger 1px border */
+  --wash-pink:  rgba(233, 195, 220, 0.35);
+  --wash-peach: rgba(248, 216, 198, 0.40);
+  --wash-sage:  rgba(156, 199, 178, 0.22);
+  --wash-amber: rgba(230, 196, 138, 0.22);
+
+  /* ---- back-compat aliases (older inline var refs resolve on-palette) ---- */
+  --gold: #b06a94; --gold-deep: #8f5277;   /* primary plum-pink accent */
+  --neon: #b06a94; --neon-dim: #8f5277;    /* secondary accent (same family) */
+  --good: var(--sage-ink);
+  --bad:  var(--amber-ink);                /* no red in the palette — alarms are amber */
+  --ink-dim: var(--ink2);
+
+  /* ---- radii ---- */
+  --r-window: 18px;
+  --r: 12px;
+  --r-sm: 8px;
+  --r-pill: 999px;
+
+  /* ---- reusable gloss gradients ---- */
+  --gloss-hi: linear-gradient(180deg,
+      rgba(255,255,255,0.72) 0%,
+      rgba(255,255,255,0.20) 42%,
+      rgba(255,255,255,0.00) 54%,
+      rgba(58,39,51,0.05) 100%);
+  --gloss-pink:   linear-gradient(180deg, #f2ddec 0%, #e9c3dc 46%, #ddabce 100%);
+  --gloss-peach:  linear-gradient(180deg, #fdeadf 0%, #f8d8c6 46%, #efc3aa 100%);
+  --gloss-silver: linear-gradient(180deg, #ffffff 0%, #f4f0f2 46%, #e6dde2 100%);
+  --gloss-title:  linear-gradient(180deg, #f6e6f0 0%, #edcfe1 52%, #e6bfd6 100%);
+
+  /* ---- shadows / highlights ---- */
+  --shadow-window: 0 12px 34px -14px rgba(58,39,51,0.38), 0 2px 6px -2px rgba(58,39,51,0.14);
+  --shadow-btn: 0 3px 0 rgba(58,39,51,0.10), 0 7px 16px -8px rgba(58,39,51,0.40);
+  --shadow-tile: 0 1px 0 rgba(255,255,255,0.7) inset, 0 4px 10px -6px rgba(58,39,51,0.30);
+  --inset-top: inset 0 1px 0 rgba(255,255,255,0.75);
+
+  /* ---- type ---- */
+  --serif: "Zilla Slab", "Iowan Old Style", Georgia, ui-serif, serif;
+  --mono:  "Space Mono", ui-monospace, "SF Mono", "SFMono-Regular", Menlo, monospace;
+  --pixel: "Pixelify Sans", "Space Mono", ui-monospace, monospace;
+  /* legacy aliases */
+  --display: var(--serif);
+  --body: var(--mono);
+
+  --maxw: 1180px;
+  color-scheme: light;
+}

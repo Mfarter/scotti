@@ -4,6 +4,12 @@ import { HashRouter, Routes, Route } from "react-router-dom";
 import { ConnectionProvider, WalletProvider } from "@solana/wallet-adapter-react";
 import { WalletModalProvider } from "@solana/wallet-adapter-react-ui";
 import "@solana/wallet-adapter-react-ui/styles.css";
+// Self-hosted fonts (bundled by Vite; no Google hotlink in production).
+import "@fontsource/zilla-slab/400.css";
+import "@fontsource/zilla-slab/700.css";
+import "@fontsource/space-mono/latin-400.css";
+import "@fontsource/space-mono/latin-700.css";
+import "@fontsource/pixelify-sans/600.css";
 import "./theme.css";
 
 import { RPC_URL } from "./lib/constants.ts";
