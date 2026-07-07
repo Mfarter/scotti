@@ -1,10 +1,11 @@
 // Live H3 verification on the demo machine: a throwaway LP deposits, requests a
 // full withdrawal, waits a real epoch boundary, and a permissionless crank
-// processes it — printing exact lamports received vs the share-price prediction.
+// processes it — printing exact lamports received vs the conservative-snapshot prediction.
 import { Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import {
-  PROGRAM_ID, SOL, connection, decodeMachine, ixDisc, loadWallet, lpPda, lpStatus,
-  machineId, machinePda, sendTx, sleep, solscanTx, u64, u128,
+  PROGRAM_ID, SOL, connection, decodeMachine, epochLengthEff, ixDisc, loadWallet, lpPda, lpStatus,
+  machineId, machinePda, sendTx, sleep, snapshotPayout, snapshotPrice, SNAPSHOT_SCALE, solscanTx, u64, u128,
+  type Machine,
 } from "./common.ts";
 
 const conn = connection();
@@ -14,12 +15,16 @@ const machine = machinePda(machineId(LABEL));
 const DEPOSIT = BigInt(process.env.WITHDRAW_DEPOSIT ?? (SOL / 20n).toString()); // 0.05 SOL
 const lamports = async (k: PublicKey) => (await conn.getAccountInfo(k))?.lamports ?? 0;
 
-// mirror of the program's process_withdrawals math (test oracle, in TS)
-function expectedProcess(pool: bigint, reserved: bigint, total: bigint, pending: bigint): bigint {
-  const free = pool > reserved ? pool - reserved : 0n;
-  const freeShares = (free * total) / pool;
-  const fill = pending < freeShares ? pending : freeShares;
-  return (fill * pool) / total;
+// mirror of the program's process_withdrawals math (test oracle, in TS). SCALE-2:
+// the payout is the epoch's CONSERVATIVE snapshot price — (pool − reserved)/total,
+// frozen at the epoch's first crank — times the filled shares, with the fill still
+// capped by the current free liquidity.
+function expectedProcess(m: Machine, pending: bigint, currentEpoch: bigint): bigint {
+  const free = m.poolValue > m.reservedExposure ? m.poolValue - m.reservedExposure : 0n;
+  const snap = snapshotPrice(free, m.totalShares, m.withdrawSnapshotPrice, m.withdrawSnapshotEpoch, currentEpoch);
+  const cap = snap === 0n ? 0n : (free * SNAPSHOT_SCALE) / snap; // shares the free can pay at snap
+  const fill = pending < cap ? pending : cap;
+  return snapshotPayout(fill, snap);
 }
 
 const ixDeposit = (owner: PublicKey, amount: bigint) => new TransactionInstruction({
@@ -89,7 +94,8 @@ for (let i = 0; i < 120; i++) {
 // predict, then process (permissionless crank = deploy wallet)
 const m = decodeMachine((await conn.getAccountInfo(machine))!.data);
 const pending = (await lpStatus(conn, machine, lp.publicKey)).pendingShares;
-const expected = expectedProcess(m.poolValue, m.reservedExposure, m.totalShares, pending);
+const currentEpoch = BigInt(await conn.getSlot("confirmed")) / epochLengthEff(m);
+const expected = expectedProcess(m, pending, currentEpoch);
 const vaultBefore = await lamports(machine);
 const lpBefore = await lamports(lp.publicKey);
 const pSig = await sendTx(conn, [ixProcess(lp.publicKey, wallet.publicKey)], [wallet], "process");
@@ -97,7 +103,7 @@ const vaultAfter = await lamports(machine);
 const lpAfter = await lamports(lp.publicKey);
 
 console.log(`\nprocessed:`);
-console.log(`  predicted payout (share price at processing) = ${expected} lamports`);
+console.log(`  predicted payout (conservative epoch snapshot)   = ${expected} lamports`);
 console.log(`  vault debited                                = ${vaultBefore - vaultAfter} lamports`);
 console.log(`  LP received (payout + reclaimed rent)        = ${lpAfter - lpBefore} lamports`);
 console.log(`  match: ${BigInt(vaultBefore - vaultAfter) === expected ? "✓ exact" : "✗ MISMATCH"}`);

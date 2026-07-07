@@ -128,6 +128,7 @@ export interface Machine {
   poolValue: bigint; reservedExposure: bigint; totalShares: bigint;
   smoothedValue: bigint; smoothedLastSlot: bigint;
   paused: boolean; epochLength: bigint;
+  withdrawSnapshotPrice: bigint; withdrawSnapshotEpoch: bigint; // SCALE-2 per-epoch withdrawal snapshot
 }
 /// Legacy sentinel: machines created before H3 store epoch_length 0 and fall
 /// back to this default (mirrors the program's DEFAULT_EPOCH_LENGTH_SLOTS).
@@ -145,9 +146,24 @@ export function decodeMachine(data: Buffer): Machine {
   const paused = data[o] !== 0; o += 1;
   o += 1; // bump
   const epochLength = rdU64();
-  return { machineId, curator, dLow, dMid, dHigh, maxExposureBp, smoothWindow, poolValue, reservedExposure, totalShares, smoothedValue, smoothedLastSlot, paused, epochLength };
+  const withdrawSnapshotPrice = rdU128(), withdrawSnapshotEpoch = rdU64();
+  return { machineId, curator, dLow, dMid, dHigh, maxExposureBp, smoothWindow, poolValue, reservedExposure, totalShares, smoothedValue, smoothedLastSlot, paused, epochLength, withdrawSnapshotPrice, withdrawSnapshotEpoch };
 }
 export function epochLengthEff(m: Machine): bigint { return m.epochLength === 0n ? DEFAULT_EPOCH_LENGTH_SLOTS : m.epochLength; }
+
+// ---- SCALE-2 conservative withdrawal price snapshot (mirrors house-math `snapshot`) ----
+// Withdrawals are priced at (free_value)/total_shares — the pool valued as if every
+// pending spin hits its reserved maximum — frozen at the epoch's first crank. Use the
+// STORED price when it's this epoch's; otherwise the value it would compute now.
+export const SNAPSHOT_SCALE = 1_000_000_000_000_000_000n; // 1e18
+export function snapshotPrice(freeValue: bigint, totalShares: bigint, snapPrice: bigint, snapEpoch: bigint, currentEpoch: bigint): bigint {
+  if (snapEpoch === currentEpoch && snapPrice !== 0n) return snapPrice;
+  return totalShares === 0n ? 0n : (freeValue * SNAPSHOT_SCALE) / totalShares;
+}
+/** Conservative payout for `shares` at the epoch snapshot (lamports or token base units). */
+export function snapshotPayout(shares: bigint, snapPrice: bigint): bigint {
+  return (shares * snapPrice) / SNAPSHOT_SCALE;
+}
 
 export interface LpPosition { machine: PublicKey; owner: PublicKey; shares: bigint; pendingShares: bigint; pendingEpoch: bigint; }
 export function decodeLpPosition(data: Buffer): LpPosition {
@@ -339,9 +355,9 @@ export async function machineStatus(conn: Connection, machine: PublicKey): Promi
 export interface LpStatus {
   exists: boolean;
   shares: bigint;
-  valueLamports: bigint;      // shares at the current share price
+  valueLamports: bigint;      // active shares marked at the current share price (NAV)
   pendingShares: bigint;
-  pendingValueLamports: bigint;
+  pendingValueLamports: bigint; // queued withdrawal PROCEEDS at the conservative epoch snapshot
   pendingEpoch: bigint;
   processableNow: boolean;    // epoch elapsed AND there is a pending request
 }
@@ -353,15 +369,19 @@ export async function lpStatus(conn: Connection, machine: PublicKey, owner: Publ
   if (!info) return { exists: false, shares: 0n, valueLamports: 0n, pendingShares: 0n, pendingValueLamports: 0n, pendingEpoch: 0n, processableNow: false };
   const p = decodeLpPosition(info.data);
   const m = decodeMachine((await conn.getAccountInfo(machine))!.data);
-  const price = (sh: bigint) => m.totalShares === 0n ? 0n : (sh * m.poolValue) / m.totalShares;
+  const nav = (sh: bigint) => m.totalShares === 0n ? 0n : (sh * m.poolValue) / m.totalShares; // mark-to-market
   const slot = BigInt(await conn.getSlot("confirmed"));
   const epochNow = slot / epochLengthEff(m);
+  // Queued withdrawals pay the CONSERVATIVE per-epoch snapshot, not the raw NAV
+  // (SCALE-2): free_value = pool_value − reserved_exposure, frozen per epoch.
+  const free = m.poolValue > m.reservedExposure ? m.poolValue - m.reservedExposure : 0n;
+  const snap = snapshotPrice(free, m.totalShares, m.withdrawSnapshotPrice, m.withdrawSnapshotEpoch, epochNow);
   return {
     exists: true,
     shares: p.shares,
-    valueLamports: price(p.shares),
+    valueLamports: nav(p.shares),
     pendingShares: p.pendingShares,
-    pendingValueLamports: price(p.pendingShares),
+    pendingValueLamports: snapshotPayout(p.pendingShares, snap),
     pendingEpoch: p.pendingEpoch,
     processableNow: p.pendingShares > 0n && epochNow > p.pendingEpoch,
   };

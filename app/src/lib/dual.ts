@@ -55,6 +55,7 @@ export interface DualMachine {
   tokenBalance: bigint; reservedTokens: bigint; escrowedSol: bigint; divPoolSol: bigint; totalShares: bigint;
   accSolPerShare: bigint; earmarkedSol: bigint; smoothedValue: bigint; smoothedLastSlot: bigint;
   paused: boolean;
+  withdrawSnapshotPrice: bigint; withdrawSnapshotEpoch: bigint; // SCALE-2 per-epoch token-withdrawal snapshot
 }
 export function decodeDualMachine(d: Buffer): DualMachine {
   return {
@@ -71,6 +72,7 @@ export function decodeDualMachine(d: Buffer): DualMachine {
     divPoolSol: d.readBigUInt64LE(293), totalShares: u128at(d, 301), accSolPerShare: u128at(d, 317),
     earmarkedSol: d.readBigUInt64LE(333), smoothedValue: u128at(d, 341), smoothedLastSlot: d.readBigUInt64LE(357),
     paused: d[365] !== 0,
+    withdrawSnapshotPrice: u128at(d, 367), withdrawSnapshotEpoch: d.readBigUInt64LE(383),
   };
 }
 

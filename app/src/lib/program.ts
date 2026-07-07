@@ -55,6 +55,7 @@ export interface Machine {
   poolValue: bigint; reservedExposure: bigint; totalShares: bigint;
   smoothedValue: bigint; smoothedLastSlot: bigint;
   paused: boolean; epochLength: bigint;
+  withdrawSnapshotPrice: bigint; withdrawSnapshotEpoch: bigint; // SCALE-2 per-epoch withdrawal snapshot
 }
 export const DEFAULT_EPOCH_LENGTH_SLOTS = 1_350n;
 export function decodeMachine(data: Buffer): Machine {
@@ -69,9 +70,20 @@ export function decodeMachine(data: Buffer): Machine {
   const paused = data[o] !== 0; o += 1;
   o += 1; // bump
   const epochLength = rdU64();
-  return { machineId: machineIdBuf, curator, dLow, dMid, dHigh, maxExposureBp, smoothWindow, poolValue, reservedExposure, totalShares, smoothedValue, smoothedLastSlot, paused, epochLength };
+  const withdrawSnapshotPrice = rdU128(), withdrawSnapshotEpoch = rdU64();
+  return { machineId: machineIdBuf, curator, dLow, dMid, dHigh, maxExposureBp, smoothWindow, poolValue, reservedExposure, totalShares, smoothedValue, smoothedLastSlot, paused, epochLength, withdrawSnapshotPrice, withdrawSnapshotEpoch };
 }
 export const epochLengthEff = (m: Machine) => (m.epochLength === 0n ? DEFAULT_EPOCH_LENGTH_SLOTS : m.epochLength);
+
+// ---- SCALE-2 conservative withdrawal price snapshot (mirrors house-math `snapshot`) ----
+// Queued withdrawals pay (free_value)/total_shares — the pool valued as if every
+// pending spin hits its reserved maximum — frozen at the epoch's first crank.
+export const SNAPSHOT_SCALE = 1_000_000_000_000_000_000n; // 1e18
+export function snapshotPrice(freeValue: bigint, totalShares: bigint, snapPrice: bigint, snapEpoch: bigint, currentEpoch: bigint): bigint {
+  if (snapEpoch === currentEpoch && snapPrice !== 0n) return snapPrice;
+  return totalShares === 0n ? 0n : (freeValue * SNAPSHOT_SCALE) / totalShares;
+}
+export const snapshotPayout = (shares: bigint, snapPrice: bigint) => (shares * snapPrice) / SNAPSHOT_SCALE;
 
 export interface LpPosition { machine: PublicKey; owner: PublicKey; shares: bigint; pendingShares: bigint; pendingEpoch: bigint; }
 export function decodeLpPosition(data: Buffer): LpPosition {

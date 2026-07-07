@@ -121,6 +121,12 @@ export function Lp() {
                   {lp?.exists && lp.shares > 0n && (
                     <div className="stack" style={{ gap: 8 }}>
                       <span className="tag">request withdrawal (epoch-gated)</span>
+                      <div className="faint" style={{ fontSize: 12 }}>
+                        Paid at the epoch's conservative price snapshot — the pool valued as if every
+                        pending spin hits its max — so exiting while spins are in flight is priced for
+                        the worst case and any surplus favors the LPs who stay. Order-independent within
+                        an epoch: identical requests are paid identically.
+                      </div>
                       <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                         {[25, 50, 100].map((pct) => (
                           <button key={pct} className="btn sm" disabled={busy !== null} onClick={() => {

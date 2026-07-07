@@ -5,7 +5,7 @@ import { Buffer } from "buffer";
 import {
   DEEP, SHALLOW, kBoundsConst, kOfDepth, maxBet, realizedRtpBp, smoothedUpdate, topMultiplier,
 } from "./housemath.ts";
-import { decodeLpPosition, decodeMachine, epochLengthEff, lpPda, Machine, machineIdToLabel } from "./program.ts";
+import { decodeLpPosition, decodeMachine, epochLengthEff, lpPda, Machine, machineIdToLabel, snapshotPayout, snapshotPrice } from "./program.ts";
 
 export interface MachineStatus {
   machine: string;
@@ -55,8 +55,8 @@ export async function machineStatus(conn: Connection, machine: PublicKey): Promi
 
 export interface LpStatus {
   exists: boolean;
-  shares: bigint; valueLamports: bigint;
-  pendingShares: bigint; pendingValueLamports: bigint; pendingEpoch: bigint;
+  shares: bigint; valueLamports: bigint;   // active shares marked at NAV
+  pendingShares: bigint; pendingValueLamports: bigint; pendingEpoch: bigint; // queued withdrawal at the conservative snapshot
   processableNow: boolean; epochNow: bigint; nextBoundarySlot: bigint;
 }
 
@@ -70,13 +70,16 @@ export async function lpStatus(conn: Connection, machine: PublicKey, owner: Publ
   if (!posInfo || !machInfo) return empty;
   const p = decodeLpPosition(Buffer.from(posInfo.data));
   const m = decodeMachine(Buffer.from(machInfo.data));
-  const price = (sh: bigint) => (m.totalShares === 0n ? 0n : (sh * m.poolValue) / m.totalShares);
+  const nav = (sh: bigint) => (m.totalShares === 0n ? 0n : (sh * m.poolValue) / m.totalShares); // mark-to-market
   const elen = epochLengthEff(m);
   const epochNow = BigInt(slotN) / elen;
+  // Queued withdrawals pay the CONSERVATIVE per-epoch snapshot (SCALE-2), not raw NAV.
+  const free = m.poolValue > m.reservedExposure ? m.poolValue - m.reservedExposure : 0n;
+  const snap = snapshotPrice(free, m.totalShares, m.withdrawSnapshotPrice, m.withdrawSnapshotEpoch, epochNow);
   return {
     exists: true,
-    shares: p.shares, valueLamports: price(p.shares),
-    pendingShares: p.pendingShares, pendingValueLamports: price(p.pendingShares), pendingEpoch: p.pendingEpoch,
+    shares: p.shares, valueLamports: nav(p.shares),
+    pendingShares: p.pendingShares, pendingValueLamports: snapshotPayout(p.pendingShares, snap), pendingEpoch: p.pendingEpoch,
     processableNow: p.pendingShares > 0n && epochNow > p.pendingEpoch,
     epochNow, nextBoundarySlot: (epochNow + 1n) * elen,
   };

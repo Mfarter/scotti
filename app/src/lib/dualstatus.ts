@@ -9,7 +9,7 @@ import {
   payoutValueLamports, PAYOUT_DENOM, pow10, realizedRtpBp, smoothedUpdate, topMultiplier,
 } from "./housemath.ts";
 import { decodeDualMachine, type DualMachine, dualLpPda, decodeDualLpPosition } from "./dual.ts";
-import { machineIdToLabel } from "./program.ts";
+import { machineIdToLabel, snapshotPayout, snapshotPrice } from "./program.ts";
 import { type PriceStatus, priceStatus } from "./clmm.ts";
 import { pendingSol } from "./dividend.ts";
 
@@ -126,13 +126,17 @@ export async function fetchDualLp(conn: Connection, machine: PublicKey, owner: P
   if (!posInfo || !mInfo) return empty;
   const p = decodeDualLpPosition(Buffer.from(posInfo.data));
   const m = decodeDualMachine(Buffer.from(mInfo.data));
-  const tv = (sh: bigint) => (m.totalShares === 0n ? 0n : (sh * m.tokenBalance) / m.totalShares);
+  const tv = (sh: bigint) => (m.totalShares === 0n ? 0n : (sh * m.tokenBalance) / m.totalShares); // NAV mark
   const elen = m.epochLength === 0n ? DEFAULT_EPOCH : m.epochLength;
   const epochNow = BigInt(slotN) / elen;
   const earning = p.shares + p.pendingShares;
+  // Queued token withdrawals pay the CONSERVATIVE per-epoch token snapshot (SCALE-2):
+  // (token_balance − reserved_tokens)/total_shares, frozen at the epoch's first crank.
+  const freeTokens = m.tokenBalance > m.reservedTokens ? m.tokenBalance - m.reservedTokens : 0n;
+  const tokenSnap = snapshotPrice(freeTokens, m.totalShares, m.withdrawSnapshotPrice, m.withdrawSnapshotEpoch, epochNow);
   return {
     exists: true, shares: p.shares, pendingShares: p.pendingShares, pendingEpoch: p.pendingEpoch,
-    tokenValue: tv(p.shares), pendingTokenValue: tv(p.pendingShares),
+    tokenValue: tv(p.shares), pendingTokenValue: snapshotPayout(p.pendingShares, tokenSnap),
     rewardMode: p.rewardMode, earmarkedSol: p.earmarkedSol,
     pendingSol: pendingSol(earning, p.solDebt, m.accSolPerShare),
     processableNow: p.pendingShares > 0n && epochNow > p.pendingEpoch, epochNow, nextBoundarySlot: (epochNow + 1n) * elen,

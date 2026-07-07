@@ -141,6 +141,13 @@ export function DualLpPanel() {
                   {lp?.exists && lp.shares > 0n && (
                     <div className="stack" style={{ gap: 6 }}>
                       <span className="tag">request withdrawal <span className="faint">· epoch-gated · pays BOTH assets</span></span>
+                      <div className="faint" style={{ fontSize: 12 }}>
+                        The token side pays the epoch's conservative price snapshot (the vault valued
+                        as if every pending spin pays its max), frozen per epoch — so it is
+                        order-independent and any surplus favors the LPs who stay; the SOL dividend is
+                        exact per-share. Exit while spins are in flight and you are priced for the worst
+                        case.
+                      </div>
                       <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                         {[25, 50, 100].map((pct) => (
                           <button key={pct} className="btn sm" disabled={busy !== null} onClick={() => send("request_withdraw_token", () => new Transaction().add(ixRequestWithdrawToken(m, publicKey!, (lp.shares * BigInt(pct)) / 100n)))}>{pct}%</button>
