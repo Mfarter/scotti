@@ -2,7 +2,7 @@ import { useState } from "react";
 import { PublicKey, Transaction } from "@solana/web3.js";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { useFloor, useLp, useMachine } from "../lib/hooks.ts";
+import { useFloor, useDualFloor, useLp, useMachine } from "../lib/hooks.ts";
 import { ixCancelWithdraw, ixLpDeposit, ixProcessWithdrawals, ixRequestWithdraw } from "../lib/program.ts";
 import { confirm } from "../lib/rpc.ts";
 import { SOL } from "../lib/constants.ts";
@@ -12,6 +12,11 @@ import { Window, SectionHeader } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
 import { DualLpPanel } from "./DualLpPanel.tsx";
+import { LpDashboard } from "./LpDashboard.tsx";
+
+function scrollToId(id: string) {
+  setTimeout(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+}
 
 function parseSol(s: string): bigint | null {
   const n = Number(s);
@@ -23,8 +28,18 @@ export function Lp() {
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
   const { entries } = useFloor(8000);
+  const { entries: dualEntries } = useDualFloor(8000);
   const [selected, setSelected] = useState<string | null>(null);
+  const [dualSel, setDualSel] = useState<string | null>(null);
+  const [activeRow, setActiveRow] = useState<string | null>(null);
   const machine = selected ?? entries?.[0]?.pubkey.toBase58() ?? null;
+  const activePk = activeRow ?? machine;
+
+  function onSelectRow(pk: string, kind: "single" | "dual") {
+    setActiveRow(pk);
+    if (kind === "single") { setSelected(pk); scrollToId("lp-single-detail"); }
+    else { setDualSel(pk); scrollToId("lp-dual-detail"); }
+  }
 
   const { status, refresh: refreshM } = useMachine(machine ?? undefined, 6000);
   const { lp, refresh: refreshLp } = useLp(machine ?? undefined, publicKey ?? null, 6000);
@@ -60,12 +75,7 @@ export function Lp() {
           </span>} />
       </header>
 
-      <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-        <span className="tag">machine</span>
-        <select className="btn sm" value={machine ?? ""} onChange={(e) => setSelected(e.target.value)} style={{ minWidth: 220 }}>
-          {entries?.map((e) => <option key={e.pubkey.toBase58()} value={e.pubkey.toBase58()}>{e.status.name} — RTP {fmtPctBp(e.status.realizedRtpBp)}</option>)}
-        </select>
-      </div>
+      <LpDashboard singles={entries} duals={dualEntries} activePk={activePk} onSelect={onSelectRow} />
 
       {!connected && (
         <div className="card pad stack" style={{ gap: 12, alignItems: "flex-start" }}>
@@ -77,7 +87,7 @@ export function Lp() {
       {msg && <div className={`note ${msg.kind}`}>{msg.text}</div>}
 
       {status && m && (
-        <div className="grid" style={{ gridTemplateColumns: "1.1fr 0.9fr", alignItems: "start" }}>
+        <div id="lp-single-detail" className="grid" style={{ gridTemplateColumns: "1.1fr 0.9fr", alignItems: "start" }}>
           {/* left: position + actions */}
           <div className="stack" style={{ gap: 16 }}>
             <Window icon="◇" title="Your position" bodyStyle={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -170,7 +180,7 @@ export function Lp() {
       )}
 
       <div className="hr" style={{ margin: "8px 0" }} />
-      <DualLpPanel />
+      <div id="lp-dual-detail"><DualLpPanel selectedPk={dualSel} hideSelector /></div>
     </div>
   );
 }

@@ -18,12 +18,14 @@ import { Window } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
 
-export function DualLpPanel() {
+export function DualLpPanel({ selectedPk, hideSelector }: { selectedPk?: string | null; hideSelector?: boolean } = {}) {
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
   const { entries } = useDualFloor(8000);
   const [selected, setSelected] = useState<string | null>(null);
-  const machine = selected ?? entries?.[0]?.pubkey.toBase58() ?? null;
+  // Controlled by the dashboard table when selectedPk is provided; otherwise keeps
+  // its own selector (unchanged flow — this only restructures the selector).
+  const machine = (selectedPk ?? selected) ?? entries?.[0]?.pubkey.toBase58() ?? null;
   const { status, refresh: refreshM } = useDualMachine(machine ?? undefined, 6000);
   const { lp, refresh: refreshLp } = useDualLp(machine ?? undefined, publicKey ?? null, 6000);
 
@@ -62,7 +64,7 @@ export function DualLpPanel() {
         dividend</b>. You provide the CHIP bankroll the prizes are paid from.
       </p>
 
-      {entries.length > 1 && (
+      {!hideSelector && entries.length > 1 && (
         <div className="row" style={{ gap: 10 }}>
           <span className="tag">machine</span>
           <select className="btn sm" value={machine ?? ""} onChange={(e) => setSelected(e.target.value)} style={{ minWidth: 220 }}>

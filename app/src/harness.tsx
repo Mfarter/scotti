@@ -73,18 +73,21 @@ function fakePriceSeries(machine: string, dual: boolean) {
 }
 function fakeSpins(machine: string, dual: boolean) {
   const now = Math.floor(Date.now() / 1000);
-  const combos: Array<[number[], string, "verified" | "partial" | "unverifiable" | "mismatch"]> = [
-    [[BELL, BELL, BELL], "240000000", "verified"],
-    [[CHERRY, BAR, BLANK], "0", "verified"],
-    [[SEVEN, SEVEN, SEVEN], "3600000000", dual ? "partial" : "verified"],
-    [[BAR, BAR, CHERRY], "80000000", "unverifiable"],
-    [[JACKPOT, JACKPOT, BELL], "120000000", "mismatch"],
-    [[CHERRY, CHERRY, BLANK], "40000000", "verified"],
+  // [reels, single payout (lamports), dual payout (CHIP base units), verify status].
+  // The single set is a jackpot day: 0.12 SOL wagered, 0.36 SOL paid → take is
+  // NEGATIVE (a jackpot landed), which the dashboard shows in rose.
+  const combos: Array<[number[], string, string, "verified" | "partial" | "unverifiable" | "mismatch"]> = [
+    [[BELL, BELL, BELL], "0", "0", "verified"],
+    [[CHERRY, BAR, BLANK], "8000000", "400000000", "verified"],
+    [[SEVEN, SEVEN, SEVEN], "40000000", "1800000000", dual ? "partial" : "verified"],
+    [[BAR, BAR, CHERRY], "0", "0", "unverifiable"],
+    [[JACKPOT, JACKPOT, BELL], "300000000", "3600000000", "mismatch"],
+    [[CHERRY, CHERRY, BLANK], "12000000", "200000000", "verified"],
   ];
-  return combos.map(([reels, payout, verifyStatus], i) => ({
+  return combos.map(([reels, sp, dp, verifyStatus], i) => ({
     signature: `HARNESSsig${i}${"1".repeat(70)}`.slice(0, 88), machine, kind: dual ? "dual" : "single",
-    slot: 134000 - i * 30, blockTime: now - i * 400, player: OWNER.toBase58(), nonce: String(100 - i),
-    wager: "20000000", reels: reels.join("|"), payout, payoutKind: dual ? "tokens" : "lamports",
+    slot: 134000 - i * 30, blockTime: now - Math.floor((i + 0.5) * 86400 / 6), player: OWNER.toBase58(), nonce: String(100 - i),
+    wager: "20000000", reels: reels.join("|"), payout: dual ? dp : sp, payoutKind: dual ? "tokens" : "lamports",
     commitSig: null, priceAtCommit1e12: dual ? "180000000000000" : null, verifyStatus, verifyDetail: null,
   }));
 }

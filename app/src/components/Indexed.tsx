@@ -36,8 +36,8 @@ export function VerifyBadge({ status, title }: { status: VerifyStatus; title?: s
 
 // -------------------- inline SVG line chart (no chart lib) --------------------
 
-interface Pt { t: number; v: number }
-function MiniChart({ pts, stroke, height = 90 }: { pts: Pt[]; stroke: string; height?: number }) {
+export interface Pt { t: number; v: number }
+export function MiniChart({ pts, stroke, height = 90 }: { pts: Pt[]; stroke: string; height?: number }) {
   const W = 320, H = height, pad = 6;
   if (pts.length < 2) return <div className="faint" style={{ fontSize: 12 }}>collecting samples… ({pts.length} so far — needs at least two)</div>;
   const xs = pts.map((p) => p.t), vs = pts.map((p) => p.v);
@@ -55,6 +55,13 @@ function MiniChart({ pts, stroke, height = 90 }: { pts: Pt[]; stroke: string; he
       <circle cx={X(last.t)} cy={Y(last.v)} r={2.6} fill={stroke} />
     </svg>
   );
+}
+
+/** A short, chart-lib-free sparkline for the stat cards — reuses MiniChart, with a
+ * compact em-dash when there aren't yet two samples to draw. */
+export function Sparkline({ pts, stroke, height = 34 }: { pts: Pt[]; stroke: string; height?: number }) {
+  if (pts.length < 2) return <div className="faint" style={{ fontSize: 11 }}>—</div>;
+  return <MiniChart pts={pts} stroke={stroke} height={height} />;
 }
 
 /** Normalize a series to its first point = 100 (share-price DRIFT — the honest
