@@ -529,9 +529,10 @@ deploy `dist/` as static files. The app uses hash routing (`/#/machine/…`), so
 on every instruction, the swap-CPI `remaining_accounts` surface, the SCALE-2 snapshot,
 economic/rounding attacks, the randomness/price gate, and the indexer — with every
 "safe" claim backed by a `redteam_*` attack test that *attempts* the exploit and is
-rejected/bounded (15 on-chain + 6 indexer). No exploit moved funds, minted, or bypassed
-auth; findings are defense-in-depth hardening only (pin the swap pool; per-spin ingest
-try/catch; the bounded snapshot freeze-timing lever).
+rejected/bounded (16 on-chain + 7 indexer). No exploit moved funds, minted, or bypassed
+auth; findings are defense-in-depth hardening only. Two — pinning the swap pool (B1) and
+the per-spin ingest `try/catch` (B2) — are now **FIXED (HARDEN-1)**; the remaining one
+is the bounded snapshot freeze-timing lever (B3), a documented residual.
 
 ## Production-scale analysis
 

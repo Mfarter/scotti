@@ -22,21 +22,29 @@ captured by a green attack test. Nothing here puts live devnet funds at risk.
 
 The **(B) hardening gaps** (not exploitable now; defense-in-depth):
 
-- **B1 — swap `remaining_accounts` are unpinned except the output vault.** In
-  `compound_epoch` the Raydium pool / vaults / tick arrays are supplied by the
-  (permissionless) cranker as `remaining_accounts` and are NOT required to equal the
-  machine's own `pool`/`observation`. Safety rests on three checks that hold
-  (`clmm_program == CLMM_PROGRAM_ID`, output `vault == machine.token_vault`, and
-  `received >= min_out` priced off the machine's *own* pool), so a substituted pool
-  "can only help or fail" — but the swap pool is not pinned. Mitigation: also
-  `require_keys_eq!` the swap `pool_state`/`observation` against `machine.pool`/
-  `machine.observation` so the swap and the price read are provably the same pool.
-- **B2 — indexer ingest has no per-spin `try/catch`.** A spin whose account/tx data
-  throws during recompute would abort the whole ingest pass rather than being skipped.
-  Not reachable by an attacker today (the randomness/machine accounts are Switchboard-
-  / program-owned, so their bytes can't be forged), but a lying RPC could stall
-  ingest. Mitigation: wrap each spin's ingest in try/catch, store `unverifiable`, and
-  continue.
+- **B1 — swap `remaining_accounts` are unpinned except the output vault. ✅ FIXED
+  (HARDEN-1).** In `compound_epoch` the Raydium pool / vaults / tick arrays were
+  supplied by the (permissionless) cranker as `remaining_accounts` and were NOT
+  required to equal the machine's own `pool`/`observation`. Safety already rested on
+  three checks (`clmm_program == CLMM_PROGRAM_ID`, output `vault == machine.token_vault`,
+  and `received >= min_out` priced off the machine's *own* pool), so a substituted pool
+  "could only help or fail" — but the swap pool itself was not pinned. **Fix:** the real
+  swap backend now also `require_keys_eq!(*pool_state.key, machine.pool)` and
+  `require_keys_eq!(*observation.key, machine.observation)` (the pool's own vaults are
+  then transitively constrained — Raydium's `swap_v2` checks vault↔pool internally), so
+  the swap and the price read are provably the same pool. The three prior checks stay as
+  defense in depth. IDL byte-identical (internal constraints only; no account/instruction
+  change). Verified by `redteam_compound_wrong_pool_rejected` and a live devnet compound
+  through the pinned path (upgrade + compound txids in §2). Requires the devnet upgrade.
+- **B2 — indexer ingest has no per-spin `try/catch`. ✅ FIXED (HARDEN-1).** A spin
+  whose account/tx data threw during recompute would abort the whole ingest pass rather
+  than being skipped. Not reachable by an attacker today (the randomness/machine
+  accounts are Switchboard- / program-owned, so their bytes can't be forged), but a
+  lying RPC could stall ingest. **Fix:** each spin's recompute+store now runs inside its
+  own `try/catch` (both in `ingestSettle` and around the RPC gather in the loop); on any
+  throw the spin is stored `unverifiable` with the error detail and the pass continues.
+  Verified by `redteam: a spin whose recompute throws is stored unverifiable, and the
+  next good spin still ingests`.
 - **B3 — snapshot freeze-timing lever (the SCALE-2 residual, now attacked).** The
   cranker chooses *when* in an epoch the withdrawal snapshot freezes. It cannot split
   two identical requests (both get the same frozen price — proven), but a cranker who
@@ -55,11 +63,11 @@ outcome is Switchboard-random with negative attacker EV; SCALE.md §1b residual)
 | # | surface | attacks attempted | worst finding |
 |---|---|---|---|
 | 1 | account substitution | cross-machine position/LP, foreign vault, foreign payee ATA | none — constrained |
-| 2 | swap CPI (`compound_epoch`) | output-vault substitution, rigged price account, sub-min_out fill, out-of-band force-fill; real-Raydium reasoned | **B1** (unpinned swap pool; bounded by min_out) |
-| 3 | SCALE-2 snapshot | hostile cranker splits identical LPs; freeze-timing | **B3** (timing lever, bounded) |
+| 2 | swap CPI (`compound_epoch`) | output-vault substitution, rigged price account, sub-min_out fill, out-of-band force-fill; real-Raydium reasoned | **B1 ✅ FIXED** (swap pool now pinned to `machine.pool`/`observation`) |
+| 3 | SCALE-2 snapshot | hostile cranker splits identical LPs; freeze-timing | **B3** (timing lever, bounded — documented residual) |
 | 4 | economic / accounting | dividend prior-accrual theft, max_bet cap edge, dust round-trip harvest | none — bounded |
 | 5 | randomness / price gate | swapped randomness (single+dual), foreign price, band edge | none — constrained |
-| 6 | off-chain (indexer) | forged payout→verified, false mismatch, parser crash, SQL injection | **B2** (no per-spin try/catch) |
+| 6 | off-chain (indexer) | forged payout→verified, false mismatch, parser crash, SQL injection | **B2 ✅ FIXED** (per-spin try/catch → `unverifiable`, pass continues) |
 | 7 | griefing / DoS | compound front-run, keeper grief, queue clogging, rent strand | none new (see SCALE.md §2/§3/§5) |
 
 ---
@@ -125,10 +133,20 @@ validates that the passed pool vaults belong to `pool_state` and that
 than `min_out` fails the threshold. Net: mis-routing the swap pool **can only help the
 machine (more tokens) or fail**; it cannot drain.
 
-**Finding B1 (hardening):** the swap `pool_state`/vaults are not *required* to equal
-`machine.pool` — only the *pricing* pool is. Safety is real but rests on `min_out` +
-Raydium's internal checks rather than an explicit pin. Pinning the swap pool to
-`machine.pool` would make the swap and the price read provably the same market.
+**Finding B1 (hardening) — ✅ FIXED (HARDEN-1).** The swap `pool_state`/`observation`
+were not *required* to equal `machine.pool`/`machine.observation` — only the *pricing*
+pool was. Safety was real but rested on `min_out` + Raydium's internal checks rather
+than an explicit pin. The real swap backend now pins both:
+`require_keys_eq!(*pool_state.key, machine.pool)` and
+`require_keys_eq!(*observation.key, machine.observation)` (the pool's own vaults follow
+transitively — Raydium's `swap_v2` validates vault↔pool internally). The swap and the
+price read are now provably the same market; the three prior checks (CLMM owner-check,
+output-vault address, `min_out` floor) stay as defense in depth. IDL is byte-identical
+(internal constraints only). The mock-swap seam fills from a counterparty and never
+receives a `pool_state`, so — like the mock-gate IDL test — the pin is asserted on the
+shipped source by `redteam_compound_wrong_pool_rejected` and exercised live on devnet:
+- program upgrade (pinned build): [`3UxyUc…`](https://solscan.io/tx/3UxyUc8otj8eupGAumotJ2WZqZaUTyfSHGn3gTUvGRM9KsCYoti9H3v3jUAvz6b9pdnp8B2ipgWunaXhTpiDjN7G?cluster=devnet)
+- live compound through the pinned path (`dual-chip-1`, all recompute checks pass — machine SOL −1,721,161 exactly, CHIP received ≥ min_out, shares == `compound_mint_shares`): [`3RYo8h…`](https://solscan.io/tx/3RYo8hL8EjMBMYvC7t6KPVLpjFP6XfDYwtWAjgf1MPQWxXUFsSoHvB2QDuEMJRjXcY8SX3qHU1BS1vuFN5ssTxZS?cluster=devnet)
 
 ## 3. The SCALE-2 snapshot, adversarially
 
@@ -209,11 +227,15 @@ The indexer is the one non-chain-read path. Attacks (node tests in
   read-only (405 on non-GET), CORS-open on purpose (public devnet data), and does no
   filesystem access, so there is no injection or path traversal.
 
-**Finding B2 (hardening):** the ingest loop (`ingest.ts`, `for (const s of sigs)`) has
-no per-spin `try/catch`, so an exception during one spin's recompute aborts the whole
-pass. Not attacker-reachable today (the randomness/machine bytes are Switchboard-/
-program-owned and can't be forged), but a lying RPC could stall ingest. Mitigation:
-per-spin try/catch → store `unverifiable` → continue.
+**Finding B2 (hardening) — ✅ FIXED (HARDEN-1).** The ingest loop (`ingest.ts`,
+`for (const s of sigs)`) had no per-spin `try/catch`, so an exception during one spin's
+recompute aborted the whole pass. Not attacker-reachable today (the randomness/machine
+bytes are Switchboard-/program-owned and can't be forged), but a lying RPC could stall
+ingest. **Fix:** `ingestSettle` now wraps its recompute+store in `try/catch` and the
+ingest loop wraps the whole per-spin body (RPC gather included); on any throw the spin
+is stored `unverifiable` with the error detail and the pass continues to the next
+signature. Verified by `redteam: a spin whose recompute throws is stored unverifiable,
+and the next good spin still ingests`.
 
 **App (reasoned):** every state-changing action is a real on-chain tx the program
 validates, so a hostile machine (a curator can only create machines whose params pass
@@ -251,19 +273,21 @@ favors stayers). **Bucket C / cross-ref.**
 
 ```sh
 cd programs/house && cargo build-sbf --features mock-randomness,mock-price,mock-swap && cd ../..
-cargo test -p house --features mock-randomness,mock-price,mock-swap redteam_   # 15 on-chain attacks
-cd indexer && node --test test/redteam.test.ts                                 # 6 off-chain attacks
+cargo test -p house --features mock-randomness,mock-price,mock-swap redteam_   # 16 on-chain attacks
+cd indexer && node --test test/redteam.test.ts                                 # 7 off-chain attacks
 ```
 
 ## What surprised me
 
-- **The swap CPI's safety is real but *emergent*, not pinned.** The output vault is
-  address-checked, but the swap *pool* rides in as an unconstrained `remaining_account`;
-  it's safe only because `min_out` (priced off the machine's own pool) + Raydium's
-  internal checks box it in so mis-routing "can only help or fail." That's a correct
-  argument, but the safety lives in the interaction of three checks rather than one
-  explicit constraint — the kind of thing that quietly breaks if `min_out` is ever
-  loosened. Pinning the pool (B1) would make it robust to that.
+- **The swap CPI's safety was real but *emergent*, not pinned — now it's both.** The
+  output vault was address-checked, but the swap *pool* rode in as an unconstrained
+  `remaining_account`; it was safe only because `min_out` (priced off the machine's own
+  pool) + Raydium's internal checks boxed it in so mis-routing "can only help or fail."
+  A correct argument, but the safety lived in the interaction of three checks rather
+  than one explicit constraint — the kind of thing that quietly breaks if `min_out` is
+  ever loosened. HARDEN-1 pins the pool (B1: `pool_state == machine.pool`,
+  `observation == machine.observation`), so the swap and the price read are now provably
+  the same market and the emergent argument is a backstop, not the load-bearing wall.
 - **The conservative snapshot's flooring direction is load-bearing for security, not
   just fairness.** Because dust floors toward the pool, the dust-harvest round-trip is
   net-negative for the attacker *by construction* — a snapshot that rounded the other

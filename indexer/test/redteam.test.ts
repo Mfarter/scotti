@@ -86,3 +86,26 @@ test("redteam: hostile machine param yields empty result, not injection", () => 
   assert.equal(s.countSpins(), 0);
   s.close();
 });
+
+// (B2 / HARDEN-1) PER-SPIN RESILIENCE — one spin whose recompute THROWS (e.g. a lying
+// RPC hands back truncated dual-machine account data that fails to decode) must NOT
+// abort the batch: it is stored `unverifiable` with the error detail, and the pass
+// still ingests the NEXT good spin. (Availability: one poisoned spin can't blind the
+// whole feed — the exact gap REDTEAM-1 flagged as B2.)
+test("redteam: a spin whose recompute throws is stored unverifiable, and the next good spin still ingests", () => {
+  const s = new Store(":memory:");
+  // a real dual settle, but its machine account is truncated to 4 bytes → decodeDualMachine
+  // throws (out-of-range read) inside ingestSettle's recompute.
+  const dual = loadBundle("dual-win");
+  const poisoned: SettleBundle = { ...dual, machineData: Buffer.from([1, 2, 3, 4]) };
+  const bad = ingestSettle(s, poisoned, PROGRAM)!;
+  assert.equal(bad.status, "unverifiable", "the throwing spin is recorded unverifiable, not propagated as a crash");
+  assert.match(bad.detail, /ingest error/, "the error detail is captured on the stored row");
+  assert.equal(bad.isNew, true);
+  assert.equal(s.countSpins(), 1);
+  // the batch is NOT aborted: a following GOOD spin still ingests and verifies.
+  const good = ingestSettle(s, loadBundle("single-win"), PROGRAM)!;
+  assert.equal(good.status, "verified", "the next good spin ingests normally after the bad one");
+  assert.equal(s.countSpins(), 2);
+  s.close();
+});

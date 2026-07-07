@@ -164,7 +164,13 @@ removing only what SCALE-1 proved unfair — order moving money between identica
 requests *within* one epoch. Residual: a NEW spin committed *after* the snapshot that
 then jackpots can force a fill to carry to the next epoch (re-priced), but it never
 causes insolvency and never moves money between two requests filled within the epoch;
-it is strictly smaller than the original whole-jackpot unfairness.
+it is strictly smaller than the original whole-jackpot unfairness. A second, related
+residual is the *freeze-timing lever* (REDTEAM §3 / B3): the cranker chooses *when* in
+an epoch the first crank freezes the snapshot, so a cranker who is also a withdrawer
+can wait for a favorable intra-epoch pool state to raise (or crank early to lower) it —
+but the move is bounded per spin by the exposure cap (≤ ~1% of the pool) and any
+withdrawer can self-crank at the same moment (§1c), making it a shared timing option
+rather than a private edge, not insolvency and not a split between identical requests.
 
 ### 1c — starvation is not possible (self-heal)
 

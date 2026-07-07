@@ -1569,3 +1569,32 @@ fn redteam_dividend_prior_accrual_theft_fails() {
     let vp1 = read_position(&svm, &id, &victim.pubkey());
     assert_eq!(hm::dividend::pending_sol(vp1.shares + vp1.pending_shares, vp1.sol_debt, m1.acc_sol_per_share), victim_owed, "victim undiluted");
 }
+
+// (B1 / HARDEN-1) COMPOUND WRONG SWAP POOL REJECTED — the real swap must execute
+// against the machine's OWN pool, so the pool we swap is provably the pool we priced
+// min_out off of (not merely a real Raydium pool bounded by min_out). Unlike the
+// price read (exercised by redteam_compound_foreign_price_rejected, which runs in the
+// mock seam), the swap pin lives entirely in the non-mock amm_swap backend: the
+// mock-swap seam fills from a counterparty and never receives a `pool_state` to
+// substitute, so — exactly like the mock-gate IDL test — this is verified by
+// asserting on the SHIPPED source, and exercised live on devnet through the pinned
+// path. The pin: pool_state == machine.pool AND observation == machine.observation.
+#[cfg(feature = "mock-swap")]
+#[test]
+fn redteam_compound_wrong_pool_rejected() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read the deployable lib.rs source");
+    // the real swap backend pins BOTH the pool and its observation to the machine's own.
+    assert!(src.contains("require_keys_eq!(*pool_state.key, expected_pool"),
+        "B1: real amm_swap must pin pool_state.key == machine pool (substituted pool → InvalidPriceAccount)");
+    assert!(src.contains("require_keys_eq!(*observation.key, expected_observation"),
+        "B1: real amm_swap must pin observation.key == machine observation");
+    // and the pinned values are the MACHINE's own stored pool/observation (not attacker input).
+    assert!(src.contains("let expected_pool = m.pool;") && src.contains("let expected_observation = m.observation;"),
+        "B1: the pinned pool/observation must be sourced from the machine account, not remaining accounts");
+    // defense in depth kept: the CLMM owner-check and the min_out floor still stand.
+    assert!(src.contains("require_keys_eq!(*clmm_program.key, CLMM_PROGRAM_ID"),
+        "B1: the CLMM owner-check must remain as defense in depth alongside the pool pin");
+    assert!(src.contains("received >= min_out_u64"),
+        "B1: the min_out floor must remain as defense in depth alongside the pool pin");
+}

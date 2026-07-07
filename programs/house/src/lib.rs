@@ -980,6 +980,11 @@ pub mod house {
         let pending_before = hm::dividend::pending_sol(earning_before, pos.sol_debt, acc);
         let machine_id = m.machine_id;
         let bump = m.bump;
+        // HARDEN-1 (B1): the swap must execute against the machine's OWN pool, so the
+        // swap pool == the pool we priced min_out off of — not merely a pool bounded by
+        // min_out. Pass the stored pool/observation for the real path to pin by key.
+        let expected_pool = m.pool;
+        let expected_observation = m.observation;
 
         // THE swap (seam). Moves `amount` SOL out of the machine and `received`
         // tokens into the vault.
@@ -990,6 +995,7 @@ pub mod house {
             ctx.accounts.token_program.to_account_info(),
             ctx.remaining_accounts,
             amount, min_out_u64, spot, dec,
+            expected_pool, expected_observation,
         )?;
         require!(received >= min_out_u64, HouseError::PriceUnstable); // slippage guard
 
@@ -1253,6 +1259,8 @@ fn amm_swap_sol_to_token<'info>(
     _min_out: u64,
     spot_1e12: u128,
     token_decimals: u8,
+    _expected_pool: Pubkey,        // (B1) real path pins these; the mock uses a counterparty
+    _expected_observation: Pubkey,
 ) -> Result<u64> {
     require!(remaining.len() >= 2, HouseError::InvalidPriceAccount);
     let counterparty_token = &remaining[0];
@@ -1324,6 +1332,8 @@ fn amm_swap_sol_to_token<'info>(
     min_out: u64,
     _spot_1e12: u128,
     _token_decimals: u8,
+    expected_pool: Pubkey,
+    expected_observation: Pubkey,
 ) -> Result<u64> {
     // fixed prefix (13) + at least one tick array.
     require!(remaining.len() >= 14, HouseError::InvalidPriceAccount);
@@ -1343,9 +1353,17 @@ fn amm_swap_sol_to_token<'info>(
 
     // trust the REAL CLMM program only (owner-check pattern, spec §2): a look-alike
     // can't be the swap target. Output lands in `vault` (constrained to the
-    // machine's token_vault by the accounts struct) and must clear `min_out`
-    // priced off the machine's own pool TWAP — so mis-routing can only help or fail.
+    // machine's token_vault by the accounts struct) and must clear `min_out`.
     require_keys_eq!(*clmm_program.key, CLMM_PROGRAM_ID, HouseError::InvalidPriceAccount);
+    // HARDEN-1 (B1): PIN the swap pool + observation to the machine's OWN price source,
+    // so the pool we swap against is provably the pool we priced `min_out` off of — not
+    // merely a real Raydium pool bounded by min_out. The pool's own vaults are then
+    // transitively constrained (Raydium's swap_v2 checks vault↔pool_state internally),
+    // and `output_vault_mint` must equal the machine token (Raydium checks it against
+    // the output ATA = the machine vault). min_out + the CLMM owner-check stay as
+    // defense in depth. (REDTEAM.md §2 / B1.)
+    require_keys_eq!(*pool_state.key, expected_pool, HouseError::InvalidPriceAccount);
+    require_keys_eq!(*observation.key, expected_observation, HouseError::InvalidPriceAccount);
 
     let signer_seeds: &[&[u8]] = &[b"dual-machine", machine_id.as_ref(), std::slice::from_ref(&bump)];
 
