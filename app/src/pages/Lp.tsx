@@ -8,7 +8,7 @@ import { confirm } from "../lib/rpc.ts";
 import { SOL } from "../lib/constants.ts";
 import { fmtPctBp, fmtLamports } from "../lib/format.ts";
 import { Sol, Stat, TierBadge } from "../components/ui.tsx";
-import { Window, SectionHeader } from "../components/os/index.ts";
+import { Window, SectionHeader, StaleChip } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
 import { DualLpPanel } from "./DualLpPanel.tsx";
@@ -27,7 +27,7 @@ function parseSol(s: string): bigint | null {
 export function Lp() {
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
-  const { entries } = useFloor(8000);
+  const { entries, stale: floorStale, lastUpdated: floorUpdated } = useFloor(8000);
   const { entries: dualEntries } = useDualFloor(8000);
   const [selected, setSelected] = useState<string | null>(null);
   const [dualSel, setDualSel] = useState<string | null>(null);
@@ -87,6 +87,8 @@ export function Lp() {
             appreciation — never a promised rate.
           </span>} />
       </header>
+
+      {floorStale && entries && <div className="row"><StaleChip lastUpdated={floorUpdated} /></div>}
 
       <LpDashboard singles={entries} duals={dualEntries} activePk={activePk} onSelect={onSelectRow} onDeposit={onDepositRow} />
 

@@ -3,16 +3,17 @@ import { useFloor, useDualFloor, DualFloorEntry } from "../lib/hooks.ts";
 import { MachineStatus } from "../lib/status.ts";
 import { fmtPctBp, fmtSol, fmtTokens, heatColor, rtpHeat } from "../lib/format.ts";
 import { TierBadge, PriceChip } from "../components/ui.tsx";
-import { Window, SectionHeader, StatCell } from "../components/os/index.ts";
+import { Window, SectionHeader, StatCell, StaleChip } from "../components/os/index.ts";
 
 export function Floor() {
-  const { entries, error } = useFloor();
+  const { entries, error, stale, lastUpdated } = useFloor();
   const { entries: dualEntries } = useDualFloor();
   return (
     <div className="stack" style={{ gap: 24 }}>
       <header className="stack" style={{ gap: 14 }}>
         <SectionHeader kicker="The floor · live on devnet" title="Find the cold machine." titleSize={38}
           subline="Every machine's odds are a published function of its pool depth. Sorted by live realized RTP — the warmer the wash, the better the odds right now." />
+        {stale && entries && <div className="row"><StaleChip lastUpdated={lastUpdated} /></div>}
         <div className="note warn" style={{ maxWidth: 720 }}>
           <b>The mechanic:</b> cold, shallow pools pay closer to the 97% ceiling; deep pools drop to
           the 92% floor but unlock the bigger-jackpot (500×) tier. Same house edge — different odds
@@ -20,7 +21,9 @@ export function Floor() {
         </div>
       </header>
 
-      {error && <div className="note bad">Couldn't reach the RPC: {error}. Set <code>VITE_RPC_URL</code> to a devnet endpoint.</div>}
+      {/* Full-panel error only on a cold start (no data). Once we have a list, a
+          rate-limit shows the amber chip above and keeps the pools rendered. */}
+      {error && !entries && <div className="note bad">Couldn't reach the RPC: {error}. Set <code>VITE_RPC_URL</code> to a devnet endpoint.</div>}
       {!entries && !error && <div className="muted spin-anim">Reading the floor…</div>}
       {entries && entries.length === 0 && <div className="note">No machines found for this program on devnet.</div>}
 

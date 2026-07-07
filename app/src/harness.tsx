@@ -33,6 +33,7 @@ import type { MachineStatus } from "./lib/status.ts";
 import type { SpinResult } from "./lib/spin.ts";
 import type { DualStatus } from "./lib/dualstatus.ts";
 import type { DualSpinResult } from "./lib/dualspin.ts";
+import { floorStore } from "./lib/hooks.ts";
 import type { FloorEntry, DualFloorEntry } from "./lib/hooks.ts";
 
 // ---- real devnet accounts (they still exist — see the UI-2 diagnostic) ----
@@ -102,6 +103,7 @@ function fakeSpins(machine: string, dual: boolean) {
     commitSig: null, priceAtCommit1e12: dual ? "180000000000000" : null, verifyStatus, verifyDetail: null,
   }));
 }
+const SCENE = new URLSearchParams(location.search).get("scene") ?? "floor";
 window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   if (INDEXER_URL && url.startsWith(INDEXER_URL)) {
@@ -165,6 +167,13 @@ const FIX_DUALS: DualFloorEntry[] = [{
 }];
 const statusOf = (pk: string) => FIX_SINGLES.find((e) => e.pubkey.toBase58() === pk)?.status;
 const dualOf = (pk: string) => FIX_DUALS.find((e) => e.pubkey.toBase58() === pk)?.status;
+
+// Drive the floor store into the degraded states deterministically (the store's
+// own poll is frozen so it can't overwrite these). "stale" seeds last-good pools
+// then marks a failure → amber chip over intact pools. "cold" only marks the
+// error with no data → the full-panel cold-start error.
+if (SCENE === "floor-stale") { floorStore.seed({ singles: FIX_SINGLES, duals: [] }); floorStore.markError("429 Too Many Requests"); floorStore.freeze(); }
+if (SCENE === "floor-cold") { floorStore.markError("429 Too Many Requests"); floorStore.freeze(); }
 
 /** Mirrors the deposit modal Lp/DualLpPanel render, using the REAL exported
  * disclosure components (the modal's tx logic lives in those files, verified by
@@ -238,6 +247,8 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
   dual: { path: `/dual/${DUAL}`, el: <Routes><Route path="/dual/:pubkey" element={<DualMachinePage />} /></Routes> },
   lp: { path: "/lp", el: <Routes><Route path="/lp" element={<Lp />} /></Routes> },
   dashboard: { path: "/", el: <DashboardScene /> },
+  "floor-stale": { path: "/", el: <Routes><Route path="/" element={<Floor />} /></Routes> },
+  "floor-cold": { path: "/", el: <Routes><Route path="/" element={<Floor />} /></Routes> },
   "machine-spin": { path: "/", el: <MidSpinConsole /> },
   "machine-outcome": { path: "/", el: (
     <div className="stack" style={{ gap: 22 }}>

@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, Link } from "react-router-dom";
-import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { SessionWidget } from "../SessionWidget.tsx";
 import { useSession } from "../SessionProvider.tsx";
+import { useSlot } from "../../lib/hooks.ts";
 import { shortKey, fmtSol } from "../../lib/format.ts";
 import { Tile } from "./controls.tsx";
 
@@ -51,18 +52,8 @@ export function SysBar() {
  * live slot and (when a session is funded) the chip balance on the right. Values
  * are read from the same connection/session the app already uses — nothing faked. */
 export function StatusBar() {
-  const { connection } = useConnection();
   const { active, balance } = useSession();
-  const [slot, setSlot] = useState<number | null>(null);
-  const alive = useRef(true);
-
-  useEffect(() => {
-    alive.current = true;
-    const tick = () => connection.getSlot("confirmed").then((s) => { if (alive.current) setSlot(s); }).catch(() => {});
-    tick();
-    const t = setInterval(tick, 8000);
-    return () => { alive.current = false; clearInterval(t); };
-  }, [connection]);
+  const slot = useSlot();   // shared slot store (one poll for the whole app)
 
   return (
     <footer className="os-statusbar" role="contentinfo">
