@@ -194,7 +194,7 @@ export function DualLpPanel() {
             </Window>
 
             <Window icon="◈" title="What you're taking on" bodyStyle={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div className="note bad stack" style={{ gap: 4 }}>
+              <div className="note warn stack" style={{ gap: 4 }}>
                 <span style={{ fontWeight: 800 }}>Token-denominated risk</span>
                 <span style={{ fontSize: 13 }}>
                   Your position is denominated in <b>CHIP</b>, not SOL. On top of ordinary bankroll variance (a

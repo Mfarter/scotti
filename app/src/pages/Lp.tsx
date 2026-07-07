@@ -210,7 +210,7 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
         </div>
       </div>
 
-      <div className="note bad stack" style={{ gap: 4 }}>
+      <div className="note warn stack" style={{ gap: 4 }}>
         <span style={{ fontWeight: 800 }}>Variance, honestly</span>
         <span style={{ fontSize: 13.5 }}>
           A single jackpot pays up to <b>{maxDrawdownPct}% of the pool</b> (the per-spin exposure cap).

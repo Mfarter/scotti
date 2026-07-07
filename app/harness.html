@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <title>SCOTTI OS — dev harness (not shipped)</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- DEV-ONLY screenshot harness. Not referenced by index.html, so `vite build`
+         (whose only input is index.html) never bundles it into production. -->
+    <script type="module" src="/src/harness.tsx"></script>
+  </body>
+</html>

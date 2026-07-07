@@ -159,7 +159,7 @@ export function MachinePage() {
   );
 }
 
-function Outcome({ r, status }: { r: SpinResult; status: MachineStatus }) {
+export function Outcome({ r, status }: { r: SpinResult; status: MachineStatus }) {
   const tier = r.tierIsDeep ? DEEP : SHALLOW;
   const baseBp = payoutBp(tier, r.reels);
   const baseMult = Number(baseBp) / Number(BP);

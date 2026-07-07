@@ -23,7 +23,7 @@ const VERIFY_STYLE: Record<VerifyStatus, { color: string; label: string; title: 
   verified: { color: "var(--sage-ink)", label: "✓ verified", title: "recompute from chain matched the paid amount" },
   partial: { color: "var(--amber-ink)", label: "~ partial", title: "reels + payout verified from chain; a dual price aged out of the observation ring" },
   unverifiable: { color: "var(--ink-faint)", label: "? unverifiable", title: "randomness account closed or commit aged out of RPC history — stored honestly as such" },
-  mismatch: { color: "var(--amber-ink)", label: "✗ mismatch", title: "paid amount did NOT recompute — investigate" },
+  mismatch: { color: "var(--rose-ink)", label: "✗ mismatch", title: "paid amount did NOT recompute — investigate" },
 };
 export function VerifyBadge({ status, title }: { status: VerifyStatus; title?: string }) {
   const s = VERIFY_STYLE[status];

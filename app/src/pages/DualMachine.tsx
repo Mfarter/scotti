@@ -200,7 +200,7 @@ function refFrom(r: DualSpinResult, status: DualStatus) {
   };
 }
 
-function DualOutcome({ r, status }: { r: DualSpinResult; status: DualStatus }) {
+export function DualOutcome({ r, status }: { r: DualSpinResult; status: DualStatus }) {
   const tier = r.tierIsDeep ? DEEP : SHALLOW;
   const baseBp = payoutBp(tier, r.reels);
   const baseMult = Number(baseBp) / Number(BP);

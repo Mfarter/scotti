@@ -12,8 +12,9 @@
   --ink2:  #856070;   /* muted plum — secondary text / labels */
 
   /* ---- status colours (desaturated; state only, never decoration) ---- */
-  --sage:      #9cc7b2;   --sage-ink:  #2f5546;   /* LIVE / connected / verified */
-  --amber:     #e6c48a;   --amber-ink: #7a5410;   /* STALE / warning / unverifiable */
+  --sage:      #9cc7b2;   --sage-ink:  #2f5546;   /* OK / LIVE / connected / verified */
+  --amber:     #e6c48a;   --amber-ink: #7a5410;   /* WARN / stale / partial / unverifiable */
+  --rose:      #d98a9a;   --rose-ink:  #9e3648;   /* ERROR / failure / mismatch — ONLY true errors */
 
   /* ---- ink-derived hairlines & fills ---- */
   --ink-faint: #a78a99;                    /* tertiary text */
@@ -23,12 +24,13 @@
   --wash-peach: rgba(248, 216, 198, 0.40);
   --wash-sage:  rgba(156, 199, 178, 0.22);
   --wash-amber: rgba(230, 196, 138, 0.22);
+  --wash-rose:  rgba(217, 138, 154, 0.20);
 
   /* ---- back-compat aliases (older inline var refs resolve on-palette) ---- */
   --gold: #b06a94; --gold-deep: #8f5277;   /* primary plum-pink accent */
   --neon: #b06a94; --neon-dim: #8f5277;    /* secondary accent (same family) */
   --good: var(--sage-ink);
-  --bad:  var(--amber-ink);                /* no red in the palette — alarms are amber */
+  --bad:  var(--rose-ink);                 /* true errors use the rose status tone */
   --ink-dim: var(--ink2);
 
   /* ---- radii ---- */

@@ -1,10 +1,21 @@
-import { Outlet, Link } from "react-router-dom";
+import { Outlet, Link, useLocation } from "react-router-dom";
 import { Banner } from "./Banner.tsx";
 import { SysBar, StatusBar } from "./os/index.ts";
 
+// Route → background tint (pure presentation; the Remilia pink-vs-peach move, in
+// palette-family tonal leans). Falls back to pink for any unmapped route.
+function bgForPath(pathname: string): "pink" | "peach" | "paper" {
+  if (pathname.startsWith("/lp")) return "peach";
+  if (pathname.startsWith("/fair")) return "paper";
+  if (pathname.startsWith("/machine") || pathname.startsWith("/dual")) return "pink";
+  return "pink"; // Floor + default
+}
+
 export function Layout() {
+  const { pathname } = useLocation();
   return (
-    <div className="os-shell">
+    <div className="os-shell" data-bg={bgForPath(pathname)}>
+      <div className="os-bg" aria-hidden />
       <Banner />
       <SysBar />
       <main className="wrap page">
