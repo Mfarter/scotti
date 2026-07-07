@@ -1,21 +1,22 @@
 // The pools-dashboard header of the Liquidity page (UI-3): three stat Windows
 // with sparklines + a search box + a machine table (single and dual in one list).
 // Pure presentation over useDashboard's client-side aggregation; row selection
-// drives the existing per-machine detail below — it restructures the selector, it
-// does not touch the deposit/withdraw/disclosure flow. No APR anywhere: the drift
-// column is trailing share-price drift, and Scotti still promises no rate.
+// drives the existing per-machine detail below, and each row's Deposit button opens
+// the machine's deposit modal (the transaction/validation logic lives unchanged in
+// Lp/DualLpPanel). The APR column is trailing REALIZED share-price drift annualized
+// from the measured window — qualified as such and never a promised rate.
 import { useState } from "react";
 import { FloorEntry, DualFloorEntry } from "../lib/hooks.ts";
 import { useDashboard, DashRow, Pt } from "../lib/dashboard.ts";
 import { fmtSol, fmtTokens } from "../lib/format.ts";
 import { TierBadge, PriceChip } from "../components/ui.tsx";
-import { Window, StatusChip } from "../components/os/index.ts";
+import { Window, StatusChip, GlossButton } from "../components/os/index.ts";
 import { Sparkline } from "../components/Indexed.tsx";
 
 const signedColor = (x: number | bigint): string =>
   x < 0 ? "var(--rose-ink)" : x > 0 ? "var(--sage-ink)" : "var(--ink)";
 const signedSol = (x: bigint): string => `${x > 0n ? "+" : ""}${fmtSol(x, 4)}`;
-const signedPct = (x: number): string => `${x >= 0 ? "+" : ""}${x.toFixed(2)}%`;
+const signedApr = (x: number): string => `${x >= 0 ? "+" : ""}${x.toFixed(1)}%`;
 
 /** deferred marker — the honest "needs the indexer" placeholder (never faked). */
 function Deferred({ compact }: { compact?: boolean }) {
@@ -35,13 +36,13 @@ function StatCard({ title, icon, big, bigColor, sub, spark, sparkStroke, indexer
   );
 }
 
-const GRID = "minmax(190px, 2.2fr) 1.3fr 1fr 1fr 1fr 22px";
+const GRID = "minmax(180px, 2.1fr) 1.2fr 0.9fr 0.9fr 1fr 108px 22px";
 
 function Cell({ children, align = "left", style }: { children: React.ReactNode; align?: "left" | "right"; style?: React.CSSProperties }) {
   return <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", alignItems: align === "right" ? "flex-end" : "flex-start", gap: 3, textAlign: align, ...style }}>{children}</div>;
 }
 
-function Row({ r, active, onSelect }: { r: DashRow; active: boolean; onSelect: () => void }) {
+function Row({ r, active, onSelect, onDeposit }: { r: DashRow; active: boolean; onSelect: () => void; onDeposit: () => void }) {
   const dec = r.liqTokenDecimals ?? 9;
   return (
     <div role="button" tabIndex={0} onClick={onSelect} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(); } }}
@@ -69,17 +70,22 @@ function Row({ r, active, onSelect }: { r: DashRow; active: boolean; onSelect: (
       <Cell align="right">{r.take24h !== null
         ? <span className="mono" style={{ color: signedColor(r.take24h) }}>{signedSol(r.take24h)}{r.takeGap ? <span className="faint" title="a dual spin lacked a recorded price; excluded from take">*</span> : null}</span>
         : <Deferred compact />}</Cell>
-      <Cell align="right">{r.drift7dPct !== null
-        ? <span className="mono" style={{ color: signedColor(r.drift7dPct) }}>{signedPct(r.drift7dPct)}</span>
+      <Cell align="right">{r.aprPct !== null
+        ? <span className="mono" style={{ color: signedColor(r.aprPct) }}>{signedApr(r.aprPct)}{r.windowDays !== null && r.windowDays < 3
+            ? <span title="short window — treat as noise" style={{ color: "var(--amber-ink)", cursor: "help", marginLeft: 2 }}>*</span> : null}</span>
         : <Deferred compact />}</Cell>
+      <Cell align="right">
+        <GlossButton sm variant={r.kind === "single" ? "pink" : "peach"} onClick={(e) => { e.stopPropagation(); onDeposit(); }}>Deposit</GlossButton>
+      </Cell>
       <Cell align="right"><span className="faint" style={{ fontSize: 16 }}>›</span></Cell>
     </div>
   );
 }
 
-export function LpDashboard({ singles, duals, activePk, onSelect }: {
+export function LpDashboard({ singles, duals, activePk, onSelect, onDeposit }: {
   singles: FloorEntry[] | null; duals: DualFloorEntry[] | null;
   activePk: string | null; onSelect: (pk: string, kind: "single" | "dual") => void;
+  onDeposit: (pk: string, kind: "single" | "dual") => void;
 }) {
   const d = useDashboard(singles, duals);
   const [q, setQ] = useState("");
@@ -114,11 +120,12 @@ export function LpDashboard({ singles, duals, activePk, onSelect }: {
               <span className="tag" style={{ textAlign: "right" }}>liquidity</span>
               <span className="tag" style={{ textAlign: "right" }}>24h vol</span>
               <span className="tag" style={{ textAlign: "right" }}>24h take</span>
-              <span className="tag" style={{ textAlign: "right" }}>7d drift</span>
+              <span className="tag" title="annualized from measured share-price history — not a promised rate" style={{ textAlign: "right", cursor: "help" }}>apr <span className="faint" style={{ textTransform: "none", letterSpacing: 0 }}>(trailing, realized)</span></span>
+              <span className="tag" style={{ textAlign: "right" }}>deposit</span>
               <span />
             </div>
             {!singles && !duals && <div className="muted spin-anim" style={{ padding: "14px" }}>Reading the floor…</div>}
-            {rows.map((r) => <Row key={r.pubkey} r={r} active={r.pubkey === activePk} onSelect={() => onSelect(r.pubkey, r.kind)} />)}
+            {rows.map((r) => <Row key={r.pubkey} r={r} active={r.pubkey === activePk} onSelect={() => onSelect(r.pubkey, r.kind)} onDeposit={() => onDeposit(r.pubkey, r.kind)} />)}
             {(singles || duals) && rows.length === 0 && <div className="muted" style={{ padding: "14px" }}>No machines match “{q}”.</div>}
           </div>
         </div>

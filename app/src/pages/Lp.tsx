@@ -7,7 +7,7 @@ import { ixCancelWithdraw, ixLpDeposit, ixProcessWithdrawals, ixRequestWithdraw 
 import { confirm } from "../lib/rpc.ts";
 import { SOL } from "../lib/constants.ts";
 import { fmtPctBp, fmtLamports } from "../lib/format.ts";
-import { Sol, Stat } from "../components/ui.tsx";
+import { Sol, Stat, TierBadge } from "../components/ui.tsx";
 import { Window, SectionHeader } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
@@ -32,6 +32,8 @@ export function Lp() {
   const [selected, setSelected] = useState<string | null>(null);
   const [dualSel, setDualSel] = useState<string | null>(null);
   const [activeRow, setActiveRow] = useState<string | null>(null);
+  const [singleDepositOpen, setSingleDepositOpen] = useState(false);
+  const [dualDepositNonce, setDualDepositNonce] = useState(0);
   const machine = selected ?? entries?.[0]?.pubkey.toBase58() ?? null;
   const activePk = activeRow ?? machine;
 
@@ -39,6 +41,15 @@ export function Lp() {
     setActiveRow(pk);
     if (kind === "single") { setSelected(pk); scrollToId("lp-single-detail"); }
     else { setDualSel(pk); scrollToId("lp-dual-detail"); }
+  }
+
+  // A row's Deposit button selects that machine and opens its deposit modal. The
+  // dual modal lives in DualLpPanel (it owns the token-mint/vault status), so we
+  // trigger it with a bumped nonce; the tx/validation logic is unchanged either way.
+  function onDepositRow(pk: string, kind: "single" | "dual") {
+    setActiveRow(pk);
+    if (kind === "single") { setSelected(pk); setSingleDepositOpen(true); }
+    else { setDualSel(pk); setDualDepositNonce((n) => n + 1); }
   }
 
   const { status, refresh: refreshM } = useMachine(machine ?? undefined, 6000);
@@ -49,16 +60,18 @@ export function Lp() {
   const [msg, setMsg] = useState<{ kind: "good" | "bad"; text: string } | null>(null);
   const [crankAddr, setCrankAddr] = useState("");
 
-  async function send(ixLabel: string, buildIx: () => Transaction) {
-    if (!publicKey) return;
+  async function send(ixLabel: string, buildIx: () => Transaction): Promise<boolean> {
+    if (!publicKey) return false;
     setBusy(ixLabel); setMsg(null);
     try {
       const sig = await sendTransaction(buildIx(), connection);
       await confirm(connection, sig, ixLabel);
       setMsg({ kind: "good", text: `${ixLabel} confirmed` });
       await Promise.all([refreshM(), refreshLp()]);
+      return true;
     } catch (e) {
       setMsg({ kind: "bad", text: `${ixLabel} failed: ${(e as Error).message}` });
+      return false;
     } finally { setBusy(null); }
   }
 
@@ -75,7 +88,7 @@ export function Lp() {
           </span>} />
       </header>
 
-      <LpDashboard singles={entries} duals={dualEntries} activePk={activePk} onSelect={onSelectRow} />
+      <LpDashboard singles={entries} duals={dualEntries} activePk={activePk} onSelect={onSelectRow} onDeposit={onDepositRow} />
 
       {!connected && (
         <div className="card pad stack" style={{ gap: 12, alignItems: "flex-start" }}>
@@ -114,21 +127,9 @@ export function Lp() {
 
               {connected && (
                 <>
-                  <div className="hr" />
-                  <div className="stack" style={{ gap: 8 }}>
-                    <span className="tag">deposit</span>
-                    <div className="row" style={{ gap: 8 }}>
-                      <input className="input" value={depositSol} onChange={(e) => setDepositSol(e.target.value)} inputMode="decimal" style={{ maxWidth: 160 }} />
-                      <span className="faint">SOL</span>
-                      <button className="btn gold" disabled={busy !== null || !parseSol(depositSol)} onClick={() => {
-                        const amt = parseSol(depositSol); if (!amt) return;
-                        send("deposit", () => new Transaction().add(ixLpDeposit(m, publicKey!, amt)));
-                      }}>{busy === "deposit" ? "…" : "Deposit"}</button>
-                    </div>
-                  </div>
-
                   {lp?.exists && lp.shares > 0n && (
                     <div className="stack" style={{ gap: 8 }}>
+                      <div className="hr" />
                       <span className="tag">request withdrawal (epoch-gated)</span>
                       <div className="faint" style={{ fontSize: 12 }}>
                         Paid at the epoch's conservative price snapshot — the pool valued as if every
@@ -180,7 +181,61 @@ export function Lp() {
       )}
 
       <div className="hr" style={{ margin: "8px 0" }} />
-      <div id="lp-dual-detail"><DualLpPanel selectedPk={dualSel} hideSelector /></div>
+      <div id="lp-dual-detail"><DualLpPanel selectedPk={dualSel} hideSelector openDepositNonce={dualDepositNonce} /></div>
+
+      {/* Deposit modal — the single-asset deposit entry point, relocated from the
+          position Window. The transaction/validation logic below is moved verbatim. */}
+      {singleDepositOpen && status && (
+        <div className="modal-backdrop" onClick={() => setSingleDepositOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="spread" style={{ marginBottom: 10 }}>
+              <h3 style={{ fontSize: 20 }}>Deposit — {status.name}</h3>
+              <TierBadge tier={status.tier} topMult={status.topMult} paused={status.paused} />
+            </div>
+            {!connected ? (
+              <div className="stack" style={{ gap: 10 }}>
+                <div className="muted">Connect a devnet wallet to deposit and manage a position.</div>
+                <WalletMultiButton />
+              </div>
+            ) : (
+              <div className="stack" style={{ gap: 12 }}>
+                <div className="stack" style={{ gap: 8 }}>
+                  <span className="tag">deposit</span>
+                  <div className="row" style={{ gap: 8 }}>
+                    <input className="input" value={depositSol} onChange={(e) => setDepositSol(e.target.value)} inputMode="decimal" style={{ maxWidth: 160 }} />
+                    <span className="faint">SOL</span>
+                    <button className="btn gold" disabled={busy !== null || !parseSol(depositSol)} onClick={async () => {
+                      const amt = parseSol(depositSol); if (!amt || !m) return;
+                      if (await send("deposit", () => new Transaction().add(ixLpDeposit(m, publicKey!, amt)))) setSingleDepositOpen(false);
+                    }}>{busy === "deposit" ? "…" : "Deposit"}</button>
+                  </div>
+                </div>
+                <SingleVarianceNote status={status} />
+                {msg && msg.kind === "bad" && <div className="note bad">{msg.text}</div>}
+              </div>
+            )}
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="btn ghost" onClick={() => setSingleDepositOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The material single-asset risk disclosure — one source, rendered both in the
+ * "What to expect" Window and (so it is not orphaned) in the deposit modal. */
+export function SingleVarianceNote({ status }: { status: import("../lib/status.ts").MachineStatus }) {
+  const maxDrawdownPct = Number(status.maxExposureBp) / 100;
+  return (
+    <div className="note warn stack" style={{ gap: 4 }}>
+      <span style={{ fontWeight: 800 }}>Variance, honestly</span>
+      <span style={{ fontSize: 13.5 }}>
+        A single jackpot pays up to <b>{maxDrawdownPct}% of the pool</b> (the per-spin exposure cap).
+        Expect whole-percent drawdowns when the {status.topMult}× top line lands. This is a devnet demo — the
+        expected return is <b>not an APY</b>; it is share-price appreciation with real drawdown risk.
+      </span>
     </div>
   );
 }
@@ -193,7 +248,6 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
   const dailyEdgeSol = vol * (Number(edgeBp) / 10_000);
   const dailyPct = pool > 0 ? (dailyEdgeSol / pool) * 100 : 0;
   const yearlyPct = dailyPct * 365;
-  const maxDrawdownPct = Number(status.maxExposureBp) / 100; // one jackpot ≤ this % of pool
 
   return (
     <Window icon="◇" title="What to expect" bodyStyle={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -220,14 +274,7 @@ function Yield({ status }: { status: import("../lib/status.ts").MachineStatus })
         </div>
       </div>
 
-      <div className="note warn stack" style={{ gap: 4 }}>
-        <span style={{ fontWeight: 800 }}>Variance, honestly</span>
-        <span style={{ fontSize: 13.5 }}>
-          A single jackpot pays up to <b>{maxDrawdownPct}% of the pool</b> (the per-spin exposure cap).
-          Expect whole-percent drawdowns when the {status.topMult}× top line lands. This is a devnet demo — the
-          expected return is <b>not an APY</b>; it is share-price appreciation with real drawdown risk.
-        </span>
-      </div>
+      <SingleVarianceNote status={status} />
 
       {indexerEnabled()
         ? <><div className="hr" /><SharePriceChart machine={status.machine} kind="single" /></>

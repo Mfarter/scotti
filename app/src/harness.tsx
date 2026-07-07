@@ -22,8 +22,10 @@ import { SessionProvider } from "./components/SessionProvider.tsx";
 import { Floor } from "./pages/Floor.tsx";
 import { MachinePage, Outcome } from "./pages/Machine.tsx";
 import { DualMachinePage, DualOutcome } from "./pages/DualMachine.tsx";
-import { Lp } from "./pages/Lp.tsx";
-import { Reels } from "./components/ui.tsx";
+import { Lp, SingleVarianceNote } from "./pages/Lp.tsx";
+import { PriceFreeNote, TokenRiskNote } from "./pages/DualLpPanel.tsx";
+import { LpDashboard } from "./pages/LpDashboard.tsx";
+import { Reels, TierBadge, PriceChip } from "./components/ui.tsx";
 import { Window } from "./components/os/index.ts";
 import { SharePriceChart, RecentSpins } from "./components/Indexed.tsx";
 import { JACKPOT, SEVEN, BELL, BAR, CHERRY, BLANK } from "./lib/housemath.ts";
@@ -31,6 +33,7 @@ import type { MachineStatus } from "./lib/status.ts";
 import type { SpinResult } from "./lib/spin.ts";
 import type { DualStatus } from "./lib/dualstatus.ts";
 import type { DualSpinResult } from "./lib/dualspin.ts";
+import type { FloorEntry, DualFloorEntry } from "./lib/hooks.ts";
 
 // ---- real devnet accounts (they still exist — see the UI-2 diagnostic) ----
 const SINGLE = "9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1";
@@ -52,11 +55,19 @@ const fakeWallet = {
 // ---- indexer fetch shim: fabricate /price + /spins so the REAL chart/feed render. ----
 const realFetch = window.fetch.bind(window);
 function jsonResponse(obj: unknown) { return new Response(JSON.stringify(obj), { status: 200, headers: { "content-type": "application/json" } }); }
+// Per-machine share-price profile so the APR column shows a positive, a negative,
+// and a short-window (annualizes to noise) case across the real devnet machines.
+function profile(pk: string): { dir: number; hours: number } {
+  if (pk.startsWith("4Tb4")) return { dir: -1, hours: 160 };  // negative APR, ~6.6d window
+  if (pk.startsWith("6zsj")) return { dir: +1, hours: 20 };   // short window (<3d) → APR is noise
+  return { dir: +1, hours: 170 };                             // positive APR, ~7d window (9Ns1 + dual)
+}
 function fakePriceSeries(machine: string, dual: boolean) {
   const now = Math.floor(Date.now() / 1000);
-  const series = Array.from({ length: 34 }, (_, i) => {
-    const t = now - (34 - i) * 3600;
-    const drift = 1 + i * 0.0025 + Math.sin(i / 3) * 0.004;
+  const { dir, hours } = profile(machine);
+  const series = Array.from({ length: hours }, (_, i) => {
+    const t = now - (hours - 1 - i) * 3600;
+    const drift = 1 + dir * (i * 0.0022) + Math.sin(i / 4) * 0.003;
     return {
       t, slot: 130000 + i * 40,
       sharePrice1e12: dual ? null : String(Math.round(1_000_000_000_000 * drift)),
@@ -94,10 +105,10 @@ function fakeSpins(machine: string, dual: boolean) {
 window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   if (INDEXER_URL && url.startsWith(INDEXER_URL)) {
-    const dual = url.includes(DUAL);
-    const machine = dual ? DUAL : SINGLE;
-    if (url.includes("/price")) return Promise.resolve(jsonResponse(fakePriceSeries(machine, dual)));
-    if (url.includes("/spins")) return Promise.resolve(jsonResponse(fakeSpins(machine, dual)));
+    const pk = url.match(/\/machines\/([^/?]+)/)?.[1] ?? SINGLE;
+    const dual = pk === DUAL;
+    if (url.includes("/price")) return Promise.resolve(jsonResponse(fakePriceSeries(pk, dual)));
+    if (url.includes("/spins")) return Promise.resolve(jsonResponse(fakeSpins(pk, dual)));
     return Promise.resolve(jsonResponse({ ok: true }));
   }
   return realFetch(input, init);
@@ -136,6 +147,73 @@ const dualWin: DualSpinResult = {
   player: OWNER.toBase58(), playerChip: "HARNESSchip" + "1".repeat(30), machine: DUAL, pool: "HARNESSpool" + "1".repeat(30), observation: "HARNESSobs" + "1".repeat(30),
 };
 
+// ---- fabricated floor for the dashboard scene (keeps capture off the flaky
+// public RPC; the mock indexer keys APR profiles by these real pubkeys). ----
+const SINGLE2 = "4Tb4cW8vn4P1aR4Wwnfd1pLZ7hF942FmrLaKWPogzmeD"; // negative-APR profile
+const SINGLE3 = "6zsjba9sbx7v8fPrnvyrUDoL1dDaaWcXaigq9swsF2uC"; // short-window profile
+const mkSingle = (pk: string, name: string, tier: string, topMult: number, poolValue: bigint): FloorEntry =>
+  ({ pubkey: new PublicKey(pk), status: { ...fixStatus, machine: pk, name, tier, topMult, poolValue } as MachineStatus });
+const FIX_SINGLES: FloorEntry[] = [
+  mkSingle(SINGLE, "house-demo-1", "shallow", 50, 999_000_000n),
+  mkSingle(SINGLE2, "Cold Comfort", "shallow", 50, 300_000_000n),
+  mkSingle(SINGLE3, "Leviathan", "deep", 500, 1_200_000_000n),
+];
+const FIX_DUALS: DualFloorEntry[] = [{
+  pubkey: new PublicKey(DUAL),
+  status: { machine: DUAL, name: "dual-chip-1", tokenBalance: 17_997_000_000_000n, tokenDecimals: 9, tokenValueLamports: null,
+    price: { kind: "STALE", label: "STALE", reason: "the price feed went quiet" }, tier: "—", topMult: 0 } as unknown as DualStatus,
+}];
+const statusOf = (pk: string) => FIX_SINGLES.find((e) => e.pubkey.toBase58() === pk)?.status;
+const dualOf = (pk: string) => FIX_DUALS.find((e) => e.pubkey.toBase58() === pk)?.status;
+
+/** Mirrors the deposit modal Lp/DualLpPanel render, using the REAL exported
+ * disclosure components (the modal's tx logic lives in those files, verified by
+ * diff — this only reproduces the modal visual off-RPC for the screenshot). */
+function HarnessDepositModal({ target, onClose }: { target: { pk: string; kind: "single" | "dual" }; onClose: () => void }) {
+  const single = target.kind === "single";
+  const s = single ? statusOf(target.pk) : undefined;
+  const d = single ? undefined : dualOf(target.pk);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="spread" style={{ marginBottom: 10 }}>
+          <h3 style={{ fontSize: 20 }}>{single ? `Deposit — ${s?.name}` : `Deposit CHIP — ${d?.name}`}</h3>
+          {single && s ? <TierBadge tier={s.tier} topMult={s.topMult} paused={s.paused} />
+            : d ? <PriceChip kind={d.price.kind} label={d.price.label} title={d.price.reason} /> : null}
+        </div>
+        <div className="stack" style={{ gap: 12 }}>
+          <div className="stack" style={{ gap: single ? 8 : 6 }}>
+            <span className="tag">{single ? "deposit" : <>deposit CHIP <span className="faint">· price-free</span></>}</span>
+            <div className="row" style={{ gap: 8 }}>
+              <input className="input" defaultValue={single ? "0.05" : "100"} style={{ maxWidth: single ? 160 : 150 }} />
+              <span className="faint">{single ? "SOL" : "CHIP"}</span>
+              <button className="btn gold">Deposit</button>
+            </div>
+            {!single && <PriceFreeNote />}
+          </div>
+          {single && s ? <SingleVarianceNote status={s} /> : <TokenRiskNote />}
+        </div>
+        <div className="row" style={{ justifyContent: "flex-end", marginTop: 14 }}>
+          <button className="btn ghost" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DashboardScene() {
+  const [modal, setModal] = React.useState<{ pk: string; kind: "single" | "dual" } | null>(null);
+  const [active, setActive] = React.useState<string>(SINGLE);
+  return (
+    <div className="stack" style={{ gap: 22 }}>
+      <h1 style={{ fontSize: 30 }}>Liquidity — pools dashboard</h1>
+      <LpDashboard singles={FIX_SINGLES} duals={FIX_DUALS} activePk={active}
+        onSelect={(pk) => setActive(pk)} onDeposit={(pk, kind) => setModal({ pk, kind })} />
+      {modal && <HarnessDepositModal target={modal} onClose={() => setModal(null)} />}
+    </div>
+  );
+}
+
 // ---- scenes ----
 function MidSpinConsole() {
   return (
@@ -159,6 +237,7 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
   machine: { path: `/machine/${SINGLE}`, el: <Routes><Route path="/machine/:pubkey" element={<MachinePage />} /></Routes> },
   dual: { path: `/dual/${DUAL}`, el: <Routes><Route path="/dual/:pubkey" element={<DualMachinePage />} /></Routes> },
   lp: { path: "/lp", el: <Routes><Route path="/lp" element={<Lp />} /></Routes> },
+  dashboard: { path: "/", el: <DashboardScene /> },
   "machine-spin": { path: "/", el: <MidSpinConsole /> },
   "machine-outcome": { path: "/", el: (
     <div className="stack" style={{ gap: 22 }}>
@@ -188,7 +267,7 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
 function App() {
   const scene = new URLSearchParams(location.search).get("scene") ?? "floor";
   const s = SCENES[scene] ?? SCENES.floor;
-  const bg = scene === "lp" ? "peach" : "pink";
+  const bg = scene === "lp" || scene === "dashboard" ? "peach" : "pink";
   return (
     <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed" }}>
       <WalletContext.Provider value={fakeWallet}>

@@ -3,9 +3,10 @@
 // it's paid: SOL (claim anytime) or SPL (earmarked, compounded by a permissionless
 // epoch crank via one band-bounded swap). Withdrawals pay BOTH assets pro-rata,
 // price-free. Token-denominated risk is disclosed plainly next to deposit.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PublicKey, Transaction } from "@solana/web3.js";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { useDualFloor, useDualMachine, useDualLp } from "../lib/hooks.ts";
 import {
   ata, ixCancelWithdrawToken, ixClaimSol, ixCreateAtaIdempotent, ixEarmarkSol, ixLpDepositToken,
@@ -18,7 +19,7 @@ import { Window } from "../components/os/index.ts";
 import { SharePriceChart } from "../components/Indexed.tsx";
 import { indexerEnabled } from "../lib/indexer.ts";
 
-export function DualLpPanel({ selectedPk, hideSelector }: { selectedPk?: string | null; hideSelector?: boolean } = {}) {
+export function DualLpPanel({ selectedPk, hideSelector, openDepositNonce }: { selectedPk?: string | null; hideSelector?: boolean; openDepositNonce?: number } = {}) {
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
   const { entries } = useDualFloor(8000);
@@ -32,20 +33,24 @@ export function DualLpPanel({ selectedPk, hideSelector }: { selectedPk?: string 
   const [depositChip, setDepositChip] = useState("100");
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: "good" | "bad"; text: string } | null>(null);
+  const [depositOpen, setDepositOpen] = useState(false);
+  // The dashboard table opens the CHIP deposit modal by bumping this nonce.
+  useEffect(() => { if (openDepositNonce && openDepositNonce > 0) setDepositOpen(true); }, [openDepositNonce]);
 
   const m = machine ? new PublicKey(machine) : null;
   const dec = status?.tokenDecimals ?? 9;
   const parseChip = (s: string): bigint | null => { const n = Number(s); return isFinite(n) && n > 0 ? BigInt(Math.round(n * 10 ** dec)) : null; };
 
-  async function send(label: string, build: () => Transaction) {
-    if (!publicKey) return;
+  async function send(label: string, build: () => Transaction): Promise<boolean> {
+    if (!publicKey) return false;
     setBusy(label); setMsg(null);
     try {
       const sig = await sendTransaction(build(), connection);
       await confirm(connection, sig, label);
       setMsg({ kind: "good", text: `${label} confirmed` });
       await Promise.all([refreshM(), refreshLp()]);
-    } catch (e) { setMsg({ kind: "bad", text: `${label} failed: ${(e as Error).message}` }); }
+      return true;
+    } catch (e) { setMsg({ kind: "bad", text: `${label} failed: ${(e as Error).message}` }); return false; }
     finally { setBusy(null); }
   }
 
@@ -106,26 +111,10 @@ export function DualLpPanel({ selectedPk, hideSelector }: { selectedPk?: string 
 
               {connected && (
                 <>
-                  <div className="hr" />
-                  <div className="stack" style={{ gap: 6 }}>
-                    <span className="tag">deposit CHIP <span className="faint">· price-free</span></span>
-                    <div className="row" style={{ gap: 8 }}>
-                      <input className="input" value={depositChip} onChange={(e) => setDepositChip(e.target.value)} inputMode="decimal" style={{ maxWidth: 150 }} />
-                      <span className="faint">CHIP</span>
-                      <button className="btn gold" disabled={busy !== null || !parseChip(depositChip)} onClick={() => {
-                        const amt = parseChip(depositChip); if (!amt || !status) return;
-                        send("deposit", () => new Transaction().add(ixLpDepositToken(m, publicKey!, ata(publicKey!, new PublicKey(status.tokenMint)), new PublicKey(status.tokenVault), amt)));
-                      }}>{busy === "deposit" ? "…" : "Deposit"}</button>
-                    </div>
-                    <div className="faint" style={{ fontSize: 12 }}>
-                      Deposit is <b>price-free</b> — shares are minted against the token vault directly, never
-                      through an oracle, so a deposit can't be sandwiched on price. You need CHIP in your wallet.
-                    </div>
-                  </div>
-
                   {/* reward mode */}
                   {lp?.exists && lp.shares > 0n && (
                     <div className="stack" style={{ gap: 6 }}>
+                      <div className="hr" />
                       <span className="tag">reward mode</span>
                       <div className="row" style={{ gap: 8 }}>
                         <button className={`btn sm ${!spl ? "gold" : "ghost"}`} disabled={busy !== null || !spl} onClick={() => send("set_reward_mode", () => new Transaction().add(ixSetRewardMode(m, publicKey!, REWARD_MODE_SOL)))}>SOL — claim</button>
@@ -196,15 +185,7 @@ export function DualLpPanel({ selectedPk, hideSelector }: { selectedPk?: string 
             </Window>
 
             <Window icon="◈" title="What you're taking on" bodyStyle={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div className="note warn stack" style={{ gap: 4 }}>
-                <span style={{ fontWeight: 800 }}>Token-denominated risk</span>
-                <span style={{ fontSize: 13 }}>
-                  Your position is denominated in <b>CHIP</b>, not SOL. On top of ordinary bankroll variance (a
-                  jackpot pays up to the exposure cap of the vault), your share value <b>moves with CHIP's own
-                  market price</b>. If CHIP falls against SOL, your position is worth less in SOL terms even if the
-                  vault is flat. You hold two risks at once: house variance <i>and</i> the token's market.
-                </span>
-              </div>
+              <TokenRiskNote />
               {indexerEnabled() && m
                 ? <><div className="hr" /><SharePriceChart machine={m.toBase58()} kind="dual" /></>
                 : <div className="faint" style={{ fontSize: 12 }}>Trailing share-price history and annualized drawdown need an indexer — not shown rather than faked.</div>}
@@ -212,6 +193,73 @@ export function DualLpPanel({ selectedPk, hideSelector }: { selectedPk?: string 
           </div>
         </div>
       )}
+
+      {/* CHIP deposit modal — relocated from the position Window. The price-free
+          note and the token-denominated-risk disclosure are shown here (not
+          orphaned), and the deposit transaction/validation below is moved verbatim. */}
+      {depositOpen && (
+        <div className="modal-backdrop" onClick={() => setDepositOpen(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="spread" style={{ marginBottom: 10 }}>
+              <h3 style={{ fontSize: 20 }}>Deposit CHIP — {status?.name ?? "dual machine"}</h3>
+              {status && <PriceChip kind={status.price.kind} label={status.price.label} title={status.price.reason} />}
+            </div>
+            {!connected ? (
+              <div className="stack" style={{ gap: 10 }}>
+                <div className="muted">Connect a devnet wallet to deposit and manage a position.</div>
+                <WalletMultiButton />
+              </div>
+            ) : (
+              <div className="stack" style={{ gap: 12 }}>
+                <div className="stack" style={{ gap: 6 }}>
+                  <span className="tag">deposit CHIP <span className="faint">· price-free</span></span>
+                  <div className="row" style={{ gap: 8 }}>
+                    <input className="input" value={depositChip} onChange={(e) => setDepositChip(e.target.value)} inputMode="decimal" style={{ maxWidth: 150 }} />
+                    <span className="faint">CHIP</span>
+                    <button className="btn gold" disabled={busy !== null || !parseChip(depositChip)} onClick={async () => {
+                      const amt = parseChip(depositChip); if (!amt || !status || !m) return;
+                      if (await send("deposit", () => new Transaction().add(ixLpDepositToken(m, publicKey!, ata(publicKey!, new PublicKey(status.tokenMint)), new PublicKey(status.tokenVault), amt)))) setDepositOpen(false);
+                    }}>{busy === "deposit" ? "…" : "Deposit"}</button>
+                  </div>
+                  <PriceFreeNote />
+                </div>
+                <TokenRiskNote />
+                {msg && msg.kind === "bad" && <div className="note bad">{msg.text}</div>}
+              </div>
+            )}
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 14 }}>
+              <button className="btn ghost" onClick={() => setDepositOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The price-free deposit note — moved verbatim from the deposit control into the
+ * deposit modal (the only place the CHIP deposit now lives). */
+export function PriceFreeNote() {
+  return (
+    <div className="faint" style={{ fontSize: 12 }}>
+      Deposit is <b>price-free</b> — shares are minted against the token vault directly, never
+      through an oracle, so a deposit can't be sandwiched on price. You need CHIP in your wallet.
+    </div>
+  );
+}
+
+/** The material dual-LP risk disclosure — one source, rendered both in the "What
+ * you're taking on" Window and (so it is not orphaned) in the deposit modal. */
+export function TokenRiskNote() {
+  return (
+    <div className="note warn stack" style={{ gap: 4 }}>
+      <span style={{ fontWeight: 800 }}>Token-denominated risk</span>
+      <span style={{ fontSize: 13 }}>
+        Your position is denominated in <b>CHIP</b>, not SOL. On top of ordinary bankroll variance (a
+        jackpot pays up to the exposure cap of the vault), your share value <b>moves with CHIP's own
+        market price</b>. If CHIP falls against SOL, your position is worth less in SOL terms even if the
+        vault is flat. You hold two risks at once: house variance <i>and</i> the token's market.
+      </span>
     </div>
   );
 }

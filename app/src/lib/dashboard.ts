@@ -19,7 +19,8 @@ export interface DashRow {
   liqTokens?: bigint; liqTokenDecimals?: number;                            // dual CHIP depth
   vol24h: bigint | null;        // null ⇒ indexer off (deferred)
   take24h: bigint | null; takeGap?: boolean;
-  drift7dPct: number | null;
+  aprPct: number | null;        // trailing realized drift, annualized from the actual sample window
+  windowDays: number | null;    // span of that window (short windows annualize to noise)
 }
 
 export interface DashData {
@@ -73,12 +74,19 @@ function tvlSeries(series: { kind: "single" | "dual"; pts: PricePoint[] }[]): Pt
   });
 }
 
-/** Trailing drift % over the last 7d of a machine's share-price series. */
-function drift7d(series: PricePoint[], kind: "single" | "dual", now: number): number | null {
+/** Trailing REALIZED share-price drift over the last 7d of samples, annualized to
+ * 365d using the ACTUAL first/last sample timestamps (not an assumed 7d window).
+ * Returns the APR% and the real span in days — a short span annualizes to noise,
+ * which the caller flags rather than hides. Never a promised rate. */
+function trailingApr(series: PricePoint[], kind: "single" | "dual", now: number): { aprPct: number; windowDays: number } | null {
   const key = kind === "single" ? "sharePrice1e12" : "sharePriceTokens1e12";
-  const pts = series.filter((p) => p[key] !== null && p.t >= now - 7 * DAY).map((p) => Number(p[key]));
-  if (pts.length < 2 || pts[0] === 0) return null;
-  return (pts[pts.length - 1] / pts[0] - 1) * 100;
+  const pts = series.filter((p) => p[key] !== null && p.t >= now - 7 * DAY).map((p) => ({ t: p.t, v: Number(p[key]) }));
+  if (pts.length < 2 || pts[0].v === 0) return null;
+  const first = pts[0], last = pts[pts.length - 1];
+  const spanSecs = last.t - first.t;
+  if (spanSecs <= 0) return null;
+  const drift = last.v / first.v - 1;                       // realized drift over the window
+  return { aprPct: drift * (365 * DAY / spanSecs) * 100, windowDays: spanSecs / DAY };
 }
 
 export function useDashboard(singles: FloorEntry[] | null, duals: DualFloorEntry[] | null): DashData {
@@ -115,7 +123,7 @@ export function useDashboard(singles: FloorEntry[] | null, duals: DualFloorEntry
   const staleTokenDepth: { name: string; tokens: bigint; dec: number }[] = [];
 
   const perMachine = (pk: string, dec: number) => {
-    if (!indexerOn || !ind) return { vol: null as bigint | null, take: null as bigint | null, gap: false, drift: null as number | null };
+    if (!indexerOn || !ind) return { vol: null as bigint | null, take: null as bigint | null, gap: false, apr: null as { aprPct: number; windowDays: number } | null };
     const spins = (ind.spins[pk] ?? []).filter((r) => r.blockTime !== null && r.blockTime >= now - DAY);
     let vol = 0n, take = 0n, gap = false;
     for (const r of spins) {
@@ -125,8 +133,8 @@ export function useDashboard(singles: FloorEntry[] | null, duals: DualFloorEntry
       if (r.wager !== null) take += BigInt(r.wager) - pv;
     }
     const ser = ind.price[pk];
-    const drift = ser ? drift7d(ser.series, ser.kind, now) : null;
-    return { vol, take, gap, drift };
+    const apr = ser ? trailingApr(ser.series, ser.kind, now) : null;
+    return { vol, take, gap, apr };
   };
 
   for (const e of singles ?? []) {
@@ -134,7 +142,7 @@ export function useDashboard(singles: FloorEntry[] | null, duals: DualFloorEntry
     tvl += s.poolValue;
     const mm = perMachine(pk, 9);
     rows.push({ pubkey: pk, name: s.name, kind: "single", tier: s.tier, topMult: s.topMult, paused: s.paused,
-      liqLamports: s.poolValue, vol24h: mm.vol, take24h: mm.take, takeGap: mm.gap, drift7dPct: mm.drift });
+      liqLamports: s.poolValue, vol24h: mm.vol, take24h: mm.take, takeGap: mm.gap, aprPct: mm.apr?.aprPct ?? null, windowDays: mm.apr?.windowDays ?? null });
   }
   for (const e of duals ?? []) {
     const pk = e.pubkey.toBase58(); const s = e.status;
@@ -144,7 +152,7 @@ export function useDashboard(singles: FloorEntry[] | null, duals: DualFloorEntry
     rows.push({ pubkey: pk, name: s.name, kind: "dual",
       priceKind: s.price.kind, priceLabel: s.price.label, priceReason: s.price.reason,
       liqLamports: s.tokenValueLamports, liqTokens: s.tokenBalance, liqTokenDecimals: s.tokenDecimals,
-      vol24h: mm.vol, take24h: mm.take, takeGap: mm.gap, drift7dPct: mm.drift });
+      vol24h: mm.vol, take24h: mm.take, takeGap: mm.gap, aprPct: mm.apr?.aprPct ?? null, windowDays: mm.apr?.windowDays ?? null });
   }
 
   // top-line 24h sums + sparklines (indexer only)
