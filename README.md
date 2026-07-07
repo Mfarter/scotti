@@ -537,7 +537,15 @@ CPI. FIX-1 reordered the surgery to last (mirroring `compound_epoch`), upgraded 
 program in place ([`3hPp33d3…`](https://solscan.io/tx/3hPp33d33TN2uUXNfpjHynHGZkswM5bifVDRctuWKpregsMvP4ewspXkLC3BTLd7xudnXjkVKucb2NWWqpzfeXFT?cluster=devnet)),
 and proved the once-reverting combined withdrawal live on `dual-chip-1`
 ([`3faxnxiW…`](https://solscan.io/tx/3faxnxiWmQBPe1UBHH7faWEZKuDvLrQTwJR1TJ5ZBFEZ5xgqWFgrpY5vvaVujsv6YRS9Vf9HqcZ7BqfnfrK1sSYh?cluster=devnet)) —
-both assets paid, exact by recompute. Everything else is a bounded (B) or precluded (C).
+both assets paid, exact by recompute. The headline scale-limit (B) — withdrawal
+payouts being crank-order-dependent when a spin settles mid-drain — is now
+**MITIGATED (SCALE-2)** by a per-epoch conservative price snapshot (both single- and
+dual-asset), proven order-independent / solvent / anti-hopping-preserving in
+house-math, upgraded in place
+([`5VU3PNuP…`](https://solscan.io/tx/5VU3PNuPEwQMwv1tsS99Ud1T75w3tXFeVD2WnY3jopurkDw2EPJDWGv4fP469bJcAyu4KW3w7VnLqaQLcFe8mqXD?cluster=devnet)),
+and verified live: two LPs with identical withdrawals and a real spin settling
+between their cranks were paid identical amounts. SCALE-2 also guards the TWAP-window
+starvation (§5) at machine creation. Everything else is a bounded (B) or precluded (C).
 
 ## Known deferrals
 

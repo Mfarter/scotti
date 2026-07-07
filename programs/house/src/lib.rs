@@ -228,20 +228,33 @@ pub mod house {
         require!(m.epoch_of(now) > ctx.accounts.position.pending_epoch, HouseError::EpochNotElapsed);
         require!(m.total_shares > 0 && m.pool_value > 0, HouseError::MathOverflow);
 
-        let total_shares = m.total_shares;
-        let pool_value = m.pool_value as u128;
-        let free = m.free_liquidity() as u128;
+        // SCALE-2: price this withdrawal at the epoch's CONSERVATIVE snapshot, frozen
+        // at the epoch's first crank, so a spin settling mid-drain can't move money
+        // between identical requests by processing order (SCALE.md §1b; house-math
+        // `snapshot`). free_value = pool_value − reserved_exposure (the pool valued as
+        // if every pending spin hits its reserved maximum). A new epoch (or a legacy
+        // zero / a still-unpriceable epoch) recomputes; otherwise the stored price is
+        // reused. Anti-hopping is preserved: this is the PROCESSING epoch's price.
+        let epoch = m.epoch_of(now);
+        let free_now = m.free_liquidity() as u128;
+        let snap_price = if m.withdraw_snapshot_epoch == epoch && m.withdraw_snapshot_price != 0 {
+            m.withdraw_snapshot_price
+        } else {
+            hm::snapshot::snapshot_price(free_now, m.total_shares)
+        };
 
-        // shares the free liquidity can cover at the current price, capped by
-        // the pending amount; then the exact lamport payout for those shares.
-        let free_shares = free.checked_mul(total_shares).ok_or(HouseError::MathOverflow)? / pool_value;
-        let fill_shares = pending.min(free_shares);
-        let payout_u128 = fill_shares.checked_mul(pool_value).ok_or(HouseError::MathOverflow)? / total_shares;
+        // fill capped by the CURRENT free (keeps pending spins funded); the cap limits
+        // HOW MUCH fills now, never the PRICE. Payout = fill × snapshot price.
+        let fill_shares = hm::snapshot::fill_shares(pending, free_now, snap_price);
+        let payout_u128 = hm::snapshot::payout(fill_shares, snap_price);
         let payout = u64::try_from(payout_u128).map_err(|_| HouseError::MathOverflow)?;
 
         // burn the filled shares and remove the paid lamports from pool depth;
         // flooring dust stays in the pool (accrues to remaining LPs).
         let m = &mut ctx.accounts.machine;
+        // freeze the snapshot for the epoch (first meaningful crank stores it).
+        m.withdraw_snapshot_price = snap_price;
+        m.withdraw_snapshot_epoch = epoch;
         m.total_shares -= fill_shares;
         m.pool_value -= payout;
 
@@ -415,6 +428,11 @@ pub mod house {
         require!(p.smooth_window > 0 && p.epoch_length > 0, HouseError::InvalidParams);
         require!(p.token_decimals <= 18, HouseError::InvalidParams);
         require!(p.twap_window_secs > 0 && p.max_staleness_secs > 0, HouseError::InvalidParams);
+        // SCALE.md §5 guard: the Raydium observation ring is 100 wide and writes at
+        // most one observation per 15s, so it covers at most 99×15 = 1485s of history.
+        // A twap_window beyond that can be starved on a BUSY pool (coverage < window →
+        // cold-start refusals), so reject it at creation. The demo's 300s is unaffected.
+        require!(p.twap_window_secs <= hm::twap::RING_MIN_COVERAGE_SECS, HouseError::TwapWindowExceedsRingCoverage);
         require!(p.max_pending_spins > 0, HouseError::InvalidParams);
         require!(p.haircut_bp as u128 <= hm::BP, HouseError::InvalidParams);
         // The solvency link: reject any RTP-ceiling / band / margin-floor combo
@@ -827,14 +845,23 @@ pub mod house {
         let sol_realized_u64 = u64::try_from(sol_realized).map_err(|_| HouseError::MathOverflow)?;
         let reward_mode = pos.reward_mode;
 
-        // token pro-rata, price-free, capped by the free (unreserved) balance.
-        let total_shares = m.total_shares;
-        let token_balance = m.token_balance;
+        // SCALE-2: token side is PRICE-FREE (no TWAP) but was still pro-rata of the
+        // token balance AT PROCESSING, so a token jackpot settling mid-drain moved
+        // tokens between identical requests by order (SCALE.md §1b, dual). Fix: freeze
+        // a CONSERVATIVE token-per-share snapshot at the epoch's first crank —
+        // free_value = token_balance − reserved_tokens (as if every pending spin pays
+        // its full reserve) — and pay every crank that epoch at it. The SOL dividend
+        // side is already order-independent (per-share ledger), so only the token side
+        // needs this. free cap limits HOW MUCH, never the PRICE.
+        let epoch = m.epoch_of(now);
         let free_tokens = m.free_tokens();
-        // wide_mul_div: free_tokens·total_shares and fill·token_balance can exceed u128.
-        let free_shares = hm::price::wide_mul_div(free_tokens, total_shares, token_balance);
-        let fill = pending_sh.min(free_shares);
-        let token_payout = hm::price::wide_mul_div(fill, token_balance, total_shares);
+        let snap_price = if m.withdraw_snapshot_epoch == epoch && m.withdraw_snapshot_price != 0 {
+            m.withdraw_snapshot_price
+        } else {
+            hm::snapshot::snapshot_price(free_tokens, m.total_shares)
+        };
+        let fill = hm::snapshot::fill_shares(pending_sh, free_tokens, snap_price);
+        let token_payout = hm::snapshot::payout(fill, snap_price);
         let token_payout_u64 = u64::try_from(token_payout).map_err(|_| HouseError::MathOverflow)?;
 
         // ----- money movement -----
@@ -864,6 +891,9 @@ pub mod house {
 
         // ----- accounting -----
         let m = &mut ctx.accounts.machine;
+        // freeze the token snapshot for the epoch (first meaningful crank stores it).
+        m.withdraw_snapshot_price = snap_price;
+        m.withdraw_snapshot_epoch = epoch;
         m.div_pool_sol = m.div_pool_sol.checked_sub(sol_realized_u64).ok_or(HouseError::MathOverflow)?;
         if reward_mode == REWARD_MODE_SPL {
             m.earmarked_sol = m.earmarked_sol.checked_add(sol_realized_u64).ok_or(HouseError::MathOverflow)?;
@@ -1439,12 +1469,19 @@ pub struct Machine {
     /// unchanged: machines created before H3 read 0 here and fall back to
     /// DEFAULT_EPOCH_LENGTH_SLOTS via `epoch_length_eff()`.
     pub epoch_length: u64,
+    /// SCALE-2 per-epoch conservative withdrawal price snapshot (fixes SCALE.md §1b).
+    /// Carved from the reserved tail (24 bytes: u128 + u64), SIZE unchanged. Legacy
+    /// accounts read 0 here; `withdraw_snapshot_epoch != current_epoch` (or price 0)
+    /// means "no snapshot for this epoch yet — compute + store on the first crank".
+    pub withdraw_snapshot_price: u128,
+    pub withdraw_snapshot_epoch: u64,
     pub reserved: [u8; Machine::RESERVED_LEN],
 }
 impl Machine {
-    // epoch_length(8) carved out of the former 64-byte reserved; size unchanged.
-    pub const RESERVED_LEN: usize = 56;
-    pub const SIZE: usize = 8 + 16 + 32 + (5 * 8) + 8 + 8 + 16 + 16 + 8 + 1 + 1 + 8 + Self::RESERVED_LEN;
+    // epoch_length(8) + withdraw_snapshot_price(16) + withdraw_snapshot_epoch(8)
+    // carved out of the former 64-byte reserved; size unchanged.
+    pub const RESERVED_LEN: usize = 32;
+    pub const SIZE: usize = 8 + 16 + 32 + (5 * 8) + 8 + 8 + 16 + 16 + 8 + 1 + 1 + 8 + 16 + 8 + Self::RESERVED_LEN;
 
     /// Effective epoch length: the stored value, or the default for legacy
     /// (pre-H3) machines that stored 0. `create_machine` forbids 0 for new ones.
@@ -1582,13 +1619,18 @@ pub struct DualMachine {
     pub smoothed_last_slot: u64,
     pub paused: bool,
     pub bump: u8,
+    /// SCALE-2 per-epoch conservative withdrawal price snapshot on the TOKEN side
+    /// (fixes SCALE.md §1b). Carved from the reserved tail (24 bytes), SIZE unchanged;
+    /// legacy semantics identical to Machine's.
+    pub withdraw_snapshot_price: u128,
+    pub withdraw_snapshot_epoch: u64,
     pub reserved: [u8; DualMachine::RESERVED_LEN],
 }
 impl DualMachine {
-    // acc_sol_per_share(16) + earmarked_sol(8) carved from the former 64-byte
-    // reserved tail; SIZE unchanged (H6b-1 was never deployed, but the discipline
-    // keeps the on-disk layout stable).
-    pub const RESERVED_LEN: usize = 40;
+    // acc_sol_per_share(16) + earmarked_sol(8) carved earlier; SCALE-2 adds
+    // withdraw_snapshot_price(16) + withdraw_snapshot_epoch(8) from the reserved
+    // tail; SIZE unchanged.
+    pub const RESERVED_LEN: usize = 16;
     pub const SIZE: usize = 8 + 16 + 32   // id, curator
         + 32 + 32 + 32 + 32 + 1           // mint, pool, obs, vault, decimals
         + (6 * 8)                         // d_low..epoch_length
@@ -1597,6 +1639,7 @@ impl DualMachine {
         + 16 + 16 + 8 + 8 + 16            // token_balance, reserved_tokens, escrowed_sol, div_pool_sol, total_shares
         + 16 + 8                          // acc_sol_per_share, earmarked_sol
         + 16 + 8 + 1 + 1                  // smoothed_value, smoothed_last_slot, paused, bump
+        + 16 + 8                          // withdraw_snapshot_price, withdraw_snapshot_epoch
         + Self::RESERVED_LEN;
     pub fn epoch_length_eff(&self) -> u64 {
         if self.epoch_length == 0 { DEFAULT_EPOCH_LENGTH_SLOTS } else { self.epoch_length }
@@ -1605,6 +1648,12 @@ impl DualMachine {
     /// Free (unreserved) tokens available to withdrawals in H6b-2.
     pub fn free_tokens(&self) -> u128 { self.token_balance.saturating_sub(self.reserved_tokens) }
 }
+
+// SCALE-2 carved the withdrawal snapshot fields from the reserved tails; the on-disk
+// SIZE must be BYTE-IDENTICAL so live accounts (e.g. dual-chip-1 at 409 bytes) keep
+// reading. These lock it at compile time.
+const _: () = assert!(Machine::SIZE == 218, "Machine SIZE changed — would break live accounts");
+const _: () = assert!(DualMachine::SIZE == 409, "DualMachine SIZE changed — would break live accounts");
 
 /// A dual-asset LP's stake. PDA `["dual-lp", machine, owner]`. The pending-
 /// withdrawal + dividend-ledger fields are sized NOW so H6b-2 needs no layout
@@ -2061,6 +2110,7 @@ pub enum HouseError {
     #[msg("Machine has too many pending spins")] TooManyPendingSpins,
     #[msg("Not enough free token liquidity to reserve payout")] InsufficientTokenLiquidity,
     #[msg("Instruction does not match the position's reward mode")] WrongRewardMode,
+    #[msg("twap_window_secs exceeds the observation ring's max coverage (1485s)")] TwapWindowExceedsRingCoverage,
 }
 
 // ---------------------------------------------------------------------------

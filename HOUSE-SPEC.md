@@ -128,24 +128,34 @@ alone. The SDK ships `verifySpin(spinPda)` doing exactly that.
   - `cancel_withdraw()` returns the pending shares to the active balance exactly, any time before
     processing.
   - `process_withdrawals()` is a **permissionless** crank, processable only once the request's
-    epoch has strictly elapsed (`epoch_of(now) > pending_epoch`). It processes one position at the
-    share price **at processing time** (`D / total_shares`) — never the request-time price; that
-    repricing is the anti-pool-hopping mechanism (a jackpot between request and processing is borne
-    by the withdrawing LP; growth accrues to them). The fill is capped by the liquidity floor
-    `free = D − reserved_exposure`, so pending spins are never starved; any **remainder stays
-    queued** for a later crank once liquidity frees up. Processed shares are burned
-    (`total_shares −= filled`, `D −= payout`); flooring dust stays in the pool and accrues to the
-    remaining LPs. A position emptied to zero (no active, no pending) is closed and its rent
-    returned to the owner.
-  - **Ordering across LPs:** each crank prices at the current pool state, so a batch cranked in
-    sequence prices each fill at the state left by the previous one; there is no separate global
-    FIFO structure. Epochs remain the anti-pool-hopping and anti-bank-run mechanism. The
-    production-scale consequences of this — that a spin settling *between* two withdrawal cranks
-    dumps the interleaved variance on whoever is cranked last, cranker-chosen — are analyzed and
-    demonstrated in [`SCALE.md`](./SCALE.md) §1 (bucket B; bounded per spin by the exposure cap;
-    mitigation = a per-epoch price snapshot). SCALE.md §1 also surfaced a real (bucket A) bug in
-    `process_withdrawal_token` (a lamport surgery before the token CPI), now **FIXED and live on
-    devnet (FIX-1)** — see SCALE.md §1(A).
+    epoch has strictly elapsed (`epoch_of(now) > pending_epoch`). It prices every position of an
+    epoch at that epoch's **conservative price snapshot** (SCALE-2), computed and frozen at the
+    epoch's FIRST crank:
+    ```
+    snapshot_price = (D − reserved_exposure) / total_shares      (single-asset)
+                   = (token_balance − reserved_tokens) / total_shares   (dual, token side)
+    ```
+    — the pool valued **as if every pending spin hits its reserved maximum**. The fill is still
+    capped by the current liquidity floor `free = D − reserved_exposure` (so pending spins are never
+    starved), but the cap only limits HOW MUCH fills now, never the PRICE. Processed shares are
+    burned (`total_shares −= filled`, `D −= payout`); flooring dust stays in the pool and accrues to
+    the remaining LPs. A position emptied to zero is closed and its rent returned.
+  - **Why the snapshot (and why it keeps anti-pool-hopping).** Pricing at the raw processing-time
+    state was chosen as the anti-pool-hopping mechanism — an LP must not lock in a request-time price
+    and escape subsequent losses. But with one position per crank in a cranker-chosen order, a spin
+    settling *between* two cranks dumped its entire net cost on whoever was processed last
+    (SCALE.md §1b, demonstrated). The per-epoch snapshot **preserves the anti-hopping property** — the
+    exit price is still the PROCESSING epoch's price, so a jackpot landing before the boundary lowers
+    everyone's exit — while removing the unfairness: within one epoch, order can no longer move money
+    between identical requests (every share is worth the same frozen price). The snapshot is
+    **conservative** (it deducts the full pending reserve, as if every spin hit its max), so:
+    withdrawers exit at the **worst-case-pending price**; and any surplus — pending spins that lose,
+    or win less than max — stays in the pool and **accrues to the LPs who stay**. In plain terms: if
+    you exit while spins are in flight you are priced for the worst case and forfeit the upside to
+    stayers; wait until they settle (a later epoch, no pending reserve) to exit at full value. Proven
+    order-independent + solvent + anti-hopping in house-math `snapshot`; see [`SCALE.md`](./SCALE.md)
+    §1b (MITIGATED). SCALE.md §1 also records a real (bucket A) bug in `process_withdrawal_token`,
+    FIXED in FIX-1.
 - **Yield display (frontend obligation):** trailing share-price change (7d/30d, annualized) AND
   expected-value math (`edge × projected volume / D`) AND historical drawdown — never a fixed
   "APY". A $1M pool at 5% avg edge and $20k daily volume expects ~36%/yr with whole-percent

@@ -15,6 +15,7 @@ pub mod dividend;
 pub mod margin;
 pub mod payout;
 pub mod price;
+pub mod snapshot;
 pub mod twap;
 
 pub const REELS: usize = 3;

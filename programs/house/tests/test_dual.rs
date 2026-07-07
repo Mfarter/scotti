@@ -1008,17 +1008,15 @@ fn scale_e_pending_cap_denies_then_permissionlessly_heals() {
     let _ = admin;
 }
 
-// (scale-1, dual) TOKEN-SIDE WITHDRAWAL ORDERING PAYOFF. Dual withdrawals are
-// PRICE-FREE (no TWAP read, so manipulation-immune), but the token side is still
-// pro-rata of the token balance AT PROCESSING. So the same crank-ordering payoff
-// as single-asset applies to the TOKEN side: two identical dual LPs both queue full
-// exits; a token JACKPOT lands between their cranks; the later-cranked LP receives
-// exactly the jackpot's token payout FEWER tokens. (The SOL dividend side, by
-// contrast, is order-independent — a per-share MasterChef ledger; see
-// k_deposit_accrue_claim / worked_example and house-math dividend::conservation.)
-// Bucket B; same batch-snapshot/FIFO mitigation as the single-asset case.
+// (SCALE-2, dual) TOKEN-SIDE WITHDRAWAL ORDERING — now FIXED by the per-epoch
+// conservative token snapshot. Dual withdrawals are price-free (no TWAP), but the
+// token side was still pro-rata of the token balance AT PROCESSING, so a token
+// jackpot settling between two identical LPs' cranks used to give the later one
+// fewer tokens (SCALE-1). Now both are priced at the SAME frozen token-per-share
+// snapshot, so they receive IDENTICAL token payouts regardless of order. (The SOL
+// dividend side was already order-independent — the per-share ledger.)
 #[test]
-fn scale_f_dual_token_withdraw_order_payoff() {
+fn scale_f_dual_token_withdraw_is_now_order_identical() {
     let (mut svm, id, mint, _admin) = boot_machine(0xF4, 100);
     let lp1 = funded(&mut svm);
     let lp2 = funded(&mut svm);
@@ -1027,43 +1025,41 @@ fn scale_f_dual_token_withdraw_order_payoff() {
     set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
     deposit(&mut svm, id, mint, &lp1, 100_000);
     deposit(&mut svm, id, mint, &lp2, 100_000); // equal → equal shares (price 1.0)
-    // Both in SPL mode: the interleaved jackpot accrues a SOL dividend, and SPL
-    // withdrawal EARMARKS it (no lamport surgery) — so this isolates the TOKEN
-    // ordering payoff and sidesteps the SOL-mode surgery revert (scale_g bug A).
+    // SPL mode so the interleaved jackpot's SOL dividend earmarks (no surgery).
     assert!(send(&mut svm, ix_set_mode(id, &lp1.pubkey(), house::REWARD_MODE_SPL), &lp1, &[&lp1]));
     assert!(send(&mut svm, ix_set_mode(id, &lp2.pubkey(), house::REWARD_MODE_SPL), &lp2, &[&lp2]));
     let s1 = read_position(&svm, &id, &lp1.pubkey()).shares;
     let s2 = read_position(&svm, &id, &lp2.pubkey()).shares;
     assert_eq!(s1, s2, "identical dual LPs hold identical shares");
 
-    // a spin that will JACKPOT, paying tokens out of the vault.
+    // a spin that WILL jackpot between the two cranks.
     let wager: u64 = 20_000_000; // 0.02 SOL
     assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
     assert!(send(&mut svm, ix_commit(id, &player.pubkey(), wager, 0), &player, &[&player]), "commit jackpot spin");
-    let sp = read_spin(&svm, &id, &player.pubkey(), 0);
-    let jackpot_tokens = sp.max_payout_tokens; // jackpot pays exactly this
 
-    // both queue full exits for the same epoch.
     assert!(send(&mut svm, ix_request_wd(id, &lp1.pubkey(), s1), &lp1, &[&lp1]));
     assert!(send(&mut svm, ix_request_wd(id, &lp2.pubkey(), s2), &lp2, &[&lp2]));
-    svm.warp_to_slot(2_000); // cross the epoch boundary (epoch_length 1000)
+    svm.warp_to_slot(2_000);
 
-    // crank #1: lp1 at the pre-jackpot token balance.
-    let lp1_tok_before = tok_bal(&svm, &ata(&lp1.pubkey(), &mint));
+    // crank #1: lp1 freezes the token snapshot at (token_balance − reserved)/total.
+    let lp1_before = tok_bal(&svm, &ata(&lp1.pubkey(), &mint));
     assert!(send(&mut svm, ix_process_wd(id, &lp1.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "process lp1");
-    let tokens1 = tok_bal(&svm, &ata(&lp1.pubkey(), &mint)) - lp1_tok_before;
+    let tokens1 = tok_bal(&svm, &ata(&lp1.pubkey(), &mint)) - lp1_before;
+    let snap = read_machine(&svm, &id).withdraw_snapshot_price;
+    assert!(snap != 0, "token snapshot frozen");
+    assert_eq!(tokens1 as u128, hm::snapshot::payout(s1, snap), "lp1 at the frozen token snapshot");
 
-    // interleaved JACKPOT settle: token vault drops by the jackpot payout.
+    // interleaved JACKPOT settle: token vault drops — the move that used to punish lp2.
     assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mint, 0, &cranker.pubkey()), &cranker, &[&cranker]), "settle jackpot");
 
-    // crank #2: lp2 at the post-jackpot token balance.
-    let lp2_tok_before = tok_bal(&svm, &ata(&lp2.pubkey(), &mint));
+    // crank #2: lp2, SAME epoch → SAME frozen token snapshot.
+    let lp2_before = tok_bal(&svm, &ata(&lp2.pubkey(), &mint));
     assert!(send(&mut svm, ix_process_wd(id, &lp2.pubkey(), mint, &cranker.pubkey()), &cranker, &[&cranker]), "process lp2");
-    let tokens2 = tok_bal(&svm, &ata(&lp2.pubkey(), &mint)) - lp2_tok_before;
+    let tokens2 = tok_bal(&svm, &ata(&lp2.pubkey(), &mint)) - lp2_before;
+    assert_eq!(read_machine(&svm, &id).withdraw_snapshot_price, snap, "same frozen snapshot in the same epoch");
 
-    // PINNED: the later LP got exactly the jackpot's token payout fewer tokens.
-    assert!(tokens1 > tokens2, "ordering changed the token payout: {tokens1} vs {tokens2}");
-    assert_eq!(tokens1 - tokens2, jackpot_tokens as u64, "later dual LP eats exactly the token jackpot");
+    // THE FIX: identical requests, IDENTICAL token payouts, regardless of order.
+    assert_eq!(tokens1, tokens2, "order-independent to the base unit: {tokens1} == {tokens2}");
 }
 
 // (FIX-1) The SCALE.md §1(A) bug is FIXED: process_withdrawal_token now does the
@@ -1265,4 +1261,32 @@ fn scale_model_pending_slot_capital() {
     assert_eq!(escrow_100, 100_000, "100 slots held for 0.0001 SOL of (refundable) escrow");
     // (numbers surfaced in SCALE.md §2)
     let _ = (r_tiny, r_real);
+}
+
+// (SCALE-2 §5 guard) create_machine_dual rejects a twap_window_secs beyond the
+// Raydium observation ring's max coverage (99×15 = 1485s), so the busy-pool TWAP
+// starvation from SCALE.md §5 can't be configured into a machine. 300s (the demo)
+// and 1485s (the boundary) are accepted; 1486s is rejected.
+#[test]
+fn scale2_twap_window_guard_rejects_over_ring_coverage() {
+    let (mut svm, id, mint, admin) = (|| {
+        let mut svm = boot();
+        let admin = funded(&mut svm);
+        let id = [0xFB; 16];
+        let mint = Pubkey::new_unique();
+        set_mint(&mut svm, &mint, DEC);
+        assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+        (svm, id, mint, admin)
+    })();
+    let with_window = |secs: u32| { let mut p = params(&id); p.twap_window_secs = secs; p };
+
+    // 1486s > 1485s ring bound → rejected.
+    let over = try_send(&mut svm, ix_create_dual(id, &admin.pubkey(), admin.pubkey(), mint, with_window(1486)), &admin, &[&admin]).unwrap_err();
+    assert!(over.contains("TwapWindowExceedsRingCoverage") || over.contains("1485") || over.contains("6019"),
+            "expected the ring-coverage guard: {over}");
+
+    // 1485s (the exact boundary) is accepted.
+    assert!(send(&mut svm, ix_create_dual(id, &admin.pubkey(), admin.pubkey(), mint, with_window(1485)), &admin, &[&admin]),
+            "the ring-coverage boundary (1485s) is allowed");
+    assert_eq!(read_machine(&svm, &id).twap_window_secs, 1485);
 }

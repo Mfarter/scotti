@@ -208,14 +208,21 @@ fn converged_snapshot(depth: u128) -> (bool, u128, u128) {
 }
 fn tier_of(is_deep: bool) -> &'static hm::Tier { if is_deep { &hm::DEEP } else { &hm::SHALLOW } }
 
-/// Mirror of the program's process_withdrawals share/lamport math — the test's
-/// oracle for exact reconciliation. Returns (fill_shares, payout).
+/// Mirror of the program's process_withdrawals share/lamport math for the FIRST
+/// crank of an epoch (SCALE-2 conservative snapshot). Prices at
+/// `(pool − reserved)/total` frozen for the epoch; the fill is capped by current
+/// free. Returns (fill_shares, payout). For later cranks in the SAME epoch, pass the
+/// FROZEN price to `process_at_snapshot` instead.
 fn expected_process(pool: u128, reserved: u128, total: u128, pending: u128) -> (u128, u128) {
     let free = pool.saturating_sub(reserved);
-    let free_shares = free * total / pool;
-    let fill = pending.min(free_shares);
-    let payout = fill * pool / total;
-    (fill, payout)
+    let snap = hm::snapshot::snapshot_price(free, total);
+    process_at_snapshot(pool, reserved, pending, snap)
+}
+/// Mirror at an already-frozen snapshot price (any crank of the epoch).
+fn process_at_snapshot(pool: u128, reserved: u128, pending: u128, snap: u128) -> (u128, u128) {
+    let free = pool.saturating_sub(reserved);
+    let fill = hm::snapshot::fill_shares(pending, free, snap);
+    (fill, hm::snapshot::payout(fill, snap))
 }
 
 /// Boot an initialized machine funded to `pool` lamports, warped past the
@@ -587,56 +594,63 @@ const E0_SLOT: u64 = 27_000;
 const E1_SLOT: u64 = 28_000; // epoch 28
 
 // ============================================================================
-// (w-a) full withdrawal request while a spin is pending — the crank leaves
-// reserved exposure untouched (capped at free), spin settles, remainder then
-// withdrawable, position closes.
+// (w-a) SCALE-2 UPDATE. Was "full withdrawal while a spin is pending → partial
+// fill capped by free, remainder queued". Under the conservative snapshot the free
+// cap no longer forces a partial fill: the exit is priced at (pool − reserved)/total,
+// and free at that price covers exactly all shares, so the LP FULLY exits in one
+// crank at the conservative price, leaving the reserved in the pool for STAYERS. The
+// core invariant (reserved untouched by the withdrawal) is unchanged. Justification:
+// price-at-processing / partial-fill were the asserted behaviors that SCALE-2 revises.
 // ============================================================================
 #[test]
 fn w_a_reserved_untouched_during_pending_spin() {
-    let pool = 50_000_000_000u64; // DEEP
-    let (mut svm, id, _a, _c, lp) = boot_converged(0xE1, pool);
+    let pool = 50_000_000_000u64; // per LP
+    let (mut svm, id, _a, _c, lp_out) = boot_converged(0xE1, pool);
     let m = machine_pda(&id);
+    let lp_stay = funded(&mut svm); // an equal LP who does NOT withdraw
+    assert!(send(&mut svm, ix_deposit(id, &lp_stay.pubkey(), pool), &lp_stay, &[&lp_stay]));
+    let total_pool = 2 * pool;
     let player = funded(&mut svm);
     let cranker = funded(&mut svm);
 
-    // a pending spin reserves exposure (house win outcome, but we don't settle yet)
-    let (_d, _k, max_bet) = converged_snapshot(pool as u128);
+    // a pending spin reserves exposure (a HOUSE-WIN outcome — the reserve is never
+    // actually needed, so its full value becomes surplus for stayers).
+    let (is_deep, k, max_bet) = converged_snapshot(total_pool as u128);
     let wager = (max_bet / 2) as u64;
-    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b }; // 1 cherry
     assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
     assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
     let reserved = read_machine(&svm, &id).reserved_exposure;
     assert!(reserved > 0);
 
-    // LP requests the full withdrawal
-    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
-    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
-
-    // process after the epoch boundary — capped at free = pool - reserved
-    let mb = read_machine(&svm, &id);
-    let free = mb.pool_value - mb.reserved_exposure;
-    let (_fill1, payout1) = expected_process(mb.pool_value as u128, mb.reserved_exposure as u128, mb.total_shares, shares);
+    // lp_out requests a full exit, processed WHILE the spin is pending.
+    let shares = read_position(&svm, &m, &lp_out.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp_out.pubkey(), shares), &lp_out, &[&lp_out]));
     svm.warp_to_slot(E1_SLOT);
-    let lp_before = lamports(&svm, &lp.pubkey());
-    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    let vault_before = lamports(&svm, &m); // vault delta == payout (no rent/fee pollution)
+    assert!(send(&mut svm, ix_process(id, &lp_out.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
 
-    let ma = read_machine(&svm, &id);
-    assert_eq!(ma.reserved_exposure, reserved, "reserved exposure untouched by withdrawal");
-    assert_eq!(lamports(&svm, &lp.pubkey()) - lp_before, payout1 as u64, "exact payout, capped at free");
-    assert!(payout1 as u64 <= free);
-    assert!(read_position(&svm, &m, &lp.pubkey()).pending_shares > 0, "remainder stays queued behind the floor");
+    // reserved untouched; lp_out FULLY exits (no partial fill) at the CONSERVATIVE
+    // snapshot — below its naive share value (pool), because the pending reserve is
+    // deducted from the price. Reconciled against the machine's stored frozen price.
+    let snap = read_machine(&svm, &id).withdraw_snapshot_price;
+    let payout = hm::snapshot::payout(shares, snap);
+    assert_eq!(read_machine(&svm, &id).reserved_exposure, reserved, "reserved exposure untouched by withdrawal");
+    assert!(position_closed(&svm, &m, &lp_out.pubkey()), "fully filled in one crank at the conservative price — position closed");
+    assert_eq!(vault_before - lamports(&svm, &m), payout as u64, "lp_out exits at the conservative snapshot");
+    assert!(payout < pool as u128, "priced below the naive pool value — the pending reserve is deducted");
 
-    // the spin settles fine afterward — reserve releases
+    // the spin settles (house win) — reserve releases into the pool.
     assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
     assert_eq!(read_machine(&svm, &id).reserved_exposure, 0);
 
-    // now the remainder is withdrawable; position closes
-    svm.expire_blockhash();
-    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
-    assert!(position_closed(&svm, &m, &lp.pubkey()), "fully withdrawn — position closed");
+    // CONSERVATISM FAVORS STAYERS: lp_stay never withdrew, and its position is now
+    // worth MORE than its deposit — it captured the reserve surplus lp_out left behind
+    // plus the house-win edge.
     let mf = read_machine(&svm, &id);
-    assert_eq!(mf.total_shares, 0);
-    assert_eq!(mf.pool_value, 0, "sole LP withdrew all principal + edge");
+    let stay_sh = read_position(&svm, &m, &lp_stay.pubkey()).shares;
+    let stay_value = stay_sh * mf.pool_value as u128 / mf.total_shares;
+    assert!(stay_value > pool as u128, "the staying LP's position grew: {stay_value} > {pool}");
 }
 
 // ============================================================================
@@ -879,87 +893,83 @@ fn w_h_books_balance_full_lifecycle() {
     svm.expire_blockhash(); // this process ix is byte-identical to the partial one above
     assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
 
-    // books balance: the sole LP has withdrawn every share; the pool is empty
-    // and the vault holds only its rent — no lamport is stranded.
+    // books balance: the sole LP has withdrawn every share; the pool drains to at
+    // most a few lamports of SCALE-2 snapshot flooring dust (which rounds TOWARD the
+    // pool). Every lamport is still accounted — the vault holds exactly rent + that
+    // dust, nothing is lost.
     assert!(position_closed(&svm, &m, &lp.pubkey()));
     let mf = read_machine(&svm, &id);
     assert_eq!(mf.total_shares, 0, "all shares burned");
-    assert_eq!(mf.pool_value, 0, "pool fully drained");
-    assert_eq!(lamports(&svm, &m), vault_rent, "vault back to rent-only — books balance to the lamport");
+    assert!(mf.pool_value <= 2, "pool drained to at most flooring dust: {}", mf.pool_value);
+    assert_eq!(lamports(&svm, &m), vault_rent + mf.pool_value, "vault == rent + pool dust — books balance to the lamport");
 }
 
 // ============================================================================
 // SCALE-1 analysis demonstrations (single-asset). See SCALE.md.
 // ============================================================================
 
-// (scale-1) WITHDRAWAL CRANK ORDERING — the payoff. `process_withdrawals` prices
-// at the pool state AT PROCESSING and handles one position per crank in an order
-// the cranker picks. Two IDENTICAL LPs both queue full exits for the same epoch;
-// a JACKPOT settles BETWEEN their two cranks. The one cranked FIRST exits at the
-// pre-jackpot price; the one cranked SECOND eats the ENTIRE net jackpot cost —
-// exactly `max_payout - wager` lamports, borne by whoever is processed last. The
-// cranker controls the order (and, being permissionless, can bundle its own exit
-// + the settle + the victim's crank), so the split of an interleaved jackpot is
-// cranker-chosen. Contrast w_d_two_lps_sequential_pricing: absent a price move,
-// order does NOT change amounts. Bucket B (fairness under contention); mitigation
-// (batch-snapshot / FIFO) sketched in SCALE.md. The magnitude is bounded per spin
-// by the exposure cap (max_payout <= ~max_exposure_bp of the pool).
+// (SCALE-2) WITHDRAWAL CRANK ORDERING — now FIXED by the per-epoch conservative
+// snapshot. The exact scenario SCALE-1 proved unfair (scale_a of SCALE-1): two
+// IDENTICAL LPs both queue full exits for the same epoch and a JACKPOT settles
+// BETWEEN their two cranks, with an adversarial cranker (lp1) front-running its own
+// exit + the settle + the victim's crank. Before: the later LP ate the entire net
+// jackpot cost. Now: both are priced at the SAME frozen snapshot, so they receive
+// IDENTICAL amounts to the lamport regardless of order — the jackpot's cost is in
+// the SNAPSHOT (both exit lower), not dumped on whoever was cranked last. See
+// SCALE.md §1b (MITIGATED) and house-math `snapshot`.
 #[test]
-fn scale_a_crank_order_dumps_interleaved_jackpot_on_later_lp() {
+fn scale_a_crank_order_is_now_price_identical() {
     let pool = 40_000_000_000u64; // each LP; 80 SOL total -> DEEP
     let (mut svm, id, _a, _c, lp1) = boot_converged(0xF1, pool);
     let m = machine_pda(&id);
     let lp2 = funded(&mut svm);
-    // lp1 doubles as the cranker — it front-runs its own exit before the jackpot.
     assert!(send(&mut svm, ix_deposit(id, &lp2.pubkey(), pool), &lp2, &[&lp2]));
     let total_pool = 2 * pool;
 
-    // equal deposits at price 1.0 -> equal shares.
     let s1 = read_position(&svm, &m, &lp1.pubkey()).shares;
     let s2 = read_position(&svm, &m, &lp2.pubkey()).shares;
     assert_eq!(s1, s2, "identical LPs hold identical shares");
 
-    // a player commits a spin; its worst case (JACKPOT^3) is what we will land.
+    // a pending spin that WILL jackpot between the two cranks.
     let player = funded(&mut svm);
     let (is_deep, k, max_bet) = converged_snapshot(total_pool as u128);
     let wager = (max_bet / 2) as u64;
-    let jack_bytes = [0u8; 32]; // JACKPOT^3
-    let jack_reels = hm::reels_from_randomness(&jack_bytes);
+    let jack_reels = hm::reels_from_randomness(&[0u8; 32]);
     let max_payout = u64::try_from(hm::spin_payout(wager as u128, tier_of(is_deep), k, jack_reels)).unwrap();
-    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), jack_bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
     assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
-    let sp = read_spin(&svm, &m, &player.pubkey(), 0);
-    assert_eq!(sp.max_payout, max_payout, "reserve == the jackpot we will land");
 
-    // both queue a FULL exit for the same epoch.
     assert!(send(&mut svm, ix_request_withdraw(id, &lp1.pubkey(), s1), &lp1, &[&lp1]));
     assert!(send(&mut svm, ix_request_withdraw(id, &lp2.pubkey(), s2), &lp2, &[&lp2]));
     svm.warp_to_slot(E1_SLOT);
 
-    // crank #1: lp1 processes ITSELF first, at the pre-jackpot pool. Reserve pins
-    // free liquidity but is small enough to fully fill lp1 (max_payout <= pool).
-    assert!((max_payout as u128) <= pool as u128, "reserve fits so lp1 fills fully");
-    let m1 = read_machine(&svm, &id);
-    let (_f1, pay1) = expected_process(m1.pool_value as u128, sp.max_payout as u128, m1.total_shares, s1);
-    let v_before1 = lamports(&svm, &m);
+    // crank #1: lp1 (also the cranker) processes itself first — freezes the epoch
+    // snapshot at (pool − reserved)/total, priced conservatively for the pending jackpot.
+    let v1 = lamports(&svm, &m);
     assert!(send(&mut svm, ix_process(id, &lp1.pubkey(), &lp1.pubkey()), &lp1, &[&lp1]));
-    assert_eq!(v_before1 - lamports(&svm, &m), pay1 as u64, "lp1 paid at the pre-jackpot price");
-    assert_eq!(pay1, pool as u128, "lp1 recovers its full deposit");
+    let pay1 = v1 - lamports(&svm, &m);
+    let snap = read_machine(&svm, &id).withdraw_snapshot_price;
+    assert!(snap != 0, "snapshot frozen on the first crank");
+    assert_eq!(pay1, hm::snapshot::payout(s1, snap) as u64, "lp1 paid at the frozen snapshot");
+    assert!(position_closed(&svm, &m, &lp1.pubkey()), "lp1 fully filled at the conservative price");
 
-    // the interleaved JACKPOT: pool pays out max_payout, absorbs wager.
+    // the interleaved JACKPOT — the very move that used to dump the cost on lp2.
     assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &lp1.pubkey()), &lp1, &[&lp1]));
 
-    // crank #2: lp2, now at the post-jackpot pool (reserve released).
-    let m2 = read_machine(&svm, &id);
-    let (_f2, pay2) = expected_process(m2.pool_value as u128, 0, m2.total_shares, s2);
-    let v_before2 = lamports(&svm, &m);
+    // crank #2: lp2, SAME epoch → SAME frozen snapshot, despite the pool having moved.
+    let v2 = lamports(&svm, &m);
     assert!(send(&mut svm, ix_process(id, &lp2.pubkey(), &lp1.pubkey()), &lp1, &[&lp1]));
-    assert_eq!(v_before2 - lamports(&svm, &m), pay2 as u64, "lp2 paid at the post-jackpot price");
+    let pay2 = v2 - lamports(&svm, &m);
+    assert_eq!(read_machine(&svm, &id).withdraw_snapshot_price, snap, "same frozen snapshot in the same epoch");
+    assert_eq!(pay2, hm::snapshot::payout(s2, snap) as u64, "lp2 paid at the SAME frozen snapshot");
 
-    // THE PINNED FINDING: identical requests, different payouts; the entire net
-    // jackpot cost (max_payout - wager) fell on the LATER-cranked LP.
-    assert!(pay1 > pay2, "ordering changed the payout: {pay1} vs {pay2}");
-    assert_eq!(pay1 - pay2, (max_payout - wager) as u128, "later LP eats exactly the net jackpot cost");
+    // THE FIX: identical requests, IDENTICAL payouts, regardless of the interleaved
+    // jackpot or the processing order the cranker chose.
+    assert_eq!(pay1, pay2, "order-independent to the lamport: {pay1} == {pay2}");
+    // and each exits at the conservative price (below the naive pre-jackpot pool) —
+    // the jackpot cost is shared via the snapshot, not dumped on the later LP.
+    assert!((pay1 as u128) < pool as u128, "both exit at the conservative snapshot, sharing the pending-jackpot cost");
+    let _ = max_payout;
 }
 
 // (scale-1) NO INDEFINITE STARVATION. The crank is permissionless and the payout
@@ -984,4 +994,77 @@ fn scale_b_no_starvation_victim_self_cranks() {
     let gained = lamports(&svm, &lp.pubkey()) as i128 - before as i128; // payout + rent - tx fee
     assert!(gained > (pool as i128) + (pos_rent as i128) - 100_000, "victim self-cranked and was paid: {gained}");
     assert!(position_closed(&svm, &m, &lp.pubkey()), "position closed on self-crank");
+}
+
+// (SCALE-2) MULTI-EPOCH: the snapshot invalidates at the epoch boundary, and a loss
+// landing BETWEEN two withdrawal epochs lowers the NEXT epoch's exit price — the
+// anti-pool-hopping property the conservative snapshot preserves. An LP can't lock in
+// a request-time price and escape a subsequent loss.
+#[test]
+fn scale2_multi_epoch_snapshot_invalidates_and_preserves_anti_hopping() {
+    let pool = 60_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xF5, pool);
+    let m = machine_pda(&id);
+    let cranker = funded(&mut svm);
+    let player = funded(&mut svm);
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+
+    // withdraw HALF in epoch 28 → snapshot A (no pending spin ⇒ A = pool/total).
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares / 2), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT);
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    let ma = read_machine(&svm, &id);
+    let (snap_a, epoch_a) = (ma.withdraw_snapshot_price, ma.withdraw_snapshot_epoch);
+    assert!(snap_a != 0);
+
+    // a JACKPOT lands and SETTLES (a realized loss) between the two withdrawal epochs.
+    let (is_deep, k, max_bet) = converged_snapshot(ma.pool_value as u128);
+    let wager = (max_bet / 2) as u64;
+    let _ = (is_deep, k);
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), wager, 0), &player, &[&player]));
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &cranker.pubkey()), &cranker, &[&cranker]));
+
+    // withdraw the REMAINDER in the NEXT epoch → snapshot recomputed at the lower pool.
+    // (fresh blockhash: this request is byte-identical to the first one for shares/2.)
+    let rest = read_position(&svm, &m, &lp.pubkey()).shares;
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), rest), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT + 1_000); // epoch 29
+    svm.expire_blockhash();
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+    let mb = read_machine(&svm, &id);
+    let (snap_b, epoch_b) = (mb.withdraw_snapshot_price, mb.withdraw_snapshot_epoch);
+
+    assert!(epoch_b > epoch_a, "snapshot invalidated at the boundary (recomputed for the new epoch)");
+    assert!(snap_b < snap_a, "the loss between epochs lowered the next exit price — no hopping: {snap_b} < {snap_a}");
+}
+
+// (SCALE-2) LEGACY COMPATIBILITY: a machine whose snapshot fields are ZERO (every
+// account created before SCALE-2, and every fresh one until the first withdrawal)
+// computes + stores the snapshot on the FIRST crank and pays correctly — zero means
+// "no snapshot yet", never a real (zero) price.
+#[test]
+fn scale2_legacy_zeroed_snapshot_cranks_on_first_use() {
+    let pool = 20_000_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0xF6, pool);
+    let m = machine_pda(&id);
+    let cranker = funded(&mut svm);
+
+    let m0 = read_machine(&svm, &id);
+    assert_eq!(m0.withdraw_snapshot_price, 0, "fresh/legacy machine has a zeroed snapshot");
+    assert_eq!(m0.withdraw_snapshot_epoch, 0);
+
+    let shares = read_position(&svm, &m, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp.pubkey(), shares), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT);
+    let vault_before = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+
+    let m1 = read_machine(&svm, &id);
+    assert!(m1.withdraw_snapshot_price != 0, "snapshot computed on first use from zeroed state");
+    assert_eq!(m1.withdraw_snapshot_epoch, m1.epoch_of(E1_SLOT), "stamped with the processing epoch");
+    // sole LP, no pending spin → paid its full principal (snapshot == pool/total).
+    assert_eq!(vault_before - lamports(&svm, &m), pool, "legacy machine paid the full principal");
+    assert!(position_closed(&svm, &m, &lp.pubkey()));
 }

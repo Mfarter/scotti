@@ -14,6 +14,14 @@
 
 use crate::price::price_1e12_at_tick;
 
+/// Maximum TWAP window a Raydium CLMM observation ring can cover, in seconds
+/// (SCALE.md §5). The ring holds 100 observations and stores at most one per 15s
+/// (`observationUpdateDuration`, ground-truthed in H6a), so the span from oldest to
+/// newest is at most (100−1)×15 = 1485s. A `twap_window_secs` beyond this can be
+/// starved on a BUSY pool (coverage < window → cold-start), so machine creation
+/// rejects it.
+pub const RING_MIN_COVERAGE_SECS: u32 = 99 * 15; // 1485
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleReason {
     /// Newest observation older than `max_staleness` — the pool went quiet.

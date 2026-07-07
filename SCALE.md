@@ -63,18 +63,18 @@ Every finding is triaged into exactly one bucket:
 >   accounts, amounts, rounding, close condition. IDL byte-identical.
 
 Everything else is a **(B) scale limit** or **(C) mainnet-only**. The headline
-(B): withdrawal payouts are **crank-order-dependent** whenever a spin settles
-between two LPs' cranks — the later-cranked LP eats the interleaved variance, and
-the cranker chooses the order. This is the "crank-order / FIFO" item the design
-explicitly deferred; it is bounded per spin by the exposure cap and is liveness-safe
-(any LP can self-crank), but it is genuinely unfair under contention.
+(B) — withdrawal payouts were **crank-order-dependent** (a spin settling between two
+LPs' cranks dumped its cost on whoever was cranked last, cranker-chosen) — is now
+**✅ MITIGATED (SCALE-2)** by a per-epoch conservative price snapshot, upgraded in
+place and verified live (see §1b). SCALE-2 also enforces the §5 TWAP-window bound at
+machine creation.
 
 ### Bucket table
 
 | # | finding | bucket | demonstration |
 |---|---|---|---|
 | 1a | SOL-mode dividend + token withdraw reverted (`UnbalancedInstruction`) — **✅ FIXED (FIX-1)**, live-verified | **A** | `scale_g_fix_*` + `scale_g_regression_*` + control `scale_g2_*` |
-| 1b | Withdrawal payout depends on crank order when a spin interleaves (single: lamport price; dual: token balance) | **B** | `scale_a_crank_order_dumps_interleaved_jackpot_on_later_lp`, `scale_f_dual_token_withdraw_order_payoff` |
+| 1b | Withdrawal payout depended on crank order when a spin interleaves (single + dual token side) — **✅ MITIGATED (SCALE-2)**, live-verified | **B** | `scale_a_crank_order_is_now_price_identical`, `scale_f_dual_token_withdraw_is_now_order_identical` + house-math `snapshot` |
 | 1c | Indefinite starvation by a hostile cranker | not a bug | `scale_b_no_starvation_victim_self_cranks` (permissionless self-crank) |
 | 2 | Pending-spin cap (100) cheaply deniable; self-heals via permissionless expire | **B** | `scale_e_pending_cap_denies_then_permissionlessly_heals`, `scale_model_pending_slot_capital` |
 | 3 | Epoch-boundary drain latency: N positions = N serial cranks | **B** | model (below) + `scale_a`/`w_d` pricing behavior |
@@ -106,48 +106,65 @@ and verified live on `dual-chip-1`
 one crank paid `1,999,486,046,306` CHIP base units + `2,000,000` lamports, exact by
 recompute. **Bucket A, fixed.**
 
-### 1b — (B) the ordering payoff
+### 1b — (B) the ordering payoff — ✅ MITIGATED (SCALE-2)
 
 **Question:** do two LPs with identical requests receive different amounts
 depending on processing order, and can a cranker exploit it?
 
-**Answer: yes, whenever a spin settles between the two cranks.** The payout is
-priced at the pool state *at processing*. Two identical LPs both queue a full exit
-for the same epoch; a **jackpot** settles between their cranks; the LP cranked
-**second** absorbs the entire interleaved loss:
+**Was: yes, whenever a spin settled between the two cranks.** The payout was priced
+at the pool state *at processing*. Two identical LPs both queue a full exit for the
+same epoch; a jackpot settles between their cranks; the LP cranked **second**
+absorbed the entire interleaved loss — single-asset `pay1 − pay2 == max_payout −
+wager`, dual token side `tokens1 − tokens2 == max_payout_tokens`. Being
+permissionless, a cranker could bundle `[process_self, settle_jackpot,
+process_victim]`. (The SOL dividend side was always order-independent — the
+per-share MasterChef ledger.) The magnitude was bounded per spin by the exposure
+cap (≈1% of the pool), accumulating across many interleaved settlements.
 
-- **Single-asset** (`scale_a_crank_order_dumps_interleaved_jackpot_on_later_lp`):
-  lp1 (also the cranker) processes itself at the pre-jackpot price and recovers its
-  full deposit; the jackpot settles; lp2 is processed at the post-jackpot pool. The
-  test pins the gap exactly: `pay1 − pay2 == max_payout − wager` — **the entire net
-  jackpot cost falls on the later LP.** Being permissionless, the cranker can bundle
-  `[process_self, settle_jackpot, process_victim]`.
-- **Dual-asset** (`scale_f_dual_token_withdraw_order_payoff`): dual withdrawals are
-  **price-free** (no TWAP read → manipulation-immune), but the token side is still
-  pro-rata of the token balance *at processing*. So the same payoff applies to the
-  token side: `tokens1 − tokens2 == max_payout_tokens` (the later LP eats the token
-  jackpot). Only the **SOL dividend** side is order-independent — a per-share
-  MasterChef ledger (`k_deposit_accrue_claim`, `worked_example`,
-  house-math `dividend::conservation`). So dual is *manipulation*-fair but not
-  *ordering*-fair on the token side.
+**Now: FIXED by a per-epoch conservative price snapshot (SCALE-2).** At the FIRST
+withdrawal crank of an epoch the machine freezes
+`snapshot_price = (pool_value − reserved_exposure) / total_shares` (single) or
+`(token_balance − reserved_tokens) / total_shares` (dual token side) — the pool
+valued **as if every pending spin hits its reserved maximum** — and every crank that
+epoch pays `fill × snapshot_price`. Within an epoch every share is worth the same
+frozen price, so **order can no longer move money between identical requests**; the
+jackpot's cost lands in the *snapshot* (both LPs exit lower, sharing it), not on
+whoever is cranked last. The free cap still limits how much fills now (pending spins
+stay funded) but never the price. Proven in house-math `snapshot`:
+(a) order-independence, (b) solvency across the full outcome space (free liquidity is
+non-decreasing as pending spins settle, so total snapshot-priced fills always fit),
+(c) anti-hopping preserved (the exit is the PROCESSING epoch's price; a pre-boundary
+loss is borne), (d) surplus conservation (unhit reserve favors stayers). The tests
+were rewritten to their positive forms:
+`scale_a_crank_order_is_now_price_identical` and
+`scale_f_dual_token_withdraw_is_now_order_identical` (identical payouts to the
+lamport / base unit), plus `scale2_multi_epoch_*` (snapshot invalidates at the
+boundary; a loss between epochs lowers the next exit — anti-hopping) and
+`scale2_legacy_zeroed_snapshot_cranks_on_first_use` (backward compatibility).
 
-**Magnitude bound:** the per-spin gap is bounded by the exposure cap — a single
-spin's worst case is `max_payout ≤ ~max_exposure_bp` of the pool (≈1% at the demo
-setting). So one interleaved jackpot shifts ≤ ~1% of the pool onto the later LP;
-the unfairness accumulates only across many interleaved settlements during a drain.
+**Live proof (single-asset, on `house-demo-1`).** Program upgraded in place
+([`5VU3PNuP…`](https://solscan.io/tx/5VU3PNuPEwQMwv1tsS99Ud1T75w3tXFeVD2WnY3jopurkDw2EPJDWGv4fP469bJcAyu4KW3w7VnLqaQLcFe8mqXD?cluster=devnet)),
+then two LPs with identical queued withdrawals were cranked with a real Switchboard
+spin settling between them — crank #1
+([`3LxNj44N…`](https://solscan.io/tx/3LxNj44NkRz5uyv3ediEtfV8STHKqxayhoy9hc84pp9hg2LspsNqh2cuJ2AgQgqyD2WQ6SGp1KZ9o8kcwgL3tC4T?cluster=devnet)),
+the interleaved spin (commit
+[`2dcZbHCU…`](https://solscan.io/tx/2dcZbHCUmvHvVUn4Q2vf45JJsHUtvYPwN143TpNK9GWynTLAe1hoFN7j3Tf8prrrzhD2iQzB5h5qWDvC7ZxfxL5W?cluster=devnet) /
+settle [`5rd2dbwh…`](https://solscan.io/tx/5rd2dbwh7hvnDu1tqrHbmrx5P2FdLA12Da2zpKbcG1gvE9rZjT42D1tJGt6dEYMyR66Rx6EuhqismyaDAFCYewbj?cluster=devnet),
+pool moved 1019017376 → 1019025272), crank #2
+([`79zztZGU…`](https://solscan.io/tx/79zztZGUJcBj3T6jekyJqXuos5yDP1QxFTfnL1yNbJK9Yb8NCN4NVJAn3uoy7BsmnMsYvZAjgipXgdpu6RQajdd?cluster=devnet)).
+Both LPs received **exactly 19,999,999 lamports** at the same frozen snapshot —
+identical despite the interleaved spin. `scripts/scale2-live-orderproof.ts`
+reproduces it.
 
-**Contrast (the fair case):** `w_d_two_lps_sequential_pricing` already shows that
-*absent* a price move, order does **not** change amounts — withdrawals burn shares
-and pool value proportionally, so the share price is invariant to withdrawals
-themselves.
-
-**Bucket B.** **Mitigation (not built):** snapshot a single withdrawal price (single:
-`pool_value/total_shares`; dual: token-per-share) once per epoch boundary and pay
-every queued position of that epoch at that frozen price, or process strictly FIFO
-by request slot with the price fixed at the first processable crank. Either makes
-the interleaved variance shared pro-rata among the epoch's withdrawers instead of
-dumped on whoever is cranked last. This is precisely the "crank-order / FIFO
-consideration for production scale" the design deferred.
+**Why this was a justified revision of the locked "price-at-processing" design:**
+price-at-processing existed to stop pool-hopping — an LP must not lock in a
+request-time price and escape subsequent losses. The snapshot **preserves** that (the
+exit is the processing epoch's price, so pre-boundary losses are still borne) while
+removing only what SCALE-1 proved unfair — order moving money between identical
+requests *within* one epoch. Residual: a NEW spin committed *after* the snapshot that
+then jackpots can force a fill to carry to the next epoch (re-priced), but it never
+causes insolvency and never moves money between two requests filled within the epoch;
+it is strictly smaller than the original whole-jackpot unfairness.
 
 ### 1c — starvation is not possible (self-heal)
 
@@ -309,10 +326,12 @@ regardless of swap rate. Therefore:
   15 s throttle, **any `twap_window_secs > 1485 s` can be starved by a busy pool** —
   so, counterintuitively, a busy pool *can* have less usable window than a quiet one.
 
-**Bucket B.** **Mitigation (not built):** cap `twap_window_secs ≤ 99 × 15 = 1485 s`
-(≈24 min) so the ring always covers it, or read across multiple Raydium observation
-accounts to widen coverage. The current demo value is already safe; the spec's 30-min
-default is the one to correct.
+**Bucket B — ✅ GUARDED (SCALE-2).** `create_machine_dual` now rejects any
+`twap_window_secs > hm::twap::RING_MIN_COVERAGE_SECS` (99 × 15 = 1485 s), so the
+busy-pool starvation can no longer be configured into a machine
+(`scale2_twap_window_guard_rejects_over_ring_coverage`; the demo's 300 s and the
+1485 s boundary are accepted, 1486 s rejected). A future refinement could read across
+multiple observation accounts to widen coverage beyond one ring.
 
 ---
 
@@ -381,16 +400,19 @@ throughput numbers pinned above.
 cd programs/house && cargo build-sbf --features mock-randomness,mock-price,mock-swap && cd ../..
 cargo test -p house --features mock-randomness,mock-price,mock-swap scale_
 
-# pre-existing suites are unchanged (counts rise only by the new scale_* tests):
-cargo test --workspace                                                   # 10 + 48 + 1
-cargo test -p house --features mock-randomness,mock-price,mock-swap      # test_house 19, test_dual 24, gate 1
+# suites (counts rose with the SCALE-1/FIX-1/SCALE-2 tests + house-math snapshot proofs):
+cargo test --workspace                                                   # 10 + 53 + 1
+cargo test -p house --features mock-randomness,mock-price,mock-swap      # test_house 21, test_dual 25, gate 1
 ```
 
 Named tests referenced above:
-`scale_a_crank_order_dumps_interleaved_jackpot_on_later_lp`,
-`scale_b_no_starvation_victim_self_cranks` (test_house.rs);
+`scale_a_crank_order_is_now_price_identical` (SCALE-2, was `scale_a_crank_order_dumps_*`),
+`scale_b_no_starvation_victim_self_cranks`,
+`scale2_multi_epoch_snapshot_invalidates_and_preserves_anti_hopping`,
+`scale2_legacy_zeroed_snapshot_cranks_on_first_use` (test_house.rs);
 `scale_e_pending_cap_denies_then_permissionlessly_heals`,
-`scale_f_dual_token_withdraw_order_payoff`,
+`scale_f_dual_token_withdraw_is_now_order_identical` (SCALE-2, was `scale_f_dual_token_withdraw_order_payoff`),
+`scale2_twap_window_guard_rejects_over_ring_coverage`,
 `scale_g_fix_sol_dividend_plus_token_withdraw_one_crank` (FIX-1, was
 `scale_g_bug_a_*`), `scale_g_regression_combined_equals_claim_then_withdraw`,
 `scale_g2_spl_mode_withdraw_with_dividend_is_fine`,
