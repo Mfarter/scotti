@@ -1290,3 +1290,282 @@ fn scale2_twap_window_guard_rejects_over_ring_coverage() {
             "the ring-coverage boundary (1485s) is allowed");
     assert_eq!(read_machine(&svm, &id).twap_window_secs, 1485);
 }
+
+// ============================================================================
+// REDTEAM-1 adversarial pass (dual). Each test ATTEMPTS an exploit and asserts
+// it is rejected/bounded. See REDTEAM.md. Helpers: try_send returns the error.
+// ============================================================================
+use anchor_lang::solana_program::instruction::AccountMeta as RtMeta;
+
+/// A funded second dual machine, so cross-machine substitution has a real target.
+fn boot_two_machines() -> (LiteSVM, [u8; 16], [u8; 16], Pubkey, Pubkey, Keypair, Keypair) {
+    let (mut svm, ida, minta, admin) = boot_machine(0xD1, BP);
+    // machine B under the same admin/svm.
+    let idb = [0xD2u8; 16];
+    let mintb = Pubkey::new_unique();
+    set_mint(&mut svm, &mintb, DEC);
+    assert!(send(&mut svm, ix_create_dual(idb, &admin.pubkey(), admin.pubkey(), mintb, params(&idb)), &admin, &[&admin]), "create B");
+    assert!(send(&mut svm, ix_set_price(idb, &admin.pubkey(), PRICE, PRICE, 5), &admin, &[&admin]));
+    let lp = funded(&mut svm);
+    deposit(&mut svm, ida, minta, &lp, 10_000);
+    deposit(&mut svm, idb, mintb, &lp, 10_000);
+    (svm, ida, idb, minta, mintb, admin, lp)
+}
+
+// (1) ACCOUNT SUBSTITUTION — a position from machine A cannot be processed against
+// machine B: the `seeds = [b"dual-lp", machine.key(), position.owner]` + `has_one =
+// machine` bind the position to its machine. Attempt: withdraw B while pointing at
+// A's position (to drain B's vault against A's shares).
+#[test]
+fn redteam_cross_machine_position_rejected() {
+    let (mut svm, ida, idb, _minta, mintb, _admin, lp) = boot_two_machines();
+    let cranker = funded(&mut svm);
+    // queue a withdrawal on A.
+    let sh = read_position(&svm, &ida, &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_wd(ida, &lp.pubkey(), sh), &lp, &[&lp]));
+    svm.warp_to_slot(2_000);
+    // ATTACK: process against machine B but pass A's dual-lp position + B's vault.
+    let ma = dmachine(&ida); let mb = dmachine(&idb);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::ProcessWithdrawalToken {}.data(),
+        house::accounts::ProcessWithdrawalToken {
+            machine: mb, position: dlp(&ma, &lp.pubkey()), owner: lp.pubkey(),
+            token_vault: ata(&mb, &mintb), owner_token_account: ata(&lp.pubkey(), &mintb),
+            token_program: token_program(), cranker: cranker.pubkey(), system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &cranker, &[&cranker]).unwrap_err();
+    assert!(err.contains("Seeds") || err.contains("2006") || err.contains("ConstraintSeeds") || err.contains("has_one") || err.contains("2001"),
+            "cross-machine position must be rejected by seeds/has_one: {err}");
+}
+
+// (1) WRONG VAULT — process_withdrawal_token with a token_vault that is NOT the
+// machine's (`#[account(address = machine.token_vault)]`). Attempt: redirect the
+// token debit against a foreign vault.
+#[test]
+fn redteam_wrong_vault_rejected() {
+    let (mut svm, id, mint, _a, _lp, _dep) = boot_dual(0xD3, 10_000);
+    let lp2 = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &lp2, 5_000);
+    let sh = read_position(&svm, &id, &lp2.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_wd(id, &lp2.pubkey(), sh), &lp2, &[&lp2]));
+    svm.warp_to_slot(2_000);
+    let m = dmachine(&id);
+    let foreign_vault = ata(&cranker.pubkey(), &mint); // attacker's own ATA, not the machine's
+    set_token_acct(&mut svm, &foreign_vault, &mint, &cranker.pubkey(), 1_000_000_000);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::ProcessWithdrawalToken {}.data(),
+        house::accounts::ProcessWithdrawalToken {
+            machine: m, position: dlp(&m, &lp2.pubkey()), owner: lp2.pubkey(),
+            token_vault: foreign_vault, owner_token_account: ata(&lp2.pubkey(), &mint),
+            token_program: token_program(), cranker: cranker.pubkey(), system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &cranker, &[&cranker]).unwrap_err();
+    assert!(err.contains("Address") || err.contains("2006") || err.contains("2012") || err.contains("address") || err.contains("ConstraintAddress"),
+            "foreign token_vault must be rejected by the address constraint: {err}");
+}
+
+// (1) FOREIGN PAYEE ATA — spin_settle_dual pays into player_token_account, which is
+// constrained `token::authority = player`. Attempt: settle a spin but redirect the
+// CHIP payout to the ATTACKER's ATA.
+#[test]
+fn redteam_settle_payout_to_foreign_ata_rejected() {
+    let (mut svm, id, mint, _a, _lp, _dep) = boot_dual(0xD4, 2_000_000);
+    let player = funded(&mut svm);
+    let attacker = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    set_token_acct(&mut svm, &ata(&attacker.pubkey(), &mint), &mint, &attacker.pubkey(), 0);
+    // one cherry → a real token payout.
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), 100_000_000, 0), &player, &[&player]));
+    let m = dmachine(&id);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::SpinSettleDual { nonce: 0 }.data(),
+        house::accounts::SpinSettleDual {
+            machine: m, pending_spin: dspin(&m, &player.pubkey(), 0), player: player.pubkey(),
+            randomness: mock_rand_pda(&id), token_vault: ata(&m, &mint),
+            player_token_account: ata(&attacker.pubkey(), &mint), // REDIRECT to attacker
+            token_program: token_program(), cranker: attacker.pubkey(), system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &attacker, &[&attacker]).unwrap_err();
+    assert!(err.contains("token") || err.contains("authority") || err.contains("2015") || err.contains("3013") || err.contains("Constraint"),
+            "payout ATA must be the player's (token::authority = player): {err}");
+}
+
+// (1/5) FOREIGN PRICE ACCOUNT — spin_commit_dual reads the price from price_pool,
+// constrained in the seam by `require_keys_eq!(pool.key(), machine.pool)` +
+// `require_keys_eq!(*pool.owner, crate::ID)`. Attempt: supply a rigged price account
+// to price the spin favorably.
+#[test]
+fn redteam_foreign_price_account_rejected() {
+    let (mut svm, id, _mint, admin, _lp, _dep) = boot_dual(0xD5, 2_000_000);
+    let player = funded(&mut svm);
+    // a rigged MockPrice under a DIFFERENT machine id the attacker can set.
+    let evil = [0xEEu8; 16];
+    assert!(send(&mut svm, ix_set_price(evil, &admin.pubkey(), PRICE * 10, PRICE * 10, 5), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    let m = dmachine(&id);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::SpinCommitDual { wager: 50_000_000, nonce: 0 }.data(),
+        house::accounts::SpinCommitDual {
+            machine: m, pending_spin: dspin(&m, &player.pubkey(), 0), player: player.pubkey(),
+            randomness: mock_rand_pda(&id),
+            price_pool: mock_price_pda(&evil), price_observation: mock_price_pda(&evil), // RIGGED
+            system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &player, &[&player]).unwrap_err();
+    assert!(err.contains("InvalidPriceAccount") || err.contains("6010") || err.contains("6011") || err.contains("Price"),
+            "foreign price account must be rejected (require_keys_eq pool == machine.pool): {err}");
+}
+
+// (5) RANDOMNESS SWAP — spin_settle_dual reads randomness through the seam, which
+// checks `require_keys_eq!(account.key(), pending_spin.randomness)`. Attempt: settle
+// with a DIFFERENT (attacker-filled) randomness account to re-roll the outcome.
+#[test]
+fn redteam_settle_swapped_randomness_rejected() {
+    let (mut svm, id, mint, _a, _lp, _dep) = boot_dual(0xD6, 2_000_000);
+    let player = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    // commit binds the machine's mock randomness (mock_rand_pda(id)).
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [22, 23, 24, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), 50_000_000, 0), &player, &[&player]));
+    // a DIFFERENT machine's filled randomness (JACKPOT bytes) the attacker controls.
+    let evil = [0xEFu8; 16];
+    assert!(send(&mut svm, ix_fill(evil, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    let m = dmachine(&id);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::SpinSettleDual { nonce: 0 }.data(),
+        house::accounts::SpinSettleDual {
+            machine: m, pending_spin: dspin(&m, &player.pubkey(), 0), player: player.pubkey(),
+            randomness: mock_rand_pda(&evil), // SWAPPED randomness
+            token_vault: ata(&m, &mint), player_token_account: ata(&player.pubkey(), &mint),
+            token_program: token_program(), cranker: player.pubkey(), system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &player, &[&player]).unwrap_err();
+    assert!(err.contains("InvalidRandomnessAccount") || err.contains("6008") || err.contains("Randomness"),
+            "swapped randomness must be rejected (require_keys_eq account == pending_spin.randomness): {err}");
+}
+
+/// Drive a machine to a ready-to-compound state: one SPL LP with earmarked SOL, a
+/// funded mock-swap counterparty, warped past an epoch. Returns the pieces to attack.
+#[cfg(feature = "mock-swap")]
+fn ready_compound(seed: u8) -> (LiteSVM, [u8; 16], Pubkey, Keypair, Keypair, Keypair, Pubkey) {
+    let (mut svm, id, mint, _admin) = boot_machine(seed, BP);
+    let spl_lp = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &spl_lp, 10_000);
+    assert!(send(&mut svm, ix_set_mode(id, &spl_lp.pubkey(), house::REWARD_MODE_SPL), &spl_lp, &[&spl_lp]));
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 20);
+    assert!(send(&mut svm, ix_earmark_sol(id, &spl_lp.pubkey()), &spl_lp, &[&spl_lp]));
+    let amm = funded(&mut svm);
+    let amm_tok = ata(&amm.pubkey(), &mint);
+    set_token_acct(&mut svm, &amm_tok, &mint, &amm.pubkey(), (200_000 * CHIP) as u64);
+    svm.warp_to_slot(2_000);
+    (svm, id, mint, spl_lp, cranker, amm, amm_tok)
+}
+
+// (2) COMPOUND OUTPUT-VAULT SUBSTITUTION — the swap deposits into `token_vault`,
+// constrained `#[account(address = machine.token_vault)]`. Attempt: point the
+// compound's output vault at the ATTACKER's ATA to drain the swapped tokens.
+#[cfg(feature = "mock-swap")]
+#[test]
+fn redteam_compound_wrong_output_vault_rejected() {
+    let (mut svm, id, mint, spl_lp, cranker, amm, amm_tok) = ready_compound(0xC1);
+    let m = dmachine(&id);
+    let evil_vault = ata(&cranker.pubkey(), &mint);
+    set_token_acct(&mut svm, &evil_vault, &mint, &cranker.pubkey(), 0);
+    let mut metas = house::accounts::CompoundEpoch {
+        machine: m, position: dlp(&m, &spl_lp.pubkey()), token_vault: evil_vault, // SUBSTITUTED
+        price_pool: mock_price_pda(&id), price_observation: mock_price_pda(&id),
+        token_program: token_program(), cranker: cranker.pubkey(),
+    }.to_account_metas(None);
+    metas.push(RtMeta::new(amm_tok, false));
+    metas.push(RtMeta::new(amm.pubkey(), true));
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::CompoundEpoch {}.data(), metas);
+    let err = try_send(&mut svm, ix, &cranker, &[&cranker, &amm]).unwrap_err();
+    assert!(err.contains("Address") || err.contains("2012") || err.contains("address") || err.contains("ConstraintAddress"),
+            "compound output vault must be machine.token_vault: {err}");
+}
+
+// (2) COMPOUND FOREIGN PRICE ACCOUNT — read_price require_keys_eq(pool == machine.pool)
+// runs BEFORE the gate, so a rigged price reverts (it does NOT no-op past it).
+#[cfg(feature = "mock-swap")]
+#[test]
+fn redteam_compound_foreign_price_rejected() {
+    let (mut svm, id, mint, spl_lp, cranker, amm, amm_tok) = ready_compound(0xC2);
+    let admin_evil = funded(&mut svm);
+    let evil = [0xCEu8; 16];
+    assert!(send(&mut svm, ix_set_price(evil, &admin_evil.pubkey(), PRICE / 10, PRICE / 10, 5), &admin_evil, &[&admin_evil]));
+    let m = dmachine(&id);
+    let mut metas = house::accounts::CompoundEpoch {
+        machine: m, position: dlp(&m, &spl_lp.pubkey()), token_vault: ata(&m, &mint),
+        price_pool: mock_price_pda(&evil), price_observation: mock_price_pda(&evil), // RIGGED
+        token_program: token_program(), cranker: cranker.pubkey(),
+    }.to_account_metas(None);
+    metas.push(RtMeta::new(amm_tok, false));
+    metas.push(RtMeta::new(amm.pubkey(), true));
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::CompoundEpoch {}.data(), metas);
+    let err = try_send(&mut svm, ix, &cranker, &[&cranker, &amm]).unwrap_err();
+    assert!(err.contains("InvalidPriceAccount") || err.contains("6010") || err.contains("6011"),
+            "compound rigged price account must be rejected before the gate: {err}");
+}
+
+// (2) COMPOUND MIN_OUT FLOOR — within the band gate the swap output always clears
+// min_out = value_at_twap × (1 − band). The mock fills at SPOT; the band gate refuses
+// any spot below twap × (1 − band), so a compound can never land below the floor.
+#[cfg(feature = "mock-swap")]
+#[test]
+fn redteam_compound_min_out_floor_holds() {
+    let (mut svm, id, mint, spl_lp, cranker, amm, amm_tok) = ready_compound(0xC3);
+    let admin = funded(&mut svm);
+    let m = dmachine(&id);
+    let vault = ata(&m, &mint);
+    let earmarked = read_machine(&svm, &id).earmarked_sol as u128;
+    let value_at_twap = hm::payout::payout_tokens(earmarked, hm::BP, hm::BP, PRICE, DEC).unwrap();
+    let min_out = value_at_twap * (hm::BP - 300) / hm::BP;
+    let spot_edge = PRICE * 9700 / 10000; // the LEGAL band edge (3% below twap)
+    assert!(send(&mut svm, ix_set_price(id, &admin.pubkey(), PRICE, spot_edge, 5), &admin, &[&admin]));
+    let before = tok_bal(&svm, &vault);
+    assert!(send(&mut svm, ix_compound(id, &spl_lp.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "compound at band edge");
+    let received = (tok_bal(&svm, &vault) - before) as u128;
+    assert!(received >= min_out, "band-edge compound still clears the floor: {received} >= {min_out}");
+}
+
+// (2) COMPOUND BEYOND-BAND NO-OP — spot 4% off twap (> 300bp): the gate refuses and
+// compound succeeds as a no-op (earmark intact, no tokens minted).
+#[cfg(feature = "mock-swap")]
+#[test]
+fn redteam_compound_out_of_band_noops() {
+    let (mut svm, id, mint, spl_lp, cranker, amm, amm_tok) = ready_compound(0xC4);
+    let admin = funded(&mut svm);
+    let ear0 = read_position(&svm, &id, &spl_lp.pubkey()).earmarked_sol;
+    let tb0 = read_machine(&svm, &id).token_balance;
+    assert!(send(&mut svm, ix_set_price(id, &admin.pubkey(), PRICE, PRICE * 9600 / 10000, 5), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_compound(id, &spl_lp.pubkey(), mint, &cranker.pubkey(), &amm.pubkey(), &amm_tok), &cranker, &[&cranker, &amm]), "out-of-band compound no-ops (succeeds)");
+    assert_eq!(read_position(&svm, &id, &spl_lp.pubkey()).earmarked_sol, ear0, "earmark intact — no forced fill");
+    assert_eq!(read_machine(&svm, &id).token_balance, tb0, "no tokens minted out of band");
+}
+
+// (4) DIVIDEND NO-DILUTION, ATTACKED — an attacker deposits RIGHT AFTER a dividend
+// accrues, then tries to claim it. `sol_debt` (house-math `debt_preserving_pending`)
+// gives new shares ZERO entitlement to prior accrual, so the claim pays nothing.
+#[test]
+fn redteam_dividend_prior_accrual_theft_fails() {
+    let (mut svm, id, mint, _admin) = boot_machine(0xC5, BP);
+    let victim = funded(&mut svm);
+    let attacker = funded(&mut svm);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    deposit(&mut svm, id, mint, &victim, 10_000);
+    accrue_yield(&mut svm, id, mint, &player, &cranker, 100_000_000, 30); // 3 SOL accrued to the victim
+    let m0 = read_machine(&svm, &id);
+    let vp0 = read_position(&svm, &id, &victim.pubkey());
+    let victim_owed = hm::dividend::pending_sol(vp0.shares + vp0.pending_shares, vp0.sol_debt, m0.acc_sol_per_share);
+    assert!(victim_owed > 0);
+    deposit(&mut svm, id, mint, &attacker, 100_000); // large LATE deposit
+    let m1 = read_machine(&svm, &id);
+    let ap = read_position(&svm, &id, &attacker.pubkey());
+    assert_eq!(hm::dividend::pending_sol(ap.shares + ap.pending_shares, ap.sol_debt, m1.acc_sol_per_share), 0, "late depositor entitled to ZERO prior accrual");
+    let before = lamports(&svm, &attacker.pubkey());
+    assert!(send(&mut svm, ix_claim_sol(id, &attacker.pubkey()), &attacker, &[&attacker]), "claim");
+    assert!((lamports(&svm, &attacker.pubkey()) as i128 - before as i128) < 0, "theft claim pays no dividend (only fee spent)");
+    let vp1 = read_position(&svm, &id, &victim.pubkey());
+    assert_eq!(hm::dividend::pending_sol(vp1.shares + vp1.pending_shares, vp1.sol_debt, m1.acc_sol_per_share), victim_owed, "victim undiluted");
+}

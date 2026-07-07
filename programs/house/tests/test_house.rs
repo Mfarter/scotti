@@ -1068,3 +1068,145 @@ fn scale2_legacy_zeroed_snapshot_cranks_on_first_use() {
     assert_eq!(vault_before - lamports(&svm, &m), pool, "legacy machine paid the full principal");
     assert!(position_closed(&svm, &m, &lp.pubkey()));
 }
+
+// ============================================================================
+// REDTEAM-1 adversarial pass (single-asset). Each test ATTEMPTS an exploit and
+// asserts it is rejected/bounded. See REDTEAM.md.
+// ============================================================================
+
+// (1) CROSS-MACHINE LP — a position from machine A cannot be processed against B
+// (`has_one = machine` + `seeds=[b"lp", machine.key(), position.owner]`). Attempt:
+// drain B's vault against A's shares.
+#[test]
+fn redteam_cross_machine_lp_rejected() {
+    let (mut svm, ida, admin, _cur, lp) = boot_converged(0xA1, 40_000_000_000);
+    let cranker = funded(&mut svm);
+    // machine B under the same config/admin.
+    let idb = [0xA2u8; 16];
+    let curb = funded(&mut svm);
+    assert!(send(&mut svm, ix_create(idb, &admin.pubkey(), curb.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_deposit(idb, &lp.pubkey(), 40_000_000_000), &lp, &[&lp]));
+    // queue a withdrawal on A.
+    let sh = read_position(&svm, &machine_pda(&ida), &lp.pubkey()).shares;
+    assert!(send(&mut svm, ix_request_withdraw(ida, &lp.pubkey(), sh), &lp, &[&lp]));
+    svm.warp_to_slot(E1_SLOT);
+    // ATTACK: process against B, pointing at A's lp position.
+    let ma = machine_pda(&ida); let mb = machine_pda(&idb);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::ProcessWithdrawals {}.data(),
+        house::accounts::ProcessWithdrawals {
+            machine: mb, position: lp_pda(&ma, &lp.pubkey()), owner: lp.pubkey(),
+            cranker: cranker.pubkey(), system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &cranker, &[&cranker]).unwrap_err();
+    assert!(err.contains("Seeds") || err.contains("2006") || err.contains("has_one") || err.contains("2001") || err.contains("Constraint"),
+            "cross-machine LP must be rejected: {err}");
+}
+
+// (5) SETTLE WITH SWAPPED RANDOMNESS — the seam checks
+// `require_keys_eq!(account.key(), pending_spin.randomness)`. Attempt: settle a
+// committed spin with a DIFFERENT (attacker-filled JACKPOT) randomness account.
+#[test]
+fn redteam_settle_swapped_randomness_rejected() {
+    let (mut svm, id, _a, _c, _lp) = boot_converged(0xA3, 50_000_000_000);
+    let player = funded(&mut svm);
+    let attacker = funded(&mut svm);
+    // commit against this machine's mock randomness (a losing fill).
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), { let mut b=[0u8;32]; b[0]=22;b[1]=23;b[2]=24; b }), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), 100_000, 0), &player, &[&player]));
+    // a foreign machine's mock randomness, filled with JACKPOT, that the attacker points settle at.
+    let evil = [0xAEu8; 16];
+    // create the evil machine so its mock-rand PDA is program-owned & fillable.
+    let curx = funded(&mut svm);
+    assert!(send(&mut svm, ix_create(evil, &_a.pubkey(), curx.pubkey()), &_a, &[&_a]));
+    assert!(send(&mut svm, ix_fill(evil, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    let m = machine_pda(&id);
+    let ix = Instruction::new_with_bytes(pid(), &house::instruction::SpinSettle { nonce: 0 }.data(),
+        house::accounts::SpinSettle {
+            machine: m, pending_spin: spin_pda(&m, &player.pubkey(), 0), player: player.pubkey(),
+            randomness: mock_pda(&evil), // SWAPPED
+            cranker: attacker.pubkey(), system_program: system_program::ID,
+        }.to_account_metas(None));
+    let err = try_send(&mut svm, ix, &attacker, &[&attacker]).unwrap_err();
+    assert!(err.contains("InvalidRandomnessAccount") || err.contains("6008") || err.contains("Randomness"),
+            "swapped randomness must be rejected: {err}");
+}
+
+// (4) MAX_BET / EXPOSURE CAP EDGE — a wager one lamport above the solvency-derived
+// max_bet is rejected; the max legal wager reserves ≤ MAX_EXPOSURE_BP (1%) of the
+// pool. Attempt: escape the exposure cap by sizing the wager to the boundary.
+#[test]
+fn redteam_max_bet_cap_holds_at_the_edge() {
+    let pool = 50_000_000_000u64;
+    let (mut svm, id, _a, _c, _lp) = boot_converged(0xA4, pool);
+    let player = funded(&mut svm);
+    let (_is_deep, _k, max_bet) = converged_snapshot(pool as u128);
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), { let mut b=[0u8;32]; b[0]=22;b[1]=23;b[2]=24; b }), &player, &[&player]));
+    // wager = max_bet + 1 → rejected.
+    let err = try_send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), max_bet as u64 + 1, 0), &player, &[&player]).unwrap_err();
+    assert!(err.contains("BetExceedsMax") || err.contains("6005"), "over-max wager rejected: {err}");
+    // wager = max_bet → accepted; the reserved exposure stays within ~1% of the pool.
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), max_bet as u64, 1), &player, &[&player]), "max wager accepted");
+    let reserved = read_machine(&svm, &id).reserved_exposure;
+    assert!((reserved as u128) <= pool as u128 * (EXPO_BP as u128) / 10_000 + 1, "reserved ≤ 1% of pool: {reserved}");
+}
+
+// (4) DUST ROUND-TRIP — deposit then immediately withdraw. The snapshot floors TOWARD
+// the pool, so a round-trip nets ≤ 0 for the attacker: dust favors the pool/stayers,
+// never the attacker. Attempt: harvest flooring dust via repeated deposit/withdraw.
+#[test]
+fn redteam_dust_roundtrip_never_profits() {
+    let pool = 40_000_000_000u64;
+    let (mut svm, id, _a, _c, _seed) = boot_converged(0xA5, pool);
+    let m = machine_pda(&id);
+    let attacker = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    let dep = 7_000_000_001u64; // odd amount to court rounding
+    let mut slot = E1_SLOT;
+    for cycle in 0..3 {
+        let before = lamports(&svm, &attacker.pubkey());
+        assert!(send(&mut svm, ix_deposit(id, &attacker.pubkey(), dep), &attacker, &[&attacker]));
+        let sh = read_position(&svm, &m, &attacker.pubkey()).shares;
+        assert!(send(&mut svm, ix_request_withdraw(id, &attacker.pubkey(), sh), &attacker, &[&attacker]));
+        slot += 2_000; svm.warp_to_slot(slot); svm.expire_blockhash();
+        assert!(send(&mut svm, ix_process(id, &attacker.pubkey(), &cranker.pubkey()), &cranker, &[&cranker]));
+        let net = lamports(&svm, &attacker.pubkey()) as i128 - before as i128;
+        assert!(net <= 0, "cycle {cycle}: round-trip never profits (dust favors the pool): net {net}");
+    }
+}
+
+// (3) SNAPSHOT / HOSTILE CRANKER — the cranker chooses WHEN in the epoch to freeze
+// the snapshot, but every withdrawer of that epoch is priced at the SAME frozen
+// value, so a cranker cannot advantage one identical request over another by
+// ordering. (The freeze-timing lever — a cranker-LP timing a favorable pool moment
+// vs stayers — is bounded per spin by the exposure cap; see REDTEAM.md §3.) Attempt:
+// a hostile cranker freezes, then reorders to pay two identical LPs differently.
+#[test]
+fn redteam_snapshot_cranker_cannot_split_identical_lps() {
+    let pool = 40_000_000_000u64;
+    let (mut svm, id, _a, _c, lp1) = boot_converged(0xA6, pool);
+    let m = machine_pda(&id);
+    let lp2 = funded(&mut svm);
+    let player = funded(&mut svm);
+    assert!(send(&mut svm, ix_deposit(id, &lp2.pubkey(), pool), &lp2, &[&lp2]));
+    let s1 = read_position(&svm, &m, &lp1.pubkey()).shares;
+    let s2 = read_position(&svm, &m, &lp2.pubkey()).shares;
+    // a pending spin whose settle the cranker will interleave to try to split them.
+    let (is_deep, k, max_bet) = converged_snapshot(2 * pool as u128);
+    let _ = (is_deep, k);
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), [0u8; 32]), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(id, &player.pubkey(), mock_pda(&id), (max_bet / 2) as u64, 0), &player, &[&player]));
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp1.pubkey(), s1), &lp1, &[&lp1]));
+    assert!(send(&mut svm, ix_request_withdraw(id, &lp2.pubkey(), s2), &lp2, &[&lp2]));
+    svm.warp_to_slot(E1_SLOT);
+    // cranker (lp2) freezes on lp1, jackpots, then cranks itself — the SCALE-1 attack.
+    let v1 = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp1.pubkey(), &lp2.pubkey()), &lp2, &[&lp2]));
+    let pay1 = v1 - lamports(&svm, &m);
+    let snap = read_machine(&svm, &id).withdraw_snapshot_price;
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mock_pda(&id), 0, &lp2.pubkey()), &lp2, &[&lp2]));
+    let v2 = lamports(&svm, &m);
+    assert!(send(&mut svm, ix_process(id, &lp2.pubkey(), &lp2.pubkey()), &lp2, &[&lp2]));
+    let pay2 = v2 - lamports(&svm, &m);
+    assert_eq!(pay1, pay2, "hostile cranker cannot split identical LPs: {pay1} == {pay2}");
+    assert_eq!(pay1 as u128, hm::snapshot::payout(s1, snap), "both at the frozen snapshot");
+}

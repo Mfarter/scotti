@@ -523,6 +523,16 @@ deploy `dist/` as static files. The app uses hash routing (`/#/machine/…`), so
 **no SPA rewrite rule is needed**: point the host at `app/` with build command
 `npm run build`, output directory `dist`, and `VITE_RPC_URL` as an env var.
 
+## Analysis & security
+
+[`REDTEAM.md`](./REDTEAM.md) is an adversarial security pass — account substitution
+on every instruction, the swap-CPI `remaining_accounts` surface, the SCALE-2 snapshot,
+economic/rounding attacks, the randomness/price gate, and the indexer — with every
+"safe" claim backed by a `redteam_*` attack test that *attempts* the exploit and is
+rejected/bounded (15 on-chain + 6 indexer). No exploit moved funds, minted, or bypassed
+auth; findings are defense-in-depth hardening only (pin the swap pool; per-spin ingest
+try/catch; the bounded snapshot freeze-timing lever).
+
 ## Production-scale analysis
 
 [`SCALE.md`](./SCALE.md) analyzes how the design behaves at volume — withdrawal
