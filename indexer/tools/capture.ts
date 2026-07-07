@@ -1,6 +1,10 @@
 // One-off: capture real devnet settle txs (and everything ingestSettle needs) into
 // test/fixtures/*.json so the parser/recompute/idempotency tests run offline and
-// deterministically. Re-run only to refresh fixtures:  node test/capture.ts
+// deterministically. Re-run only to refresh fixtures:  node tools/capture.ts
+//
+// This lives OUTSIDE test/ on purpose: Node's test runner auto-executes every file
+// in a test/ directory, so keeping it here would make a bare `node --test` re-fetch
+// live devnet and rewrite the fixtures on every run.
 import { writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -10,7 +14,7 @@ import { decodeDualMachine } from "../src/dual-decode.ts";
 import { PROGRAM_ID } from "../src/config.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DIR = join(HERE, "fixtures");
+const DIR = join(HERE, "..", "test", "fixtures"); // tools/ -> ../test/fixtures
 mkdirSync(DIR, { recursive: true });
 
 // name → settle signature. Chosen to cover: single win, single loss, dual win
