@@ -164,6 +164,21 @@ CHIP/WSOL CLMM pool — see *Dual-asset machines* below for the design.
 | machine | address |
 |---|---|
 | `dual-chip-1` | `6vyARZoi4Kc81ZLHYxYDhE4JGH5Db4zf1u8xvLJEvYzL` |
+| `vault-set-1` (VAULT-1, permissionless, 1-pool set) | `86JGeQXykW69jydjUXxWfUBk6KpgHSm8sVvE1fKfrxPE` |
+
+**Pool liquidity (`scripts/devnet-liquidity.ts`, LIQ-1).** The pool was seeded thin
+in H6a (0.3 WSOL + ~266 CHIP), so swaps moved it a lot and the TWAP was usually
+STALE. `devnet-liquidity.ts` supplies real liquidity: it reuses the Raydium SDK v2
+CLMM path (the same one proven by the H6a seed tx) to **increase our in-range
+concentrated position** — idempotently, in one atomic tx (re-running increases the
+same position; only after a devnet reset, with no position, does it open a wide
+`±range-pct` one). It pairs `--sol` WSOL (wrapped via the SDK) with CHIP minted
+from our devnet CHIP mint authority. LIQ-1 added 1.6 WSOL + ~1,264 CHIP, taking
+pool liquidity `L` from `37,305,335,910` → `225,996,431,177` (**6.06×**); a 0.002-SOL
+dust swap's price impact dropped from ~0.47% to **0.078%**, and a live compound
+swap filled within ~0.11% of TWAP (fee + near-zero slippage). Re-run after a reset
+with `HOUSE_RPC=<devnet> node scripts/devnet-liquidity.ts --sol 1.6` (keep the
+keeper running — `node scripts/keeper.ts` — so the TWAP stays fresh).
 
 ### Verified artifacts (each reconciled to the base unit by independent recompute)
 
@@ -180,6 +195,12 @@ CHIP/WSOL CLMM pool — see *Dual-asset machines* below for the design.
 | H6b-3 `claim_sol` | [`46y4nJ…`](https://solscan.io/tx/46y4nJtBM6EYJvgbo7mVyCfy2yMXdhnDe3h1iz2DiJENrp9vnQqBQE4z9ZrKrLLkaFbpRGe7u9fbsnKkxsWfyKZ2?cluster=devnet) | SOL dividend paid from the MasterChef ledger |
 | H6c-1 live `compound_epoch` | [`5P8zLq…`](https://solscan.io/tx/5P8zLq6tqBtX35xvH2k8VeksddoJ6VoXmkjnKKsubc2JTGm4mJ5j95xBn9ALCndv1UWPbYL6cPUsTDov7KF9zWQP?cluster=devnet) | real `swap_v2` CPI (174,732 CU): machine SOL −earmark, vault CHIP +3,913,661,140 (≥ TWAP×(1−band)), shares minted non-dilutively |
 | H6c-2 UI dual spin (`spin_settle_dual`) | [`Gc874Z…`](https://solscan.io/tx/Gc874Zcxrh37PWL9mpce8NWTUx7pYtjPfW1BpB9B8C7ynfmcKSoCkrUTVXMdApg7skKWnpwhoVZoAhc6LGZ5Uv2?cluster=devnet) | CHERRY · BLANK · CHERRY, 3.83 CHIP, recompute == paid; price independently recomputed from the ring at 977.67 vs the 977.65 snapshot (0.15 bp) |
+| LIQ-1 pool deepen (`increase_liquidity`) | [`q1gfYV…`](https://solscan.io/tx/q1gfYVsatdSgzA92XZwCGkjHfFjLqKH1GSw9j8zjbeppwUgHeTvy5D11rCUzPFw6nd8iCkwNcML3k6ohoZpXNz6?cluster=devnet) | position `G8t8Y5…9Yff` +1.6 WSOL +1,264 CHIP; pool `L` 37,305,335,910 → 225,996,431,177 (6.06×); dust-swap impact ~0.47% → 0.078% |
+| LIQ-1 LIVE dual spin (`spin_settle_dual`) | [`4Jajay…`](https://solscan.io/tx/4JajaYiXcpG2Yv1umoW9tRHcfkMaazh6yLUGaGAZDmmY9ZcqsCHnEYTKe6pmq3vbN61y7ahzDCmoE8w7YEUMzEwi?cluster=devnet) | BAR · CHERRY · CHERRY at LIVE TWAP (price_at_commit 972.58, k 10337); CHIP paid 2,211,791,206 == recompute |
+| LIQ-1 `compound_epoch` (deep pool) | [`tM7tQX…`](https://solscan.io/tx/tM7tQX41dBHB4uBdj7NKTspe3kTLtqVvXuzxQjQ6d6YtFePQ56MJWZajiTiWks341QCCcMEgouxFTrG1WzvsVma?cluster=devnet) | real swap filled 2,914,863,458 CHIP (≥ min_out 2,830,571,978, ~0.11% below TWAP — near-zero impact); SOL −earmark, shares minted non-dilutively; all checks pass |
+| VAULT-1 program upgrade | [`4yXwtT…`](https://solscan.io/tx/4yXwtTFTNzkzBNj4qKszBrSKYoXp7k3apJwKGBqAVJHbtnzQXC1RbU83DxsZesRYZny3qj5GnjA6hofgVPoKkczY?cluster=devnet) | in-place upgrade (601,312 → 654,488 bytes) added permissionless pool-set vaults; `dual-chip-1` byte-identical after |
+| VAULT-1 permissionless `create_vault` | [`2nV1XR…`](https://solscan.io/tx/2nV1XRUCbXzzgujvTm5mM4yHmEsPySftkXv6w1JoBHetpduLATic3vKGo8igbVPVafpFGSQnAAcNJdYWbKyCqdQL?cluster=devnet) | a NON-authority throwaway (`Ev8rR1…`) created vault `86JGeQ…` as a 1-pool set on CHIP/WSOL (rent only, no admin) |
+| VAULT-1 pool-set spin (`spin_settle_dual`) | [`28Q8Wo…`](https://solscan.io/tx/28Q8Wo8LYxsSRmGUyPrreP3yoZZMUz87B5Xm2UNeu3Y8dGmDq3nacR94a8XL9z24BBSupeExkELos97LH3LP26Fz?cluster=devnet) | BLANK · CHERRY · CHERRY priced by the on-chain median of the set (972.0974 CHIP/SOL); 2,210,685,642 CHIP == recompute |
 
 The three H2 spins' full commit/settle signatures and revealed randomness live in
 `scripts/spins/`. `spin_expire` (reveal-never-arrives refund) needs a ~9000-slot
@@ -262,6 +283,30 @@ and the manipulation defenses a price input demands. Full design in
   Withdrawals pay `shares/total_shares` of **both** assets, price-free and
   manipulation-immune; "excess SOL evenly distributed between stakers" falls out
   automatically.
+
+### Permissionless vaults with multi-pool price sets (VAULT-1)
+
+Vault creation is **permissionless** — anyone runs `create_vault` (rent only, no
+admin) to launch an SPL/dual vault and becomes its curator with **pause rights
+only**; single-asset SOL machines stay admin-gated and untouched. The price link
+generalizes from one CLMM pool to a **set of 1–5 pools** of the payout token,
+combined by a **median gated by a majority quorum** (1-of-1 … 3-of-5). Each pool
+must independently pass the same freshness + spot-vs-TWAP band gate to be counted,
+then the aggregate is the **median** of the eligible TWAPs — so moving a *minority*
+of the pools cannot drag the price past the honest band, and each corrupted pool
+still costs a full single-pool TWAP displacement (house-math proves the bound
+exhaustively; odd set sizes are the recommended, strongest case).
+
+The set lives in a fixed-size **`PoolSet` companion PDA** created with the vault;
+`DualMachine` gains a one-byte `pool_set_len` **carved from its reserved tail**, so
+its on-disk size is **unchanged (409 B)** and the live `dual-chip-1` (a legacy
+single-pool vault, `pool_set_len == 0`) keeps working **byte-identically** — no
+migration needed. Every risk param is clamped so the **margin-floor invariant holds
+for any user input** (realized RTP stays in the dual `[92%, 95%]` corridor; no vault
+can be a faucet). What is *not* promised across user vaults is a global odds
+ordering — each vault sets its own curve knees within the clamped corridor. Full
+design, proofs, clamp table, and the live devnet proof: **`H6-DUAL-ASSET-SPEC.md`
+§8**.
 
 ### Price infrastructure ground-truth (H6a)
 
@@ -459,19 +504,19 @@ deployable artifact.
 # 1. deployable build: clean .so + IDL (no mocks)
 anchor build
 
-# 2. pure-math proofs (48) + switchboard seam unit tests + the mock-gate check
+# 2. pure-math proofs (67) + switchboard seam unit tests + the mock-gate check
 cargo test --workspace                      # green with NO feature flags
 
 # 3. the single-asset LiteSVM suite (needs the randomness mock in the .so)
 cd programs/house && cargo build-sbf --features mock-randomness && cd ../..
-cargo test -p house --features mock-randomness              # test_house.rs (17)
+cargo test -p house --features mock-randomness              # test_house.rs (29)
 
-# 4. the FULL LiteSVM suite incl. dual-asset + compound (all three mock seams)
+# 4. the FULL LiteSVM suite incl. dual-asset + compound + VAULT-1 pool sets
 cd programs/house && cargo build-sbf --features mock-randomness,mock-price,mock-swap && cd ../..
-cargo test -p house --features mock-randomness,mock-price,mock-swap   # + test_dual.rs (17)
+cargo test -p house --features mock-randomness,mock-price,mock-swap   # + test_dual.rs (43)
 ```
 
-`cargo test --workspace` stays green with no feature: it runs the 48 house-math
+`cargo test --workspace` stays green with no feature: it runs the 67 house-math
 proofs, the switchboard seam unit tests, and the mock-gate test; the LiteSVM
 suites are `#![cfg]`-gated on their mock features and skipped there (they need the
 mock `.so` anyway). The dual/compound tests (`test_dual.rs`) are gated on all three
@@ -500,6 +545,7 @@ npm run keeper                              # keep observations fresh
 npm run twap-demo                           # the full STALE→LIVE→band→stale artifact
 node keeper.ts --interval 16 & node devnet-dual-spin.ts   # freshen TWAP, then a live dual spin
 node devnet-compound.ts                     # a live compound (freshen TWAP first)
+node keeper.ts --swaps 30 & node vault1-live-proof.ts    # VAULT-1: permissionless pool-set vault + spin
 ```
 
 `spin` bundles the Switchboard create+commit with `spin_commit` in one tx, waits

@@ -197,3 +197,147 @@ internal, so donations to either side remain inert (HOUSE-SPEC rule).
   that price and a valid k. Verified by a live UI-driven dual spin (CHERRY·BLANK·CHERRY, 3.83 CHIP,
   recompute == paid to the base unit; ring price 977.67 vs 977.65 snapshot, 0.15bp) — see README
   "The app · Verified". The protection made visible, end to end.
+
+---
+
+## 8. VAULT-1 — permissionless vaults with multi-pool price sets
+
+**Status — shipped + LIVE on devnet.** Generalizes the H6 dual vault two ways: (a)
+creation is **permissionless** (anyone creates an SPL/dual vault; single-asset SOL
+machines remain admin-only and are untouched), and (b) the price link generalizes
+from ONE Raydium CLMM pool to a **pool SET of 1–5 pools** of the vault's payout
+token, aggregated by a manipulation-resistant **median + quorum**. Interpretation
+is fixed: one vault, one payout token, up to five pools pricing THAT token.
+
+### 8.1 The aggregator (`house-math::aggregator`)
+
+At commit, each set member is read through the UNCHANGED per-pool price seam
+(`read_clmm_price` → spot, TWAP, observation age). Per-pool rules are reused
+verbatim from §2–§3:
+
+- **Eligibility.** A pool is *eligible* iff it is **fresh** (newest observation
+  within `max_staleness`, TWAP window covered) AND its own **spot is within
+  `band_bp` of its own TWAP**. This is byte-for-byte the single-pool gate applied
+  per pool — a member must still pay the full single-pool TWAP-displacement cost to
+  be counted.
+- **Aggregate = MEDIAN** of the eligible members' TWAPs (a true order statistic —
+  `sorted[m/2]`, integer-exact, never an average, so the result is always one real
+  pool's TWAP).
+- **Quorum gate.** A commit is allowed iff `eligible ≥ quorum`, where `quorum` is a
+  strict majority of the SET size:
+
+  | set_len | 1 | 2 | 3 | 4 | 5 |
+  |---|---|---|---|---|---|
+  | quorum  | 1 | 2 | 2 | 3 | 3 |
+
+  Below quorum ⇒ `QuorumNotMet` (the commit is refused, exactly as a single stale
+  pool refuses today).
+
+**Pinned proofs** (house-math, all green):
+
+1. **Bounded manipulation.** If a strict majority of the eligible pools are honest
+   and inside the band `[P(1−b), P(1+b)]`, the median is inside the band — proven
+   exhaustively over every eligible count 1–5, every choice of which pools are
+   adversarial, and adversaries pinned at both extremes. Corollary for the
+   **recommended ODD sizes (1, 3, 5)**: `quorum = ⌈n/2⌉`, so corrupting **fewer
+   than quorum** pools leaves the aggregate in the band — the headline guarantee.
+   Each corrupted pool still costs a full single-pool TWAP displacement, so the
+   pool set multiplies the single-pool attack cost by the honest-majority
+   threshold.
+2. **Determinism / integer-exactness.** The median is a pure integer function; same
+   inputs → same output; result ∈ the inputs (no float, no synthetic average).
+3. **Single-pool degeneracy.** A 1-pool set returns EXACTLY that pool's TWAP and
+   refuses in EXACTLY the cases the single-pool machine refuses — the bit-identical
+   guarantee. Legacy vaults (`pool_set_len == 0`) don't even enter this path.
+
+**Documented residual (`even_set_tie_is_the_residual`).** Even sizes (2, 4) have a
+50% median breakdown at the tie: an adversary controlling *exactly half* the
+eligible pools can move an even-count median (one pool short of the odd-set bound).
+Even vaults stay solvent (the per-pool band and the margin floor still bind) but
+need strictly more than half honest. **The spec therefore RECOMMENDS odd set sizes;
+even sets are permitted but weaker.**
+
+### 8.2 Account design (price-plumbing only)
+
+The five (pool, observation) pairs don't fit `DualMachine`'s reserved tail, so the
+set lives in a **companion `PoolSet` PDA** (`["pool-set", machine]`), fixed 394 B,
+created WITH the vault and never resized: `machine`, `set_len`, `pools[5]`,
+`observations[5]`. `DualMachine` gains a single `pool_set_len: u8` **carved from the
+first byte of its reserved tail** (reserved 16 → 15). SIZE stays **409 bytes** —
+identical on disk — so **live `dual-chip-1` keeps deserializing untouched**: its
+reserved bytes are all zero, so `pool_set_len` reads 0 and it follows the unchanged
+single-pool path. No account type's size changes; no LP/ledger/dividend field
+moves. This is **price plumbing only** (a stop-and-report trigger was that it must
+not force accounting changes — it does not). Migration of `dual-chip-1` is **not
+needed**: `pool_set_len == 0` IS the legacy reading, so it works as-is (verified
+byte-identical live).
+
+Set member 0 becomes the vault's primary pool (`m.pool` / `m.observation`) — so the
+**compound swap venue** (the HARDEN-1 pin `swap pool == m.pool`) is now provably a
+member of the set (generalizing the pin to set membership), and member 0 doubles as
+the aggregator's legacy-shaped named price account.
+
+### 8.3 Permissionless `create_vault` + the clamp table
+
+`create_vault` has **no admin/config gate**: the creator signs and pays **rent
+only** (no protocol fee) for the `DualMachine`, its `PoolSet`, and the token vault
+ATA, and becomes the **curator with PAUSE rights only** (`set_paused_dual`) — no
+odds control beyond the create-time params. Each candidate pool is validated:
+owned by the Raydium CLMM program, **actually pairs the payout mint** (one side of
+`PoolState` = the vault mint, else `PoolMintMismatch`), pool↔observation
+cross-linked, and **distinct** (`DuplicatePool`). Under the mock-price seam these
+CLMM-structure checks fold to a program-owner check (the mock has no pool state);
+the deployable branch does the full parse (zero mock surface in the shipped IDL).
+
+Every risk param is CLAMPED so the **H6b margin-floor invariant holds for ANY user
+input** (`validate_dual_params`, proven exhaustively over ~14.6M configs — the
+same gate `create_machine_dual` uses):
+
+| Param | Min | Max | Note |
+|---|---|---|---|
+| `set_len` | 1 | 5 | pool-set size (odd recommended) |
+| `d_low, d_mid, d_high` | — | — | `0 < d_low < d_mid < d_high` |
+| `max_exposure_bp` | 1 | 10000 | ≤100% of token depth per spin |
+| `smooth_window` | 1 | — | anti-snipe slots |
+| `epoch_length` | 1 | — | withdrawal-epoch slots |
+| `token_decimals` | 0 | 18 | |
+| `twap_window_secs` | 1 | 1485 | Raydium ring coverage cap |
+| `max_staleness_secs` | 1 | — | |
+| `max_pending_spins` | 1 | — | |
+| `haircut_bp` | 0 | 10000 | reveal-drift reserve cushion |
+| `rtp_max_bp` | **9200** | **9500** | dual realized-RTP ceiling band |
+| `band_bp` | 0 | **300** | spot-vs-TWAP gate cap |
+| `m_bp` (margin floor) | **200** | <10000 | AND `rtp_max·(BP+band) ≤ (BP−m)·BP` |
+
+The last row is the binding invariant: `margin_floor_holds` is checked on the
+user's own `(rtp_max, band, m)`, so no accepted config — for any pool set — can
+cross the house floor even at worst-case band drift (`margin.rs` proves the 300bp
+cap sits 15bp inside the true boundary).
+
+### 8.4 Cross-vault coherence — what IS and ISN'T guaranteed
+
+Dual vaults keep **per-vault** curve knees `(d_low, d_mid, d_high)` (the ODDS-1
+normalized protocol curve is single-asset floor scope, unchanged). The clamps make
+the cross-vault story **coherent but not normalized**:
+
+- **Guaranteed for every user vault:** realized RTP lives in the dual `[92%, 95%]`
+  corridor; the margin floor holds under the band gate (no vault is ever a faucet);
+  the haircut reserve covers every outcome (solvency); the payout VALUE is
+  invariant to the snapshot price (the median only rescales the token count).
+- **NOT guaranteed across vaults:** a global odds ORDERING. Unlike the single-asset
+  protocol curve (lowest pool value ⇒ best odds, one monotone function), two
+  different user vaults are not comparable by pool value — each sets its own knees
+  within the clamped corridor. The clamps guarantee every vault is *solvent and
+  inside the same RTP band*, not that vaults are *ranked* by depth.
+
+### 8.5 Live proof (devnet)
+
+Program upgraded in place (601312 → 654488 bytes). A SECOND vault was created
+**permissionlessly from a fresh non-authority wallet**
+(`Ev8rR17SuDm4C5MThBznbfeDvshX6tsmU5oKRhmVexJc`) as a 1-pool set on the CHIP/WSOL
+pool, deposited (20,000 CHIP), and spun once through the on-chain aggregator path
+(`pool_set_len = 1`, PoolSet `7dmx8UzQ…`): `BLANK·CHERRY·CHERRY` at 972.0974
+CHIP/SOL → **2,210,685,642 base units, matching an independent recompute exactly**.
+`dual-chip-1` was **byte-identical before and after**. New vault
+`86JGeQXykW69jydjUXxWfUBk6KpgHSm8sVvE1fKfrxPE`; script `scripts/vault1-live-proof.ts`.
+(The user-facing docs/frontend page is VAULT-2.)
