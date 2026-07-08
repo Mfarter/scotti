@@ -135,6 +135,16 @@ export function vaultMachineId(label: string): Buffer {
 }
 export const vaultMachinePda = (id: Buffer) => PublicKey.findProgramAddressSync([Buffer.from("dual-machine"), id], PROGRAM_ID)[0];
 
+/** register_legacy_mint — permissionless grandfathering: claim the mint-registry
+ *  slot for an EXISTING DualMachine (VAULT-3). `mint` is that machine's token_mint. */
+export function ixRegisterLegacyMint(machine: PublicKey, mint: PublicKey, payer: PublicKey): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [meta(machine, false, false), meta(mintRegistryPda(mint), false, true), meta(payer, true, true), meta(SYS, false, false)],
+    data: ixDisc("register_legacy_mint"),
+  });
+}
+
 /** create_vault — permissionless. Accounts + remaining members mirror
  *  scripts/vault1-live-proof.ts exactly. `members` = the (pool, observation) set. */
 export function ixCreateVault(
