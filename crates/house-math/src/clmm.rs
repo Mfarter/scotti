@@ -46,6 +46,17 @@ pub fn pool_sqrt_price_x64(pool: &[u8]) -> u128 { u128_le(pool, POOL_SQRT_PRICE_
 pub fn pool_tick_current(pool: &[u8]) -> i32 { i32_le(pool, POOL_TICK_CURRENT) }
 /// Spot price scaled 1e12 from PoolState.sqrt_price (equal-decimals orientation).
 pub fn pool_spot_1e12(pool: &[u8]) -> u128 { price_1e12_from_sqrt_x64(pool_sqrt_price_x64(pool)) }
+/// PoolState.mint_a / mint_b — 32-byte pubkeys, pinned offsets 73 / 105. VAULT-1
+/// permissionless `create_vault` parses these to prove a candidate pool actually
+/// pairs the vault's payout mint (one side must equal it) before admitting it to
+/// the set. The H6a orientation is mintA = WSOL (quote), mintB = the token.
+pub fn pool_mint_a(pool: &[u8]) -> [u8; 32] { let mut k = [0u8; 32]; k.copy_from_slice(&pool[POOL_MINT_A..POOL_MINT_A + 32]); k }
+pub fn pool_mint_b(pool: &[u8]) -> [u8; 32] { let mut k = [0u8; 32]; k.copy_from_slice(&pool[POOL_MINT_B..POOL_MINT_B + 32]); k }
+/// True iff `mint` is one side of the pool (the payout-mint-pairing check).
+pub fn pool_pairs_mint(pool: &[u8], mint: &[u8; 32]) -> bool {
+    pool.len() >= POOL_SPAN && (&pool_mint_a(pool) == mint || &pool_mint_b(pool) == mint)
+}
+
 /// PoolState.observation_id / ObservationState.pool_id — 32-byte pubkeys, for the
 /// caller's cross-link checks (pool ↔ observation).
 pub fn pool_observation_id(pool: &[u8]) -> [u8; 32] { let mut k = [0u8; 32]; k.copy_from_slice(&pool[POOL_OBSERVATION_ID..POOL_OBSERVATION_ID + 32]); k }
@@ -188,6 +199,25 @@ mod proofs {
             }
             other => panic!("expected LIVE twap, got {other:?}"),
         }
+    }
+
+    /// PROOF (VAULT-1 payout-mint pairing): `pool_pairs_mint` accepts a mint that
+    /// sits on EITHER side of the pool and rejects a foreign one — the create-time
+    /// check that a candidate set member actually prices the vault's payout token.
+    /// Uses the captured live pool's real mint_a / mint_b.
+    #[test]
+    fn pool_pairs_mint_matches_either_side() {
+        let a = pool_mint_a(POOL_BYTES);
+        let b = pool_mint_b(POOL_BYTES);
+        assert_ne!(a, [0u8; 32], "pool stores mint_a");
+        assert_ne!(b, [0u8; 32], "pool stores mint_b");
+        assert_ne!(a, b, "the two sides are distinct mints");
+        assert!(pool_pairs_mint(POOL_BYTES, &a), "mint_a pairs the pool");
+        assert!(pool_pairs_mint(POOL_BYTES, &b), "mint_b pairs the pool");
+        let foreign = [7u8; 32];
+        assert!(!pool_pairs_mint(POOL_BYTES, &foreign), "a foreign mint does NOT pair the pool");
+        // a short buffer never spuriously matches.
+        assert!(!pool_pairs_mint(&POOL_BYTES[..POOL_SPAN - 1], &a));
     }
 
     /// PROOF: a `now` far past the newest observation (the live-STALE case: the

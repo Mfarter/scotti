@@ -58,6 +58,8 @@ fn default_build_idl_has_no_mock_surface() {
         "claim_sol", "earmark_sol", "set_reward_mode",
         "request_withdraw_token", "cancel_withdraw_token", "process_withdrawal_token",
         "compound_epoch",
+        // VAULT-1 permissionless pool-set surface (real, not mock).
+        "create_vault", "set_paused_dual",
     ] {
         assert!(instrs.iter().any(|n| n == needed),
             "dual-asset instruction '{needed}' missing from the default-build IDL");

@@ -1598,3 +1598,315 @@ fn redteam_compound_wrong_pool_rejected() {
     assert!(src.contains("received >= min_out_u64"),
         "B1: the min_out floor must remain as defense in depth alongside the pool pin");
 }
+
+// ============================================================================
+// VAULT-1 — PERMISSIONLESS POOL-SET VAULTS (median + quorum aggregator)
+//
+// Exercises create_vault (permissionless, 1..=5 pools), the pool-set price path
+// in spin_commit_dual, quorum gating, median manipulation resistance, the
+// create-time clamps, and bit-identical degeneration of a 1-pool set to today's
+// single-pool math. Under the mock-price seam each "pool" is a program-owned
+// MockPrice account; the deployable CLMM-owner + mint-pairing + cross-link checks
+// live in the non-mock branch (source-asserted below + proven in house-math::clmm
+// and live on devnet), exactly as the CLMM reader itself is.
+// ============================================================================
+use anchor_lang::solana_program::instruction::AccountMeta as VMeta;
+
+/// Distinct 16-byte ids for pool-set member i (i < 5), disjoint from the vault id.
+fn member_id(vault_id: &[u8; 16], i: usize) -> [u8; 16] {
+    let mut m = *vault_id;
+    m[15] = m[15].wrapping_add(1 + i as u8);
+    m
+}
+fn pool_set_pda(machine: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"pool-set", machine.as_ref()], &pid()).0
+}
+/// Params for a pool-set vault (create_vault ignores params.pool/observation).
+fn vault_params() -> house::DualParams {
+    let mut p = params(&[0u8; 16]);
+    p.pool = Pubkey::default();
+    p.observation = Pubkey::default();
+    p
+}
+/// Create + price `prices.len()` mock members at (twap, spot, age) each; returns
+/// their (pool, obs) keys (pool == obs == the MockPrice account; mock ignores obs).
+fn setup_members(svm: &mut LiteSVM, vault_id: &[u8; 16], authority: &Keypair, prices: &[(u128, u128, u32)]) -> Vec<(Pubkey, Pubkey)> {
+    let mut out = Vec::new();
+    for (i, &(twap, spot, age)) in prices.iter().enumerate() {
+        let mid = member_id(vault_id, i);
+        assert!(send(svm, ix_set_price(mid, &authority.pubkey(), twap, spot, age), authority, &[authority]), "set member price {i}");
+        let pda = mock_price_pda(&mid);
+        out.push((pda, pda));
+    }
+    out
+}
+fn ix_create_vault(id: [u8; 16], creator: &Pubkey, mint: Pubkey, p: house::DualParams, set_len: u8, members: &[(Pubkey, Pubkey)]) -> Instruction {
+    let m = dmachine(&id);
+    let mut metas = house::accounts::CreateVault {
+        machine: m, pool_set: pool_set_pda(&m), token_mint: mint, token_vault: ata(&m, &mint),
+        creator: *creator, token_program: token_program(), associated_token_program: ata_program(),
+        system_program: system_program::ID, rent: rent_sysvar(),
+    }.to_account_metas(None);
+    for (pool, obs) in members.iter() {
+        metas.push(VMeta::new_readonly(*pool, false));
+        metas.push(VMeta::new_readonly(*obs, false));
+    }
+    Instruction::new_with_bytes(pid(), &house::instruction::CreateVault { machine_id: id, params: p, set_len }.data(), metas)
+}
+/// commit against a pool set: remaining = [pool_set, member1.pool, member1.obs, ...].
+fn ix_commit_set(id: [u8; 16], player: &Pubkey, wager: u64, nonce: u64, members: &[(Pubkey, Pubkey)]) -> Instruction {
+    let m = dmachine(&id);
+    let (p0_pool, p0_obs) = members[0];
+    let mut metas = house::accounts::SpinCommitDual {
+        machine: m, pending_spin: dspin(&m, player, nonce), player: *player,
+        randomness: mock_rand_pda(&id), price_pool: p0_pool, price_observation: p0_obs,
+        system_program: system_program::ID,
+    }.to_account_metas(None);
+    metas.push(VMeta::new_readonly(pool_set_pda(&m), false));
+    for (pool, obs) in members.iter().skip(1) {
+        metas.push(VMeta::new_readonly(*pool, false));
+        metas.push(VMeta::new_readonly(*obs, false));
+    }
+    Instruction::new_with_bytes(pid(), &house::instruction::SpinCommitDual { wager, nonce }.data(), metas)
+}
+/// Boot a permissionless pool-set vault (NO admin/config): create `set_len`
+/// in-band members, fund creator + LP, deposit tokens. Returns the pieces tests need.
+fn boot_vault(seed: u8, deposit_chip: u128, member_prices: &[(u128, u128, u32)]) -> (LiteSVM, [u8; 16], Pubkey, Keypair, Keypair, Vec<(Pubkey, Pubkey)>, u128) {
+    let mut svm = boot();
+    let creator = funded(&mut svm);
+    let lp = funded(&mut svm);
+    let id = [seed; 16];
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+    let members = setup_members(&mut svm, &id, &creator, member_prices);
+    let deposit_base = deposit_chip * CHIP;
+    set_token_acct(&mut svm, &ata(&lp.pubkey(), &mint), &mint, &lp.pubkey(), deposit_base as u64);
+    assert!(send(&mut svm, ix_create_vault(id, &creator.pubkey(), mint, vault_params(), member_prices.len() as u8, &members), &creator, &[&creator]), "create_vault");
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), mint, deposit_base as u64), &lp, &[&lp]), "deposit");
+    (svm, id, mint, creator, lp, members, deposit_base)
+}
+const FRESH: (u128, u128, u32) = (PRICE, PRICE, 5);
+
+/// (v-degenerate) A 1-pool set is BIT-IDENTICAL to a legacy single-pool vault:
+/// same k / tier / price / max_payout / reserve snapshot, same token payout —
+/// in the SAME svm, side by side. This is the dual-chip-1 migration guarantee.
+#[test]
+fn v_one_pool_set_is_bit_identical_to_legacy() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let creator = funded(&mut svm);
+    let lp = funded(&mut svm);
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+    let dep_chip = 2_000_000u128;
+    let dep = dep_chip * CHIP;
+
+    // legacy machine (admin create_machine_dual, pool_set_len == 0)
+    let lid = [0x51u8; 16];
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    set_token_acct(&mut svm, &ata(&lp.pubkey(), &mint), &mint, &lp.pubkey(), (2 * dep) as u64);
+    assert!(send(&mut svm, ix_create_dual(lid, &admin.pubkey(), admin.pubkey(), mint, params(&lid)), &admin, &[&admin]), "legacy create");
+    assert!(send(&mut svm, ix_set_price(lid, &admin.pubkey(), PRICE, PRICE, 5), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_deposit(lid, &lp.pubkey(), mint, dep as u64), &lp, &[&lp]), "legacy deposit");
+    assert_eq!(read_machine(&svm, &lid).pool_set_len, 0, "legacy is single-pool");
+
+    // 1-pool vault (permissionless create_vault, pool_set_len == 1)
+    let vid = [0x52u8; 16];
+    let members = setup_members(&mut svm, &vid, &creator, &[FRESH]);
+    assert!(send(&mut svm, ix_create_vault(vid, &creator.pubkey(), mint, vault_params(), 1, &members), &creator, &[&creator]), "vault create");
+    // second LP position for the vault
+    let lp2 = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&lp2.pubkey(), &mint), &mint, &lp2.pubkey(), dep as u64);
+    assert!(send(&mut svm, ix_deposit(vid, &lp2.pubkey(), mint, dep as u64), &lp2, &[&lp2]), "vault deposit");
+    assert_eq!(read_machine(&svm, &vid).pool_set_len, 1, "vault is a 1-pool set");
+
+    // spin both with identical wager + reels
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    let wager: u64 = 100_000_000;
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+
+    assert!(send(&mut svm, ix_fill(lid, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit(lid, &player.pubkey(), wager, 1), &player, &[&player]), "legacy commit");
+    assert!(send(&mut svm, ix_fill(vid, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit_set(vid, &player.pubkey(), wager, 2, &members), &player, &[&player]), "vault commit");
+
+    let ls = read_spin(&svm, &lid, &player.pubkey(), 1);
+    let vs = read_spin(&svm, &vid, &player.pubkey(), 2);
+    assert_eq!((vs.k_bp, vs.tier_is_deep, vs.price_at_commit_1e12, vs.max_payout_tokens, vs.reserved_tokens),
+               (ls.k_bp, ls.tier_is_deep, ls.price_at_commit_1e12, ls.max_payout_tokens, ls.reserved_tokens),
+               "1-pool-set snapshot is bit-identical to the legacy single-pool snapshot");
+    assert_eq!(vs.price_at_commit_1e12, PRICE, "priced at the single pool's TWAP, unchanged");
+}
+
+/// (v-3pools / v-5pools) create with 3 and 5 pools, commit prices at the MEDIAN,
+/// settle reconciles to house-math at that median.
+#[test]
+fn v_three_and_five_pool_medians_reconcile() {
+    for (seed, prices) in [
+        (0x60u8, vec![(99 * PRICE / 100, 99 * PRICE / 100, 5), FRESH, (101 * PRICE / 100, 101 * PRICE / 100, 5)]),
+        (0x61u8, vec![(97 * PRICE / 100, 97 * PRICE / 100, 5), (99 * PRICE / 100, 99 * PRICE / 100, 5), FRESH,
+                       (101 * PRICE / 100, 101 * PRICE / 100, 5), (103 * PRICE / 100, 103 * PRICE / 100, 5)]),
+    ] {
+        let (mut svm, id, mint, _c, _lp, members, dep) = boot_vault(seed, 2_000_000, &prices);
+        let player = funded(&mut svm);
+        let cranker = funded(&mut svm);
+        set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+        let wager: u64 = 100_000_000;
+        let (_d, k, tier, _mp, _r) = predict(dep, 0, wager); // predict uses PRICE == the median
+        let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+        let reels = hm::reels_from_randomness(&bytes);
+        let expected = hm::payout::spin_payout_tokens(wager as u128, tier, k, reels, PRICE, DEC).unwrap();
+
+        assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+        assert!(send(&mut svm, ix_commit_set(id, &player.pubkey(), wager, 0, &members), &player, &[&player]), "commit set {seed:x}");
+        assert_eq!(read_spin(&svm, &id, &player.pubkey(), 0).price_at_commit_1e12, PRICE, "priced at the median");
+        assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mint, 0, &cranker.pubkey()), &cranker, &[&cranker]), "settle set {seed:x}");
+        assert_eq!(tok_bal(&svm, &ata(&player.pubkey(), &mint)), expected as u64, "median payout reconciles");
+    }
+}
+
+/// (v-quorum) 3-of-5: two stale members still LIVE (median of the 3 fresh);
+/// three stale members REFUSED (2 < quorum 3).
+#[test]
+fn v_quorum_3_of_5_gating() {
+    // 3 fresh at {0.99,1,1.01}·P + 2 stale at 2·P (would corrupt a mean; excluded).
+    let two_stale = vec![
+        (99 * PRICE / 100, 99 * PRICE / 100, 5), FRESH, (101 * PRICE / 100, 101 * PRICE / 100, 5),
+        (2 * PRICE, 2 * PRICE, 999), (2 * PRICE, 2 * PRICE, 999),
+    ];
+    let (mut svm, id, _mint, _c, _lp, members, _dep) = boot_vault(0x70, 2_000_000, &two_stale);
+    let player = funded(&mut svm);
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit_set(id, &player.pubkey(), 100_000_000, 0, &members), &player, &[&player]), "2 stale → still LIVE at quorum");
+    assert_eq!(read_spin(&svm, &id, &player.pubkey(), 0).price_at_commit_1e12, PRICE, "median of the 3 fresh == P");
+
+    // three stale → below quorum → refused.
+    let three_stale = vec![
+        FRESH, (101 * PRICE / 100, 101 * PRICE / 100, 5),
+        (2 * PRICE, 2 * PRICE, 999), (2 * PRICE, 2 * PRICE, 999), (2 * PRICE, 2 * PRICE, 999),
+    ];
+    let (mut svm2, id2, _m2, _c2, _l2, members2, _d2) = boot_vault(0x71, 2_000_000, &three_stale);
+    let player2 = funded(&mut svm2);
+    assert!(send(&mut svm2, ix_fill(id2, &player2.pubkey(), bytes), &player2, &[&player2]));
+    assert!(!send(&mut svm2, ix_commit_set(id2, &player2.pubkey(), 100_000_000, 0, &members2), &player2, &[&player2]), "3 stale → QuorumNotMet refuses the commit");
+}
+
+/// (v-manipulation) a 5-pool set with 3 honest + 2 rigged (each individually
+/// in-band at 2·P) prices at the honest median P — the rigged minority cannot move
+/// the payout beyond the proven bound.
+#[test]
+fn v_median_manipulation_is_bounded() {
+    let rigged = vec![
+        FRESH, FRESH, FRESH, // 3 honest at P
+        (2 * PRICE, 2 * PRICE, 5), (2 * PRICE, 2 * PRICE, 5), // 2 rigged (in-band on their own pool)
+    ];
+    let (mut svm, id, mint, _c, _lp, members, dep) = boot_vault(0x80, 2_000_000, &rigged);
+    let player = funded(&mut svm);
+    let cranker = funded(&mut svm);
+    set_token_acct(&mut svm, &ata(&player.pubkey(), &mint), &mint, &player.pubkey(), 0);
+    let wager: u64 = 100_000_000;
+    let (_d, k, tier, _mp, _r) = predict(dep, 0, wager);
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    let reels = hm::reels_from_randomness(&bytes);
+    let honest = hm::payout::spin_payout_tokens(wager as u128, tier, k, reels, PRICE, DEC).unwrap();
+
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+    assert!(send(&mut svm, ix_commit_set(id, &player.pubkey(), wager, 0, &members), &player, &[&player]), "commit");
+    assert_eq!(read_spin(&svm, &id, &player.pubkey(), 0).price_at_commit_1e12, PRICE, "rigged minority did NOT move the snapshot off the honest median");
+    assert!(send(&mut svm, ix_settle(id, &player.pubkey(), mint, 0, &cranker.pubkey()), &cranker, &[&cranker]), "settle");
+    assert_eq!(tok_bal(&svm, &ata(&player.pubkey(), &mint)), honest as u64, "payout at the honest price, not the rigged 2·P");
+}
+
+/// (v-reject) create rejections: 0 pools, 6 pools, duplicate pool, non-program-owned
+/// member, and params outside the clamps.
+#[test]
+fn v_create_rejections() {
+    let mut svm = boot();
+    let creator = funded(&mut svm);
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+
+    // 0 pools (set_len 0, no members) → InvalidSetLen.
+    let id0 = [0x90u8; 16];
+    assert!(!send(&mut svm, ix_create_vault(id0, &creator.pubkey(), mint, vault_params(), 0, &[]), &creator, &[&creator]), "0 pools rejected");
+
+    // 6 pools → InvalidSetLen (set_len 6). Give 6 members so only the len cap bites.
+    let id6 = [0x91u8; 16];
+    let m6 = setup_members(&mut svm, &id6, &creator, &[FRESH, FRESH, FRESH, FRESH, FRESH, FRESH]);
+    assert!(!send(&mut svm, ix_create_vault(id6, &creator.pubkey(), mint, vault_params(), 6, &m6), &creator, &[&creator]), "6 pools rejected");
+
+    // duplicate pool: two members that are the SAME MockPrice account → DuplicatePool.
+    let idd = [0x92u8; 16];
+    let one = setup_members(&mut svm, &idd, &creator, &[FRESH]);
+    let dup = vec![one[0], one[0]];
+    assert!(!send(&mut svm, ix_create_vault(idd, &creator.pubkey(), mint, vault_params(), 2, &dup), &creator, &[&creator]), "duplicate pool rejected");
+
+    // non-program-owned member (a plain token account, owner = token program) →
+    // InvalidPriceAccount (the mock analog of the deployable CLMM-owner check).
+    let idn = [0x93u8; 16];
+    let foreign = Pubkey::new_unique();
+    set_token_acct(&mut svm, &foreign, &mint, &creator.pubkey(), 0);
+    assert!(!send(&mut svm, ix_create_vault(idn, &creator.pubkey(), mint, vault_params(), 1, &[(foreign, foreign)]), &creator, &[&creator]), "non-program-owned pool rejected");
+
+    // params outside the clamps: rtp_max 96% (> 95% dual ceiling) → MarginFloorViolation.
+    let idp = [0x94u8; 16];
+    let mp = setup_members(&mut svm, &idp, &creator, &[FRESH]);
+    let mut bad = vault_params();
+    bad.rtp_max_bp = 9600;
+    assert!(!send(&mut svm, ix_create_vault(idp, &creator.pubkey(), mint, bad, 1, &mp), &creator, &[&creator]), "rtp_max over the dual ceiling rejected");
+    // band 400bp (> 300 cap) → MarginFloorViolation.
+    let idb = [0x95u8; 16];
+    let mb = setup_members(&mut svm, &idb, &creator, &[FRESH]);
+    let mut bad2 = vault_params();
+    bad2.band_bp = 400;
+    assert!(!send(&mut svm, ix_create_vault(idb, &creator.pubkey(), mint, bad2, 1, &mb), &creator, &[&creator]), "band over the cap rejected");
+    // infeasible margin floor (250bp at 95%/300bp) → MarginFloorViolation.
+    let idm = [0x96u8; 16];
+    let mm = setup_members(&mut svm, &idm, &creator, &[FRESH]);
+    let mut bad3 = vault_params();
+    bad3.m_bp = 250;
+    assert!(!send(&mut svm, ix_create_vault(idm, &creator.pubkey(), mint, bad3, 1, &mm), &creator, &[&creator]), "infeasible margin floor rejected");
+}
+
+/// (v-pause) the creator is the curator and can pause/unpause; a non-curator cannot.
+#[test]
+fn v_curator_pause_gates_commit() {
+    let (mut svm, id, _mint, creator, _lp, members, _dep) = boot_vault(0xA0, 2_000_000, &[FRESH]);
+    let player = funded(&mut svm);
+    let stranger = funded(&mut svm);
+    let bytes = { let mut b = [0u8; 32]; b[0] = 13; b[1] = 22; b[2] = 23; b };
+    assert!(send(&mut svm, ix_fill(id, &player.pubkey(), bytes), &player, &[&player]));
+
+    let m = dmachine(&id);
+    let ix_pause = |paused: bool, signer: &Pubkey| Instruction::new_with_bytes(pid(),
+        &house::instruction::SetPausedDual { paused }.data(),
+        house::accounts::SetPausedDual { machine: m, curator: *signer }.to_account_metas(None));
+
+    // a non-curator cannot pause.
+    assert!(!send(&mut svm, ix_pause(true, &stranger.pubkey()), &stranger, &[&stranger]), "non-curator pause rejected");
+    // the creator/curator pauses → commit refused.
+    assert!(send(&mut svm, ix_pause(true, &creator.pubkey()), &creator, &[&creator]), "curator pauses");
+    assert!(!send(&mut svm, ix_commit_set(id, &player.pubkey(), 100_000_000, 0, &members), &player, &[&player]), "paused vault refuses spins");
+    // unpause → commit works (nonce 1 so its signature differs from the paused attempt).
+    assert!(send(&mut svm, ix_pause(false, &creator.pubkey()), &creator, &[&creator]), "curator unpauses");
+    assert!(send(&mut svm, ix_commit_set(id, &player.pubkey(), 100_000_000, 1, &members), &player, &[&player]), "commit after unpause");
+}
+
+/// (v-deployable) source-assert that the DEPLOYABLE create-time validation enforces
+/// the CLMM-owner, payout-mint-pairing, and pool↔observation cross-link on every
+/// member — the wrong-mint / non-CLMM-owned rejections that the mock seam can't
+/// stage (mirrors the B1 compound source-asserts; proven live on devnet).
+#[test]
+fn v_deployable_create_validates_owner_mint_and_link() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read the deployable lib.rs source");
+    let start = src.find("#[cfg(not(feature = \"mock-price\"))]\nfn validate_pool_member")
+        .expect("deployable validate_pool_member present");
+    let body = &src[start..start + 1500];
+    assert!(body.contains("CLMM_PROGRAM_ID"), "deployable create owner-checks pools against the CLMM program");
+    assert!(body.contains("pool_pairs_mint"), "deployable create requires the pool to pair the payout mint");
+    assert!(body.contains("pool_observation_id") && body.contains("obs_pool_id"), "deployable create cross-links pool ↔ observation");
+}

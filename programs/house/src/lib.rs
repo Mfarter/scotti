@@ -483,7 +483,124 @@ pub mod house {
         m.smoothed_last_slot = now;
         m.paused = false;
         m.bump = ctx.bumps.machine;
+        m.pool_set_len = 0; // admin path stays LEGACY single-pool (m.pool / m.observation)
         m.reserved = [0u8; DualMachine::RESERVED_LEN];
+        Ok(())
+    }
+
+    /// PERMISSIONLESS dual-vault creation (VAULT-1). ANYONE signs + pays (rent
+    /// only — no protocol fee); the creator becomes the CURATOR with PAUSE rights
+    /// only (no odds control beyond the clamped params). Generalizes the price link
+    /// to a POOL SET of 1..=5 Raydium CLMM pools of the vault's payout token: each
+    /// candidate is validated (CLMM-owned, PAIRS the payout mint, pool↔observation
+    /// cross-linked) and DISTINCT; the set is stored in a companion PoolSet PDA and
+    /// aggregated by median+quorum at commit. All risk params are CLAMPED so the
+    /// H6b margin-floor invariant holds for ANY user input (`validate_dual_params`,
+    /// proven exhaustively in house-math::margin over ~14.6M configs). Set member 0
+    /// becomes the vault's primary pool (`m.pool` / `m.observation`) — the compound
+    /// swap venue (HARDEN-1 pin, now provably a set member) and the legacy-shaped
+    /// price account for the aggregator's member 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_vault<'info>(
+        ctx: Context<'info, CreateVault<'info>>,
+        machine_id: [u8; 16],
+        params: DualParams,
+        set_len: u8,
+    ) -> Result<()> {
+        let p = &params;
+        // ---- parameter clamps (identical to create_machine_dual; the margin-floor
+        // gate is the security-critical one and holds for ANY user params) ----
+        require!(0 < p.d_low && p.d_low < p.d_mid && p.d_mid < p.d_high, HouseError::InvalidParams);
+        require!(p.max_exposure_bp > 0 && p.max_exposure_bp <= hm::BP as u64, HouseError::InvalidParams);
+        require!(p.smooth_window > 0 && p.epoch_length > 0, HouseError::InvalidParams);
+        require!(p.token_decimals <= 18, HouseError::InvalidParams);
+        require!(p.twap_window_secs > 0 && p.max_staleness_secs > 0, HouseError::InvalidParams);
+        require!(p.twap_window_secs <= hm::twap::RING_MIN_COVERAGE_SECS, HouseError::TwapWindowExceedsRingCoverage);
+        require!(p.max_pending_spins > 0, HouseError::InvalidParams);
+        require!(p.haircut_bp as u128 <= hm::BP, HouseError::InvalidParams);
+        require!(
+            hm::margin::validate_dual_params(p.rtp_max_bp as u128, p.band_bp as u128, p.m_bp as u128),
+            HouseError::MarginFloorViolation
+        );
+
+        // ---- pool-set shape + per-member validation ----
+        require!(set_len >= 1 && (set_len as usize) <= hm::aggregator::MAX_POOLS, HouseError::InvalidSetLen);
+        let members = ctx.remaining_accounts;
+        require!(members.len() == 2 * set_len as usize, HouseError::PoolSetInvalid);
+
+        let token_mint = ctx.accounts.token_mint.key();
+        let machine_key = ctx.accounts.machine.key();
+        let mut pools = [Pubkey::default(); hm::aggregator::MAX_POOLS];
+        let mut observations = [Pubkey::default(); hm::aggregator::MAX_POOLS];
+        for i in 0..set_len as usize {
+            let pool = &members[2 * i];
+            let obs = &members[2 * i + 1];
+            validate_pool_member(pool, obs, &token_mint)?;
+            // DISTINCT pools — a set may not double-weight a single pool in the median.
+            for pj in pools.iter().take(i) {
+                require_keys_neq!(pool.key(), *pj, HouseError::DuplicatePool);
+            }
+            pools[i] = pool.key();
+            observations[i] = obs.key();
+        }
+
+        let now = Clock::get()?.slot;
+        {
+            let m = &mut ctx.accounts.machine;
+            m.machine_id = machine_id;
+            m.curator = ctx.accounts.creator.key(); // creator == curator (pause rights only)
+            m.token_mint = token_mint;
+            m.pool = pools[0]; // primary == set member 0 (compound venue; aggregator member 0)
+            m.observation = observations[0];
+            m.token_vault = ctx.accounts.token_vault.key();
+            m.token_decimals = p.token_decimals;
+            m.d_low = p.d_low;
+            m.d_mid = p.d_mid;
+            m.d_high = p.d_high;
+            m.max_exposure_bp = p.max_exposure_bp;
+            m.smooth_window = p.smooth_window;
+            m.epoch_length = p.epoch_length;
+            m.twap_window_secs = p.twap_window_secs;
+            m.max_staleness_secs = p.max_staleness_secs;
+            m.band_bp = p.band_bp;
+            m.m_bp = p.m_bp;
+            m.haircut_bp = p.haircut_bp;
+            m.rtp_max_bp = p.rtp_max_bp;
+            m.max_pending_spins = p.max_pending_spins;
+            m.pending_spins = 0;
+            m.token_balance = 0;
+            m.reserved_tokens = 0;
+            m.escrowed_sol = 0;
+            m.div_pool_sol = 0;
+            m.acc_sol_per_share = 0;
+            m.earmarked_sol = 0;
+            m.total_shares = 0;
+            m.smoothed_value = 0; // cold until the first spin
+            m.smoothed_last_slot = now;
+            m.paused = false;
+            m.bump = ctx.bumps.machine;
+            m.withdraw_snapshot_price = 0;
+            m.withdraw_snapshot_epoch = 0;
+            m.pool_set_len = set_len; // 1..=5 ⇒ the pool-set price path
+            m.reserved = [0u8; DualMachine::RESERVED_LEN];
+        }
+        {
+            let ps = &mut ctx.accounts.pool_set;
+            ps.machine = machine_key;
+            ps.set_len = set_len;
+            ps.pools = pools;
+            ps.observations = observations;
+            ps.bump = ctx.bumps.pool_set;
+            ps.reserved = [0u8; 32];
+        }
+        Ok(())
+    }
+
+    /// Curator pause toggle for a dual vault (VAULT-1). The permissionless creator
+    /// is the curator and gets this ONE right — pause only, no odds control beyond
+    /// the create-time clamped params. Mirrors `set_paused` for legacy SOL machines.
+    pub fn set_paused_dual(ctx: Context<SetPausedDual>, paused: bool) -> Result<()> {
+        ctx.accounts.machine.paused = paused;
         Ok(())
     }
 
@@ -553,18 +670,20 @@ pub mod house {
     /// the SMOOTHED token-side VALUE depth, enforces BOTH the value-curve max_bet
     /// and the token-solvency bound (max_payout × (1+haircut) ≤ exposure × token
     /// balance), escrows the SOL wager and reserves the token payout+haircut.
-    pub fn spin_commit_dual(ctx: Context<SpinCommitDual>, wager: u64, nonce: u64) -> Result<()> {
+    pub fn spin_commit_dual<'info>(ctx: Context<'info, SpinCommitDual<'info>>, wager: u64, nonce: u64) -> Result<()> {
         let m = &ctx.accounts.machine;
         require!(!m.paused, HouseError::MachinePaused);
         require!(wager > 0, HouseError::InvalidWager);
         require!(m.pending_spins < m.max_pending_spins, HouseError::TooManyPendingSpins);
 
-        // --- price seam + shared gates (spec §2–3) ---
+        // --- price seam (single pool OR pool-set median) + shared gates (spec §2–3) ---
         let clock = Clock::get()?;
         let now_secs = clock.unix_timestamp.max(0) as u32; // matches CLMM observation stamps
-        let reading = read_price(
-            &ctx.accounts.price_pool, &ctx.accounts.price_observation, m.pool, m.observation,
-            now_secs, m.twap_window_secs,
+        let machine_key = ctx.accounts.machine.key();
+        let reading = read_price_aggregated(
+            m, machine_key,
+            &ctx.accounts.price_pool, &ctx.accounts.price_observation,
+            ctx.remaining_accounts, now_secs,
         )?;
         eval_price_gates(&reading, m.max_staleness_secs, m.band_bp)?;
         let twap = reading.twap_1e12;
@@ -1236,6 +1355,103 @@ fn eval_price_gates(r: &PriceReading, max_staleness_secs: u32, band_bp: u16) -> 
     Ok(())
 }
 
+/// VAULT-1: read the vault's price as the MEDIAN of its POOL SET (or the single
+/// pool of a legacy vault). Returns a `PriceReading` the caller passes to the
+/// UNCHANGED `eval_price_gates` — a no-op pass for the aggregate (spot == twap,
+/// age == 0), because the real per-pool staleness + band gating already happened
+/// INSIDE the median. So `spin_commit_dual` / `compound_epoch` keep their exact
+/// downstream logic; only the price SOURCE generalizes.
+///
+///   * LEGACY (`pool_set_len == 0`) — byte-for-byte the H6 single-pool path:
+///     reads `m.pool` / `m.observation` from the named price accounts.
+///     dual-chip-1 (reserved tail all zeros ⇒ len 0) is UNAFFECTED.
+///   * POOL SET (`pool_set_len == n`) — `remaining_accounts` carry
+///     `[pool_set_pda, pool_1, obs_1, …, pool_{n-1}, obs_{n-1}]`; member 0 is the
+///     named `price_pool` / `price_observation`. Every member is read through the
+///     SAME price seam, then `hm::aggregator::aggregate` medians the eligible
+///     TWAPs under the majority quorum. Below quorum ⇒ `QuorumNotMet`.
+fn read_price_aggregated<'info>(
+    m: &DualMachine,
+    machine_key: Pubkey,
+    price_pool: &AccountInfo<'info>,
+    price_observation: &AccountInfo<'info>,
+    remaining: &[AccountInfo<'info>],
+    now_secs: u32,
+) -> Result<PriceReading> {
+    if m.pool_set_len == 0 {
+        return read_price(price_pool, price_observation, m.pool, m.observation, now_secs, m.twap_window_secs);
+    }
+    let n = m.pool_set_len as usize;
+    require!(n <= hm::aggregator::MAX_POOLS, HouseError::PoolSetInvalid);
+    // remaining[0] is the companion PoolSet PDA; members 1..n follow as pairs.
+    require!(remaining.len() >= 1 + 2 * (n - 1), HouseError::PoolSetInvalid);
+    let ps_acct = &remaining[0];
+    let (expected_ps, _b) = Pubkey::find_program_address(&[b"pool-set", machine_key.as_ref()], &crate::ID);
+    require_keys_eq!(ps_acct.key(), expected_ps, HouseError::PoolSetInvalid);
+    require_keys_eq!(*ps_acct.owner, crate::ID, HouseError::PoolSetInvalid);
+    let ps_data = ps_acct.try_borrow_data()?;
+    let ps = PoolSet::try_deserialize(&mut &ps_data[..]).map_err(|_| HouseError::PoolSetInvalid)?;
+    require!(ps.machine == machine_key, HouseError::PoolSetInvalid);
+    require!(ps.set_len as usize == n, HouseError::PoolSetInvalid);
+
+    let mut quotes =
+        [hm::aggregator::PoolQuote { twap_1e12: 0, spot_1e12: 0, age_secs: u32::MAX }; hm::aggregator::MAX_POOLS];
+    for (i, quote) in quotes.iter_mut().enumerate().take(n) {
+        let (pool_acct, obs_acct, exp_pool, exp_obs) = if i == 0 {
+            (price_pool, price_observation, ps.pools[0], ps.observations[0])
+        } else {
+            let base = 1 + 2 * (i - 1);
+            (&remaining[base], &remaining[base + 1], ps.pools[i], ps.observations[i])
+        };
+        // read_price ERRORS only on account-identity failure (wrong/foreign/malformed);
+        // a merely stale/cold member returns (twap 0, age MAX) → simply ineligible.
+        let r = read_price(pool_acct, obs_acct, exp_pool, exp_obs, now_secs, m.twap_window_secs)?;
+        *quote = hm::aggregator::PoolQuote {
+            twap_1e12: r.twap_1e12,
+            spot_1e12: r.spot_1e12,
+            age_secs: r.newest_obs_age_secs,
+        };
+    }
+    match hm::aggregator::aggregate(&quotes, m.pool_set_len, m.max_staleness_secs, m.band_bp) {
+        hm::aggregator::Aggregate::Priced { price_1e12, .. } => {
+            Ok(PriceReading { twap_1e12: price_1e12, spot_1e12: price_1e12, newest_obs_age_secs: 0 })
+        }
+        hm::aggregator::Aggregate::BelowQuorum { .. } => err!(HouseError::QuorumNotMet),
+    }
+}
+
+// ---- create-time pool-member validation seam (VAULT-1 permissionless create) ----
+// Same posture as `read_price`: under mock-price a "pool" is a program-owned
+// MockPrice (no CLMM structure to parse), so the mock branch owner-checks it and
+// skips the mint/cross-link checks; the DEPLOYABLE branch parses real Raydium
+// PoolState (one side must equal the payout mint) and the pool↔observation link.
+// The mock branch never reaches the shipped IDL (gate test i).
+
+/// Validate one candidate set member at `create_vault` time.
+#[cfg(feature = "mock-price")]
+fn validate_pool_member(pool: &AccountInfo, _obs: &AccountInfo, _token_mint: &Pubkey) -> Result<()> {
+    require_keys_eq!(*pool.owner, crate::ID, HouseError::InvalidPriceAccount);
+    Ok(())
+}
+#[cfg(not(feature = "mock-price"))]
+fn validate_pool_member(pool: &AccountInfo, obs: &AccountInfo, token_mint: &Pubkey) -> Result<()> {
+    // owner-check trust pattern: both accounts must be the Raydium CLMM program's.
+    require!(pool.owner.to_bytes() == CLMM_PROGRAM_ID.to_bytes(), HouseError::InvalidPriceAccount);
+    require!(obs.owner.to_bytes() == CLMM_PROGRAM_ID.to_bytes(), HouseError::InvalidPriceAccount);
+    let pool_data = pool.try_borrow_data()?;
+    let obs_data = obs.try_borrow_data()?;
+    require!(
+        pool_data.len() >= hm::clmm::POOL_SPAN && obs_data.len() >= hm::clmm::OBS_SPAN,
+        HouseError::InvalidPriceAccount
+    );
+    // the pool must actually PAIR the vault's payout mint (one side == token_mint).
+    require!(hm::clmm::pool_pairs_mint(&pool_data, &token_mint.to_bytes()), HouseError::PoolMintMismatch);
+    // pool ↔ observation cross-link (pinned H6a offsets).
+    require!(hm::clmm::pool_observation_id(&pool_data) == obs.key().to_bytes(), HouseError::InvalidPriceAccount);
+    require!(hm::clmm::obs_pool_id(&obs_data) == pool.key().to_bytes(), HouseError::InvalidPriceAccount);
+    Ok(())
+}
+
 // -------------------- AMM swap seam (H6b-3 accounting, H6c-1 real CPI) --------------------
 //
 // compound_epoch's ONE AMM CPI, behind a seam like the price/randomness ones:
@@ -1648,13 +1864,21 @@ pub struct DualMachine {
     /// legacy semantics identical to Machine's.
     pub withdraw_snapshot_price: u128,
     pub withdraw_snapshot_epoch: u64,
+    /// VAULT-1 pool-set link. 0 = LEGACY single-pool vault: price reads m.pool /
+    /// m.observation via the unchanged single-pool path (so dual-chip-1, whose
+    /// reserved tail is all zeros, reads 0 here and is BIT-IDENTICAL). 1..=5 = a
+    /// companion `PoolSet` PDA (`["pool-set", machine.key()]`) holds that many
+    /// (pool, observation) pairs, aggregated by median+quorum. Carved from the
+    /// reserved tail's FIRST byte (was `reserved[0]` = 0 on legacy accounts), so
+    /// SIZE is unchanged at 409.
+    pub pool_set_len: u8,
     pub reserved: [u8; DualMachine::RESERVED_LEN],
 }
 impl DualMachine {
     // acc_sol_per_share(16) + earmarked_sol(8) carved earlier; SCALE-2 adds
-    // withdraw_snapshot_price(16) + withdraw_snapshot_epoch(8) from the reserved
-    // tail; SIZE unchanged.
-    pub const RESERVED_LEN: usize = 16;
+    // withdraw_snapshot_price(16) + withdraw_snapshot_epoch(8); VAULT-1 carves
+    // pool_set_len(1) from the reserved tail (16 → 15); SIZE unchanged at 409.
+    pub const RESERVED_LEN: usize = 15;
     pub const SIZE: usize = 8 + 16 + 32   // id, curator
         + 32 + 32 + 32 + 32 + 1           // mint, pool, obs, vault, decimals
         + (6 * 8)                         // d_low..epoch_length
@@ -1664,6 +1888,7 @@ impl DualMachine {
         + 16 + 8                          // acc_sol_per_share, earmarked_sol
         + 16 + 8 + 1 + 1                  // smoothed_value, smoothed_last_slot, paused, bump
         + 16 + 8                          // withdraw_snapshot_price, withdraw_snapshot_epoch
+        + 1                               // pool_set_len (VAULT-1)
         + Self::RESERVED_LEN;
     pub fn epoch_length_eff(&self) -> u64 {
         if self.epoch_length == 0 { DEFAULT_EPOCH_LENGTH_SLOTS } else { self.epoch_length }
@@ -1678,6 +1903,29 @@ impl DualMachine {
 // reading. These lock it at compile time.
 const _: () = assert!(Machine::SIZE == 218, "Machine SIZE changed — would break live accounts");
 const _: () = assert!(DualMachine::SIZE == 409, "DualMachine SIZE changed — would break live accounts");
+
+/// VAULT-1 companion account: the price POOL SET of a dual vault (1..=5 Raydium
+/// CLMM pools of the vault's payout token). Fixed size, created WITH the vault by
+/// `create_vault` (never resized), PDA `["pool-set", machine.key()]`. Only the
+/// first `DualMachine.pool_set_len` entries of `pools`/`observations` are live;
+/// the rest are zero. Legacy single-pool vaults have NO PoolSet account
+/// (`pool_set_len == 0`) and never touch this type. This is PRICE PLUMBING only —
+/// it holds no balances and no LP/ledger state.
+#[account]
+pub struct PoolSet {
+    pub machine: Pubkey,                 // back-link to the DualMachine
+    pub set_len: u8,                     // 1..=5 (mirrors DualMachine.pool_set_len)
+    pub pools: [Pubkey; hm::aggregator::MAX_POOLS],
+    pub observations: [Pubkey; hm::aggregator::MAX_POOLS],
+    pub bump: u8,
+    pub reserved: [u8; 32],
+}
+impl PoolSet {
+    pub const SIZE: usize = 8 + 32 + 1 + (32 * hm::aggregator::MAX_POOLS) + (32 * hm::aggregator::MAX_POOLS) + 1 + 32;
+    /// The (pool, observation) pair for member `i` (i < set_len).
+    pub fn member(&self, i: usize) -> (Pubkey, Pubkey) { (self.pools[i], self.observations[i]) }
+}
+const _: () = assert!(PoolSet::SIZE == 394, "PoolSet SIZE drifted");
 
 /// A dual-asset LP's stake. PDA `["dual-lp", machine, owner]`. The pending-
 /// withdrawal + dividend-ledger fields are sized NOW so H6b-2 needs no layout
@@ -1934,6 +2182,41 @@ pub struct CreateMachineDual<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
+/// PERMISSIONLESS vault creation (VAULT-1) — NO config/admin gate. The creator
+/// signs + pays rent for the DualMachine, its companion PoolSet, and the token
+/// vault ATA. The 1..=5 (pool, observation) members arrive via remaining_accounts.
+#[derive(Accounts)]
+#[instruction(machine_id: [u8; 16])]
+pub struct CreateVault<'info> {
+    #[account(init, payer = creator, space = DualMachine::SIZE,
+              seeds = [b"dual-machine", machine_id.as_ref()], bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(init, payer = creator, space = PoolSet::SIZE,
+              seeds = [b"pool-set", machine.key().as_ref()], bump)]
+    pub pool_set: Box<Account<'info, PoolSet>>,
+    pub token_mint: Box<Account<'info, Mint>>,
+    #[account(init, payer = creator,
+              associated_token::mint = token_mint,
+              associated_token::authority = machine)]
+    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(mut)]
+    pub creator: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+    // pool-set members (pool_i, obs_i) arrive via remaining_accounts.
+}
+
+/// Curator pause toggle for a dual vault (VAULT-1). `curator` is the creator.
+#[derive(Accounts)]
+pub struct SetPausedDual<'info> {
+    #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump,
+              has_one = curator @ HouseError::NotCurator)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    pub curator: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct LpDepositToken<'info> {
     #[account(mut, seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
@@ -2135,6 +2418,12 @@ pub enum HouseError {
     #[msg("Not enough free token liquidity to reserve payout")] InsufficientTokenLiquidity,
     #[msg("Instruction does not match the position's reward mode")] WrongRewardMode,
     #[msg("twap_window_secs exceeds the observation ring's max coverage (1485s)")] TwapWindowExceedsRingCoverage,
+    // ---- VAULT-1 pool sets + permissionless create ----
+    #[msg("Pool-set length must be 1..=5")] InvalidSetLen,
+    #[msg("Pool set is malformed, wrong-length, or the PoolSet account mismatches")] PoolSetInvalid,
+    #[msg("A pool appears more than once in the set")] DuplicatePool,
+    #[msg("A candidate pool does not pair the vault's payout mint")] PoolMintMismatch,
+    #[msg("Too few eligible pools to meet the majority quorum")] QuorumNotMet,
 }
 
 // ---------------------------------------------------------------------------
