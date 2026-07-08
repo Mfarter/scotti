@@ -25,7 +25,7 @@ import {
 import { DEFAULT_PARAMS, CLAMPS, validateParams, quorumOf, type VaultParams, type ParamIssue } from "../lib/vaultspec.ts";
 
 // ---------- token (SPL mint) validation ----------
-interface TokenInfo { mint: string; decimals: number; supply: bigint; ok: boolean; error: string | null }
+export interface TokenInfo { mint: string; decimals: number; supply: bigint; ok: boolean; error: string | null }
 async function loadToken(conn: import("@solana/web3.js").Connection, mint: string): Promise<TokenInfo> {
   let key: PublicKey;
   try { key = new PublicKey(mint); } catch { return { mint, decimals: 0, supply: 0n, ok: false, error: "not a valid address" }; }
@@ -38,26 +38,30 @@ async function loadToken(conn: import("@solana/web3.js").Connection, mint: strin
 }
 
 // ---------- a validated pool-set member ----------
-interface Member {
+export interface Member {
   poolKey: PublicKey; obsKey: PublicKey | null;
   check: MemberCheck; status: PriceStatus | null; loading: boolean;
 }
 
-export function LaunchWizard() {
+// DEV-ONLY: the screenshot harness injects fabricated wizard state so each step can
+// be captured deterministically without live RPC/clicks (never used in production).
+export interface WizardInitial { step?: number; token?: TokenInfo; members?: Member[]; params?: VaultParams; label?: string }
+
+export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
   const { connection } = useConnection();
   const { publicKey, sendTransaction, connected } = useWallet();
 
-  const [step, setStep] = useState(0);
-  const [tokenInput, setTokenInput] = useState("");
-  const [token, setToken] = useState<TokenInfo | null>(null);
+  const [step, setStep] = useState(initial?.step ?? 0);
+  const [tokenInput, setTokenInput] = useState(initial?.token?.mint ?? "");
+  const [token, setToken] = useState<TokenInfo | null>(initial?.token ?? null);
   const [tokenBusy, setTokenBusy] = useState(false);
 
-  const [members, setMembers] = useState<Member[]>([]);
+  const [members, setMembers] = useState<Member[]>(initial?.members ?? []);
   const [poolInput, setPoolInput] = useState("");
   const [addBusy, setAddBusy] = useState(false);
 
-  const [params, setParams] = useState<VaultParams>({ ...DEFAULT_PARAMS });
-  const [label, setLabel] = useState("");
+  const [params, setParams] = useState<VaultParams>(initial?.params ?? { ...DEFAULT_PARAMS });
+  const [label, setLabel] = useState(initial?.label ?? "");
 
   const [launchState, setLaunchState] = useState<"idle" | "sending" | "done" | "error">("idle");
   const [launchErr, setLaunchErr] = useState<string | null>(null);

@@ -35,6 +35,10 @@ import type { DualStatus } from "./lib/dualstatus.ts";
 import type { DualSpinResult } from "./lib/dualspin.ts";
 import { floorStore } from "./lib/hooks.ts";
 import type { FloorEntry, DualFloorEntry } from "./lib/hooks.ts";
+import { LaunchWizard, type Member, type TokenInfo } from "./pages/Launch.tsx";
+import { Docs } from "./pages/Docs.tsx";
+import { DEFAULT_PARAMS } from "./lib/vaultspec.ts";
+import type { PriceStatus } from "./lib/clmm.ts";
 
 // ---- real devnet accounts (they still exist — see the UI-2 diagnostic) ----
 const SINGLE = "9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1";
@@ -168,12 +172,42 @@ const FIX_DUALS: DualFloorEntry[] = [{
 const statusOf = (pk: string) => FIX_SINGLES.find((e) => e.pubkey.toBase58() === pk)?.status;
 const dualOf = (pk: string) => FIX_DUALS.find((e) => e.pubkey.toBase58() === pk)?.status;
 
+// ---- VAULT-2 fixtures: launch-wizard state + a pool-set (3-of-5 quorum) floor card ----
+const uniqKey = () => PublicKey.unique();
+const livePS = (twap: number, spot: number): PriceStatus => ({ kind: "LIVE", label: "LIVE", reason: "fresh & in band", spot, twap, twap1e12: BigInt(Math.round(twap * 1e12)), bandBp: Math.round(Math.abs(spot - twap) / twap * 10000), staleSecs: 3, coverageSecs: 620, obsCount: 42, commitAllowed: true });
+const stalePS = (): PriceStatus => ({ kind: "STALE", label: "STALE", reason: "newest obs 9001s old > max 180s", spot: 970, twap: null, twap1e12: null, bandBp: null, staleSecs: 9001, coverageSecs: 300, obsCount: 12, commitAllowed: false });
+const CHIP_TOKEN: TokenInfo = { mint: CHIP, decimals: 9, supply: 10_000_000_000_000_000n, ok: true, error: null };
+const okMember = (twap: number): Member => ({ poolKey: uniqKey(), obsKey: uniqKey(), loading: false, status: livePS(twap, twap * 1.002),
+  check: { ok: true, clmmOwned: true, pairsMint: true, crossLinked: true, distinct: true, mintA: new PublicKey("So11111111111111111111111111111111111111112"), mintB: new PublicKey(CHIP), observation: uniqKey(), reasons: [] } });
+const badMember: Member = { poolKey: uniqKey(), obsKey: uniqKey(), loading: false, status: null,
+  check: { ok: false, clmmOwned: true, pairsMint: false, crossLinked: true, distinct: true, mintA: new PublicKey("So11111111111111111111111111111111111111112"), mintB: uniqKey(), observation: uniqKey(), reasons: ["pool does not pair the payout mint (one side must equal it)"] } };
+const setPools = (kinds: ("live" | "stale")[]): PriceStatus[] => kinds.map((k, i) => k === "live" ? livePS(972 + i * 0.6, 972 + i * 0.6) : stalePS());
+// a 3-of-5 LIVE set and a 2-of-5 QUORUM-NOT-MET set, as floor DualFloorEntries.
+const mkSetStatus = (name: string, live: number): DualStatus => ({
+  machine: uniqKey().toBase58(), name, tokenMint: CHIP, tokenVault: uniqKey().toBase58(), pool: uniqKey().toBase58(), observation: uniqKey().toBase58(),
+  tokenDecimals: 9, poolSetLen: 5, eligiblePools: live, quorum: 3,
+  perPoolPrice: setPools(Array.from({ length: 5 }, (_, i) => (i < live ? "live" : "stale"))),
+  price: live >= 3 ? livePS(972.2, 972.9) : { kind: "QUORUM", label: "QUORUM NOT MET", reason: `only ${live}/5 pools eligible — need 3 (a majority) to price`, spot: null, twap: null, twap1e12: null, bandBp: null, staleSecs: 0, coverageSecs: 0, obsCount: 5, commitAllowed: false },
+  rtpFloorBp: 9200n, rtpMaxBp: 9500n, bandBp: 300, twapWindowSecs: 60, maxStalenessSecs: 180,
+  tier: "shallow", topMult: 50, isDeep: false, kBp: live >= 3 ? 10337n : null, realizedRtpBp: live >= 3 ? 9500n : null, effectiveRtpAtSpotBp: null,
+  depthLamports: 20_000_000_000n, smoothedDepthLamports: 20_000_000_000n, valueMaxBetLamports: 40_000_000n, maxBetLamports: live >= 3 ? 40_000_000n : null,
+  tokenBalance: 20_000_000_000_000n, reservedTokens: 0n, freeTokens: 20_000_000_000_000n, tokenValueLamports: live >= 3 ? 20_570_000_000n : null,
+  totalShares: 20_000_000_000_000_000n, sharePriceTokens: 1_000_000, divPoolSol: 0n, earmarkedSol: 0n, paused: false,
+  epochLength: 1350n, epochNow: 100n, nextBoundarySlot: 136500n, slot: 135000n,
+} as unknown as DualStatus);
+const FIX_SET_DUALS: DualFloorEntry[] = [
+  { pubkey: new PublicKey(mkSetStatus("chip-set-3of5", 3).machine), status: mkSetStatus("chip-set-3of5", 3) },
+  { pubkey: new PublicKey(mkSetStatus("chip-set-2of5", 2).machine), status: mkSetStatus("chip-set-2of5", 2) },
+];
+
 // Drive the floor store into the degraded states deterministically (the store's
 // own poll is frozen so it can't overwrite these). "stale" seeds last-good pools
 // then marks a failure → amber chip over intact pools. "cold" only marks the
 // error with no data → the full-panel cold-start error.
 if (SCENE === "floor-stale") { floorStore.seed({ singles: FIX_SINGLES, duals: [] }); floorStore.markError("429 Too Many Requests"); floorStore.freeze(); }
 if (SCENE === "floor-cold") { floorStore.markError("429 Too Many Requests"); floorStore.freeze(); }
+// pool-set quorum chips (3-of-5 LIVE + 2-of-5 QUORUM NOT MET), from fixtures.
+if (SCENE === "quorum") { floorStore.seed({ singles: [], duals: FIX_SET_DUALS }); floorStore.freeze(); }
 
 /** Mirrors the deposit modal Lp/DualLpPanel render, using the REAL exported
  * disclosure components (the modal's tx logic lives in those files, verified by
@@ -263,6 +297,13 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
       <DualOutcome r={dualWin} status={fixDual} />
     </div>
   ) },
+  quorum: { path: "/", el: <Routes><Route path="/" element={<Floor />} /></Routes> },
+  docs: { path: "/docs", el: <Routes><Route path="/docs" element={<Docs />} /></Routes> },
+  "launch-token": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 0, token: CHIP_TOKEN }} />} /></Routes> },
+  "launch-pools": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)] }} />} /></Routes> },
+  "launch-pools-invalid": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), badMember] }} />} /></Routes> },
+  "launch-params": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 2, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)], label: "my-vault", params: { ...DEFAULT_PARAMS, mBp: 250 } }} />} /></Routes> },
+  "launch-review": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 3, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)], label: "my-vault" }} />} /></Routes> },
   indexer: { path: "/", el: (
     <div className="stack" style={{ gap: 24 }}>
       <h1 style={{ fontSize: 30 }}>Indexer — chart + recent-spins feed</h1>

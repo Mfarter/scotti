@@ -330,4 +330,5 @@ input[type="range"].input { box-shadow: none; accent-color: var(--gold); }
   .docs-nav { position: static; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 6px; padding-bottom: 6px; }
   .docs-nav .group { display: none; }
   .docs-nav a { white-space: nowrap; flex: 0 0 auto; }
+  .docs-benefits { grid-template-columns: 1fr; }
 }
