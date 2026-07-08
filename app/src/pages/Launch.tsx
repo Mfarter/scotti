@@ -20,7 +20,7 @@ import { TOKEN_PROGRAM_ID } from "../lib/dual.ts";
 import { priceStatus, type PriceStatus } from "../lib/clmm.ts";
 import {
   checkPoolMember, poolObservationId, ixCreateVault, vaultMachineId, vaultMachinePda, poolSetPda,
-  type MemberCheck, MAX_POOLS,
+  fetchMintRegistry, type MemberCheck, MAX_POOLS,
 } from "../lib/poolset.ts";
 import { DEFAULT_PARAMS, CLAMPS, validateParams, quorumOf, type VaultParams, type ParamIssue } from "../lib/vaultspec.ts";
 
@@ -45,7 +45,7 @@ export interface Member {
 
 // DEV-ONLY: the screenshot harness injects fabricated wizard state so each step can
 // be captured deterministically without live RPC/clicks (never used in production).
-export interface WizardInitial { step?: number; token?: TokenInfo; members?: Member[]; params?: VaultParams; label?: string }
+export interface WizardInitial { step?: number; token?: TokenInfo; members?: Member[]; params?: VaultParams; label?: string; takenBy?: string }
 
 export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
   const { connection } = useConnection();
@@ -55,6 +55,7 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
   const [tokenInput, setTokenInput] = useState(initial?.token?.mint ?? "");
   const [token, setToken] = useState<TokenInfo | null>(initial?.token ?? null);
   const [tokenBusy, setTokenBusy] = useState(false);
+  const [takenBy, setTakenBy] = useState<string | null>(initial?.takenBy ?? null); // VAULT-3: mint already has a vault
 
   const [members, setMembers] = useState<Member[]>(initial?.members ?? []);
   const [poolInput, setPoolInput] = useState("");
@@ -86,7 +87,13 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
 
   async function validateToken() {
     setTokenBusy(true);
-    try { setToken(await loadToken(connection, tokenInput.trim())); } finally { setTokenBusy(false); }
+    try {
+      const t = await loadToken(connection, tokenInput.trim());
+      setToken(t);
+      // VAULT-3 courtesy: if this mint already has a vault, block here and link to it
+      // (the chain enforces one-vault-per-mint regardless of this check).
+      setTakenBy(t.ok ? (await fetchMintRegistry(connection, new PublicKey(t.mint)))?.machine.toBase58() ?? null : null);
+    } finally { setTokenBusy(false); }
   }
 
   async function addPool() {
@@ -156,7 +163,7 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
           <p className="muted" style={{ margin: 0 }}>Paste the SPL mint your vault pays out. We read its decimals and supply straight from the chain.</p>
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
             <input className="input mono" style={{ flex: "1 1 420px" }} placeholder="token mint address" value={tokenInput}
-              onChange={(e) => { setTokenInput(e.target.value); setToken(null); }} />
+              onChange={(e) => { setTokenInput(e.target.value); setToken(null); setTakenBy(null); }} />
             <GlossButton onClick={validateToken} disabled={tokenBusy || !tokenInput.trim()}>{tokenBusy ? "Checking…" : "Validate"}</GlossButton>
           </div>
           {token && !token.ok && <div className="note bad">Not usable: {token.error}.</div>}
@@ -167,7 +174,15 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
                 <StatCell k="decimals">{token.decimals}</StatCell>
                 <StatCell k="supply">{(Number(token.supply) / 10 ** token.decimals).toLocaleString()}</StatCell>
               </div>
-              <div className="row"><GlossButton variant="pink" onClick={() => setStep(1)}>Next — pool set →</GlossButton></div>
+              {takenBy ? (
+                <div className="note bad stack" style={{ gap: 8 }}>
+                  <b>This token already has a vault.</b> Only one vault may exist per payout mint — the chain enforces
+                  it, so a create for this mint would fail at the registry.
+                  <Link className="btn gold sm" to={`/dual/${takenBy}`}>Open the existing vault →</Link>
+                </div>
+              ) : (
+                <div className="row"><GlossButton variant="pink" onClick={() => setStep(1)}>Next — pool set →</GlossButton></div>
+              )}
             </>
           )}
         </Window>

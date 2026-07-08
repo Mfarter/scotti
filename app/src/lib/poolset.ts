@@ -28,6 +28,19 @@ const OBS_POOL_ID = 19;
 export const poolSetPda = (machine: PublicKey) =>
   PublicKey.findProgramAddressSync([Buffer.from("pool-set"), machine.toBuffer()], PROGRAM_ID)[0];
 
+// VAULT-3: one vault per SPL mint. The registry PDA is unique per payout mint.
+export const mintRegistryPda = (mint: PublicKey) =>
+  PublicKey.findProgramAddressSync([Buffer.from("mint-vault"), mint.toBuffer()], PROGRAM_ID)[0];
+
+export interface MintRegistry { tokenMint: PublicKey; machine: PublicKey }
+/** Which machine (if any) already holds a given mint's vault slot. `null` = free. */
+export async function fetchMintRegistry(conn: Connection, mint: PublicKey): Promise<MintRegistry | null> {
+  const info = await conn.getAccountInfo(mintRegistryPda(mint));
+  if (!info) return null;
+  const d = Buffer.from(info.data); // disc(8) token_mint(32) machine(32) …
+  return { tokenMint: new PublicKey(d.subarray(8, 40)), machine: new PublicKey(d.subarray(40, 72)) };
+}
+
 export interface PoolSet { machine: PublicKey; setLen: number; pools: PublicKey[]; observations: PublicKey[]; }
 
 /** Fetch + decode the companion PoolSet, or null for a legacy single-pool vault. */
@@ -136,7 +149,8 @@ export function ixCreateVault(
     Buffer.from([members.length]),
   ]);
   const keys = [
-    meta(machine, false, true), meta(poolSetPda(machine), false, true), meta(tokenMint, false, false), meta(vault, false, true),
+    meta(machine, false, true), meta(poolSetPda(machine), false, true), meta(mintRegistryPda(tokenMint), false, true),
+    meta(tokenMint, false, false), meta(vault, false, true),
     meta(creator, true, true), meta(TOKEN_PROGRAM_ID, false, false), meta(ASSOCIATED_TOKEN_PROGRAM_ID, false, false),
     meta(SYS, false, false), meta(SYSVAR_RENT_PUBKEY, false, false),
   ];

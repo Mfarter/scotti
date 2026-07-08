@@ -135,11 +135,36 @@ const SECTIONS: Section[] = [
     ),
   },
   {
+    id: "onepermint", group: "Pool sets", nav: "One per token", title: "One vault per token",
+    desc: "A payout mint can back at most one vault — enforced atomically on-chain.",
+    body: (
+      <div className="stack" style={{ gap: 16 }}>
+        <p className="muted" style={{ margin: 0 }}>
+          Each SPL mint gets a single vault. When you create one, the program also creates a tiny <b>registry
+          account</b> keyed by the mint (<span className="mono">["mint-vault", token_mint]</span>); a second create for
+          the same mint fails at that account's initialization — atomically, in the same transaction, no race. The
+          registry records <b>which</b> vault claimed the mint, so the wizard can point you at it.
+        </p>
+        <div className="docs-benefits">
+          <Benefit icon="◈" title="Atomic">The gate is an account init, not a check-then-write — there's no window for two vaults to slip through.</Benefit>
+          <Benefit icon="◫" title="Grandfathered">Vaults created before the registry can be registered permissionlessly; first registration wins.</Benefit>
+          <Benefit icon="✓" title="Create-time only">The registry gates CREATION. Existing vaults keep spinning, depositing, and withdrawing regardless.</Benefit>
+        </div>
+        <div className="note warn">
+          <b>The squatting residual (named, not hidden).</b> Vault params are immutable and there is no close
+          instruction, so a mint's slot is claimed <b>forever</b> — a rent-only junk vault can permanently squat a
+          popular mint. This is accepted for the devnet demonstration, exactly like the even-set tie; a close/reclaim
+          design is future work, deliberately out of scope here.
+        </div>
+      </div>
+    ),
+  },
+  {
     id: "launch", group: "Build", nav: "Launch guide", title: "Launching your vault",
     desc: "The four steps of the wizard, and what each one checks before you sign.",
     body: (
       <div className="stack" style={{ gap: 18 }}>
-        <Step n={1} title="Token">Paste your payout SPL mint. The wizard reads its decimals and supply from the chain and confirms it's an initialized mint.</Step>
+        <Step n={1} title="Token">Paste your payout SPL mint. The wizard reads its decimals and supply from the chain, confirms it's an initialized mint, and checks the mint registry — if the token already has a vault it links you there and stops (one vault per token).</Step>
         <Step n={2} title="Pool set">Add 1–{MAX_POOLS} Raydium CLMM pool addresses. Each is validated the way the program will — CLMM-owned, pairs your mint, pool↔observation cross-linked, distinct — with a live fresh/stale read so you see what you're linking. Prefer odd sizes.</Step>
         <Step n={3} title="Params">Prefilled with the proven live-vault profile. Every field is clamped; an out-of-range value names the exact program error, and the margin floor is checked live before you can continue.</Step>
         <Step n={4} title="Review & launch">A full summary, the rent estimate, and the creator disclosure — then one wallet signature builds and sends the create_vault transaction. Your vault appears on the Floor and in Liquidity automatically.</Step>

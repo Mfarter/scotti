@@ -1621,6 +1621,9 @@ fn member_id(vault_id: &[u8; 16], i: usize) -> [u8; 16] {
 fn pool_set_pda(machine: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"pool-set", machine.as_ref()], &pid()).0
 }
+fn mint_registry_pda(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"mint-vault", mint.as_ref()], &pid()).0
+}
 /// Params for a pool-set vault (create_vault ignores params.pool/observation).
 fn vault_params() -> house::DualParams {
     let mut p = params(&[0u8; 16]);
@@ -1643,7 +1646,7 @@ fn setup_members(svm: &mut LiteSVM, vault_id: &[u8; 16], authority: &Keypair, pr
 fn ix_create_vault(id: [u8; 16], creator: &Pubkey, mint: Pubkey, p: house::DualParams, set_len: u8, members: &[(Pubkey, Pubkey)]) -> Instruction {
     let m = dmachine(&id);
     let mut metas = house::accounts::CreateVault {
-        machine: m, pool_set: pool_set_pda(&m), token_mint: mint, token_vault: ata(&m, &mint),
+        machine: m, pool_set: pool_set_pda(&m), mint_registry: mint_registry_pda(&mint), token_mint: mint, token_vault: ata(&m, &mint),
         creator: *creator, token_program: token_program(), associated_token_program: ata_program(),
         system_program: system_program::ID, rent: rent_sysvar(),
     }.to_account_metas(None);
@@ -1909,4 +1912,109 @@ fn v_deployable_create_validates_owner_mint_and_link() {
     assert!(body.contains("CLMM_PROGRAM_ID"), "deployable create owner-checks pools against the CLMM program");
     assert!(body.contains("pool_pairs_mint"), "deployable create requires the pool to pair the payout mint");
     assert!(body.contains("pool_observation_id") && body.contains("obs_pool_id"), "deployable create cross-links pool ↔ observation");
+}
+
+// ============================================================================
+// VAULT-3 — ONE VAULT PER SPL MINT (the MintRegistry gate)
+//
+// The registry PDA ["mint-vault", token_mint] is `init`ed by create_vault (and by
+// register_legacy_mint for grandfathering), so a second vault for the same mint
+// fails ATOMICALLY at init. Purely a create-time gate — existing suites unchanged.
+// ============================================================================
+
+fn ix_register_legacy(machine_id: [u8; 16], payer: &Pubkey, mint: Pubkey) -> Instruction {
+    Instruction::new_with_bytes(pid(),
+        &house::instruction::RegisterLegacyMint {}.data(),
+        house::accounts::RegisterLegacyMint {
+            machine: dmachine(&machine_id), mint_registry: mint_registry_pda(&mint), payer: *payer, system_program: system_program::ID,
+        }.to_account_metas(None))
+}
+/// The `machine` a mint's registry points at (registry: disc(8) token_mint(32) machine(32)…).
+fn registry_machine(svm: &LiteSVM, mint: &Pubkey) -> Option<Pubkey> {
+    svm.get_account(&mint_registry_pda(mint)).map(|a| Pubkey::new_from_array(a.data[40..72].try_into().unwrap()))
+}
+/// create a 1-pool-set vault for `mint` under `seed`; returns whether it landed.
+fn make_vault(svm: &mut LiteSVM, seed: u8, mint: Pubkey, creator: &Keypair) -> bool {
+    let id = [seed; 16];
+    let members = setup_members(svm, &id, creator, &[FRESH]);
+    send(svm, ix_create_vault(id, &creator.pubkey(), mint, vault_params(), 1, &members), creator, &[creator])
+}
+
+/// (v3-register) create_vault registers the mint; the registry points at the vault.
+#[test]
+fn v3_create_registers_the_mint() {
+    let mut svm = boot();
+    let creator = funded(&mut svm);
+    let mintA = Pubkey::new_unique();
+    set_mint(&mut svm, &mintA, DEC);
+    assert!(make_vault(&mut svm, 0xC1, mintA, &creator), "create for mint A");
+    let machine = dmachine(&[0xC1u8; 16]);
+    assert_eq!(registry_machine(&svm, &mintA), Some(machine), "registry points at the created vault");
+}
+
+/// (v3-second-fails) a second create for the SAME mint fails at init (the gate).
+#[test]
+fn v3_second_create_same_mint_fails() {
+    let mut svm = boot();
+    let creator = funded(&mut svm);
+    let mintA = Pubkey::new_unique();
+    set_mint(&mut svm, &mintA, DEC);
+    assert!(make_vault(&mut svm, 0xC2, mintA, &creator), "first create for mint A");
+    // a DIFFERENT machine id, SAME mint → the mint-registry init collides → refused.
+    assert!(!make_vault(&mut svm, 0xC3, mintA, &creator), "second create for mint A must fail (one vault per mint)");
+    // the registry still points at the FIRST vault (unchanged by the failed create).
+    assert_eq!(registry_machine(&svm, &mintA), Some(dmachine(&[0xC2u8; 16])), "registry unchanged after the failed create");
+}
+
+/// (v3-independence) a different mint B is unaffected — one vault EACH is allowed.
+#[test]
+fn v3_different_mint_is_independent() {
+    let mut svm = boot();
+    let creator = funded(&mut svm);
+    let (mintA, mintB) = (Pubkey::new_unique(), Pubkey::new_unique());
+    set_mint(&mut svm, &mintA, DEC);
+    set_mint(&mut svm, &mintB, DEC);
+    assert!(make_vault(&mut svm, 0xC4, mintA, &creator), "mint A vault");
+    assert!(make_vault(&mut svm, 0xC5, mintB, &creator), "mint B vault (independent)");
+    assert_eq!(registry_machine(&svm, &mintA), Some(dmachine(&[0xC4u8; 16])));
+    assert_eq!(registry_machine(&svm, &mintB), Some(dmachine(&[0xC5u8; 16])));
+}
+
+/// (v3-legacy) register_legacy_mint claims the slot for an EXISTING dual machine
+/// once; a second registration fails; first registration wins.
+#[test]
+fn v3_register_legacy_once_then_fails() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let payer = funded(&mut svm);
+    let id = [0xC6u8; 16];
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    // a LEGACY dual machine (admin path, pool_set_len 0) — no registry created.
+    assert!(send(&mut svm, ix_create_dual(id, &admin.pubkey(), admin.pubkey(), mint, params(&id)), &admin, &[&admin]), "legacy create");
+    assert!(registry_machine(&svm, &mint).is_none(), "no registry before grandfathering");
+    // permissionless: a non-admin payer registers it.
+    assert!(send(&mut svm, ix_register_legacy(id, &payer.pubkey(), mint), &payer, &[&payer]), "register once");
+    assert_eq!(registry_machine(&svm, &mint), Some(dmachine(&id)), "registry points at the legacy machine");
+    // second registration of the same mint → init collides → refused (first wins).
+    assert!(!send(&mut svm, ix_register_legacy(id, &payer.pubkey(), mint), &payer, &[&payer]), "second registration must fail");
+}
+
+/// (v3-create-after-legacy) once a mint is grandfathered, a NEW create_vault for it
+/// fails — the legacy vault owns the slot.
+#[test]
+fn v3_create_after_legacy_registration_fails() {
+    let mut svm = boot();
+    let admin = funded(&mut svm);
+    let creator = funded(&mut svm);
+    let id = [0xC7u8; 16];
+    let mint = Pubkey::new_unique();
+    set_mint(&mut svm, &mint, DEC);
+    assert!(send(&mut svm, ix_init(&admin.pubkey()), &admin, &[&admin]));
+    assert!(send(&mut svm, ix_create_dual(id, &admin.pubkey(), admin.pubkey(), mint, params(&id)), &admin, &[&admin]), "legacy create");
+    assert!(send(&mut svm, ix_register_legacy(id, &creator.pubkey(), mint), &creator, &[&creator]), "grandfather the mint");
+    // a fresh permissionless vault for the SAME mint is now refused.
+    assert!(!make_vault(&mut svm, 0xC8, mint, &creator), "create_vault after legacy registration must fail");
+    assert_eq!(registry_machine(&svm, &mint), Some(dmachine(&id)), "the legacy machine keeps the slot");
 }

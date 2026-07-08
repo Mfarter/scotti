@@ -300,6 +300,7 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
   quorum: { path: "/", el: <Routes><Route path="/" element={<Floor />} /></Routes> },
   docs: { path: "/docs", el: <Routes><Route path="/docs" element={<Docs />} /></Routes> },
   "launch-token": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 0, token: CHIP_TOKEN }} />} /></Routes> },
+  "launch-taken": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 0, token: CHIP_TOKEN, takenBy: DUAL }} />} /></Routes> },
   "launch-pools": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)] }} />} /></Routes> },
   "launch-pools-invalid": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), badMember] }} />} /></Routes> },
   "launch-params": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 2, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)], label: "my-vault", params: { ...DEFAULT_PARAMS, mBp: 250 } }} />} /></Routes> },

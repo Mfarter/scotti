@@ -593,6 +593,32 @@ pub mod house {
             ps.bump = ctx.bumps.pool_set;
             ps.reserved = [0u8; 32];
         }
+        {
+            // VAULT-3: claim the mint's registry slot (init already enforced uniqueness).
+            let r = &mut ctx.accounts.mint_registry;
+            r.token_mint = token_mint;
+            r.machine = machine_key;
+            r.bump = ctx.bumps.mint_registry;
+            r.reserved = [0u8; 32];
+        }
+        Ok(())
+    }
+
+    /// VAULT-3 grandfathering — PERMISSIONLESS. Creates the `MintRegistry` for an
+    /// EXISTING `DualMachine`'s payout mint, claiming the one-vault-per-mint slot
+    /// for that machine. `init` fails if the mint is already registered, so FIRST
+    /// REGISTRATION WINS (the deterministic rule for a mint with several legacy
+    /// vaults — enforced in code, not convention). Anyone may call it and pays the
+    /// registry rent. This gates CREATION only: it never affects the legacy vault's
+    /// own spins/deposits/withdrawals, which keep operating regardless.
+    pub fn register_legacy_mint(ctx: Context<RegisterLegacyMint>) -> Result<()> {
+        let machine_key = ctx.accounts.machine.key();
+        let token_mint = ctx.accounts.machine.token_mint;
+        let r = &mut ctx.accounts.mint_registry;
+        r.token_mint = token_mint;
+        r.machine = machine_key;
+        r.bump = ctx.bumps.mint_registry;
+        r.reserved = [0u8; 32];
         Ok(())
     }
 
@@ -1927,6 +1953,25 @@ impl PoolSet {
 }
 const _: () = assert!(PoolSet::SIZE == 394, "PoolSet SIZE drifted");
 
+/// VAULT-3 mint registry: the ONE-VAULT-PER-MINT gate. PDA `["mint-vault",
+/// token_mint]`, so it is unique per payout mint and `init` fails atomically if a
+/// vault for that mint already exists. Records WHICH machine claimed the mint so
+/// the failure is diagnosable (the wizard links to the existing vault). Created by
+/// `create_vault` (new vaults) or `register_legacy_mint` (grandfathering an
+/// existing DualMachine). This is a CREATE-TIME gate only — it never touches
+/// DualMachine, the price path, or any spin/deposit/withdrawal.
+#[account]
+pub struct MintRegistry {
+    pub token_mint: Pubkey,
+    pub machine: Pubkey,
+    pub bump: u8,
+    pub reserved: [u8; 32],
+}
+impl MintRegistry {
+    pub const SIZE: usize = 8 + 32 + 32 + 1 + 32;
+}
+const _: () = assert!(MintRegistry::SIZE == 105, "MintRegistry SIZE drifted");
+
 /// A dual-asset LP's stake. PDA `["dual-lp", machine, owner]`. The pending-
 /// withdrawal + dividend-ledger fields are sized NOW so H6b-2 needs no layout
 /// change (spec §5): `sol_debt` is the reward-debt marker of the pro-rata SOL
@@ -2194,6 +2239,11 @@ pub struct CreateVault<'info> {
     #[account(init, payer = creator, space = PoolSet::SIZE,
               seeds = [b"pool-set", machine.key().as_ref()], bump)]
     pub pool_set: Box<Account<'info, PoolSet>>,
+    // VAULT-3: the one-vault-per-mint gate. `init` here fails atomically if this
+    // mint already has a vault (from a prior create_vault or register_legacy_mint).
+    #[account(init, payer = creator, space = MintRegistry::SIZE,
+              seeds = [b"mint-vault", token_mint.key().as_ref()], bump)]
+    pub mint_registry: Box<Account<'info, MintRegistry>>,
     pub token_mint: Box<Account<'info, Mint>>,
     #[account(init, payer = creator,
               associated_token::mint = token_mint,
@@ -2206,6 +2256,22 @@ pub struct CreateVault<'info> {
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
     // pool-set members (pool_i, obs_i) arrive via remaining_accounts.
+}
+
+/// VAULT-3 grandfathering context — permissionless. Reads an existing DualMachine
+/// and inits its mint's registry PDA (seeds from `machine.token_mint`, so it
+/// collides with any create_vault registry for the same mint). `init` fails if the
+/// registry already exists (first registration wins).
+#[derive(Accounts)]
+pub struct RegisterLegacyMint<'info> {
+    #[account(seeds = [b"dual-machine", machine.machine_id.as_ref()], bump = machine.bump)]
+    pub machine: Box<Account<'info, DualMachine>>,
+    #[account(init, payer = payer, space = MintRegistry::SIZE,
+              seeds = [b"mint-vault", machine.token_mint.as_ref()], bump)]
+    pub mint_registry: Box<Account<'info, MintRegistry>>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 /// Curator pause toggle for a dual vault (VAULT-1). `curator` is the creator.

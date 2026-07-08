@@ -60,6 +60,8 @@ fn default_build_idl_has_no_mock_surface() {
         "compound_epoch",
         // VAULT-1 permissionless pool-set surface (real, not mock).
         "create_vault", "set_paused_dual",
+        // VAULT-3 one-vault-per-mint registry (real, not mock).
+        "register_legacy_mint",
     ] {
         assert!(instrs.iter().any(|n| n == needed),
             "dual-asset instruction '{needed}' missing from the default-build IDL");
