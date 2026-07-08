@@ -38,6 +38,7 @@ import type { FloorEntry, DualFloorEntry } from "./lib/hooks.ts";
 import { LaunchWizard, type Member, type TokenInfo } from "./pages/Launch.tsx";
 import { Docs } from "./pages/Docs.tsx";
 import { Fair } from "./pages/Fair.tsx";
+import { FrescoBg } from "./components/FrescoBg.tsx";
 import { DEFAULT_PARAMS } from "./lib/vaultspec.ts";
 import type { PriceStatus } from "./lib/clmm.ts";
 
@@ -327,13 +328,22 @@ function App() {
   const bgOf = (sc: string) =>
     sc === "lp" || sc === "dashboard" ? "peach" : sc === "fair" || sc === "docs" ? "paper" : sc.startsWith("floor") ? "natural" : "pink";
   const bg = new URLSearchParams(location.search).get("bg") ?? bgOf(scene);
+  // UI-6 capture aid: ?scrollp=0..1 scrolls to that fraction of the page so a
+  // headless screenshot shows the fresco translated to that scroll position.
+  React.useEffect(() => {
+    const sp = parseFloat(new URLSearchParams(location.search).get("scrollp") ?? "");
+    if (isNaN(sp)) return;
+    const go = () => window.scrollTo(0, sp * Math.max(0, document.documentElement.scrollHeight - window.innerHeight));
+    const t = [200, 500, 900, 1400].map((ms) => setTimeout(go, ms));
+    return () => t.forEach(clearTimeout);
+  }, []);
   return (
     <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed" }}>
       <WalletContext.Provider value={fakeWallet}>
         <SessionProvider>
           <MemoryRouter initialEntries={[s.path]}>
             <div className="os-shell" data-bg={bg}>
-              <div className="os-bg" aria-hidden />
+              <FrescoBg treat={bg} />
               <main className="wrap page">{s.el}</main>
             </div>
           </MemoryRouter>

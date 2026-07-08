@@ -54,8 +54,8 @@ export function Fair() {
       </Window>
 
       <div className="stack" style={{ gap: 12 }}>
-        <h2 style={{ fontSize: 24 }}>Three real spins, verify them now</h2>
-        <p className="muted" style={{ margin: 0 }}>
+        <h2 className="on-fresco" style={{ fontSize: 24 }}>Three real spins, verify them now</h2>
+        <p className="muted on-fresco" style={{ margin: 0 }}>
           The first public spins settled on this program (a house win, a full loss, and a 12× player win),
           live on devnet against real Switchboard randomness. Nothing here trusts our word — each button
           recomputes from chain data in your browser.
@@ -78,8 +78,8 @@ export function Fair() {
       </div>
 
       <div className="stack" style={{ gap: 12 }}>
-        <h2 style={{ fontSize: 24 }}>Dual-asset machines (SOL in, CHIP out)</h2>
-        <p className="muted" style={{ margin: 0 }}>
+        <h2 className="on-fresco" style={{ fontSize: 24 }}>Dual-asset machines (SOL in, CHIP out)</h2>
+        <p className="muted on-fresco" style={{ margin: 0 }}>
           A dual machine takes a SOL wager and pays a <b>token</b> (CHIP) prize, priced by the pool's
           on-chain price. The same "verify everything" discipline applies, with three extra guards
           worth stating plainly (full detail in <b>H6-DUAL-ASSET-SPEC.md</b>).

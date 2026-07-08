@@ -1,6 +1,7 @@
 import { Outlet, Link, useLocation } from "react-router-dom";
 import { Banner } from "./Banner.tsx";
 import { SysBar, StatusBar } from "./os/index.ts";
+import { FrescoBg } from "./FrescoBg.tsx";
 
 // Route → background tint (pure presentation; the Remilia pink-vs-peach move, in
 // palette-family tonal leans). UI-5: the dithered "Last Judgment" fresco —
@@ -17,9 +18,10 @@ function bgForPath(pathname: string): "natural" | "pink" | "peach" | "paper" {
 
 export function Layout() {
   const { pathname } = useLocation();
+  const treat = bgForPath(pathname);
   return (
-    <div className="os-shell" data-bg={bgForPath(pathname)}>
-      <div className="os-bg" aria-hidden />
+    <div className="os-shell" data-bg={treat}>
+      <FrescoBg treat={treat} />
       <Banner />
       <SysBar />
       <main className="wrap page">
