@@ -37,6 +37,7 @@ import { floorStore } from "./lib/hooks.ts";
 import type { FloorEntry, DualFloorEntry } from "./lib/hooks.ts";
 import { LaunchWizard, type Member, type TokenInfo } from "./pages/Launch.tsx";
 import { Docs } from "./pages/Docs.tsx";
+import { Fair } from "./pages/Fair.tsx";
 import { DEFAULT_PARAMS } from "./lib/vaultspec.ts";
 import type { PriceStatus } from "./lib/clmm.ts";
 
@@ -298,6 +299,7 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
     </div>
   ) },
   quorum: { path: "/", el: <Routes><Route path="/" element={<Floor />} /></Routes> },
+  fair: { path: "/fair", el: <Routes><Route path="/fair" element={<Fair />} /></Routes> },
   docs: { path: "/docs", el: <Routes><Route path="/docs" element={<Docs />} /></Routes> },
   "launch-token": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 0, token: CHIP_TOKEN }} />} /></Routes> },
   "launch-taken": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 0, token: CHIP_TOKEN, takenBy: DUAL }} />} /></Routes> },
@@ -320,7 +322,11 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
 function App() {
   const scene = new URLSearchParams(location.search).get("scene") ?? "floor";
   const s = SCENES[scene] ?? SCENES.floor;
-  const bg = scene === "lp" || scene === "dashboard" ? "peach" : "pink";
+  // UI-5: mirror Layout.bgForPath by scene, and allow ?bg=natural|pink|peach|paper
+  // to force any treatment (so the fresco gallery can be captured on real UI).
+  const bgOf = (sc: string) =>
+    sc === "lp" || sc === "dashboard" ? "peach" : sc === "fair" || sc === "docs" ? "paper" : sc.startsWith("floor") ? "natural" : "pink";
+  const bg = new URLSearchParams(location.search).get("bg") ?? bgOf(scene);
   return (
     <ConnectionProvider endpoint={RPC_URL} config={{ commitment: "confirmed" }}>
       <WalletContext.Provider value={fakeWallet}>
