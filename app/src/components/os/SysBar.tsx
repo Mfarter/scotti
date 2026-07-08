@@ -34,6 +34,8 @@ export function SysBar() {
         <nav className="os-navlinks">
           <NavLink to="/" end className={({ isActive }) => (isActive ? "on" : "")}>Floor</NavLink>
           <NavLink to="/lp" className={({ isActive }) => (isActive ? "on" : "")}>Liquidity</NavLink>
+          <NavLink to="/launch" className={({ isActive }) => (isActive ? "on" : "")}>Launch</NavLink>
+          <NavLink to="/docs" className={({ isActive }) => (isActive ? "on" : "")}>Docs</NavLink>
           <NavLink to="/fair" className={({ isActive }) => (isActive ? "on" : "")}>Fair?</NavLink>
         </nav>
         <div className="os-grow" />

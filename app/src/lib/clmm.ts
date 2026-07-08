@@ -79,7 +79,9 @@ export function computeTwap(obs: Obs[], currentTick: number, now: number, window
 
 // -------------------- price-status (the machine's commit gate, client-side) --------------------
 
-export type PriceStatusKind = "LIVE" | "UNSTABLE" | "STALE";
+// LIVE/UNSTABLE/STALE are the single-pool gate states; QUORUM is the pool-set
+// aggregate state (fewer than a majority of pools eligible) — see aggregator.ts.
+export type PriceStatusKind = "LIVE" | "UNSTABLE" | "STALE" | "QUORUM";
 export interface PriceStatus {
   kind: PriceStatusKind;          // LIVE = fresh + in band; UNSTABLE = band exceeded; STALE = obs too old / cold
   label: string;                  // "LIVE" | "PRICE UNSTABLE" | "STALE"

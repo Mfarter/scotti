@@ -56,6 +56,7 @@ export interface DualMachine {
   accSolPerShare: bigint; earmarkedSol: bigint; smoothedValue: bigint; smoothedLastSlot: bigint;
   paused: boolean;
   withdrawSnapshotPrice: bigint; withdrawSnapshotEpoch: bigint; // SCALE-2 per-epoch token-withdrawal snapshot
+  poolSetLen: number; // VAULT-1: 0 = legacy single-pool; 1..5 = a companion PoolSet PDA
 }
 export function decodeDualMachine(d: Buffer): DualMachine {
   return {
@@ -73,6 +74,9 @@ export function decodeDualMachine(d: Buffer): DualMachine {
     earmarkedSol: d.readBigUInt64LE(333), smoothedValue: u128at(d, 341), smoothedLastSlot: d.readBigUInt64LE(357),
     paused: d[365] !== 0,
     withdrawSnapshotPrice: u128at(d, 367), withdrawSnapshotEpoch: d.readBigUInt64LE(383),
+    // pool_set_len is carved from the reserved tail's first byte at offset 391
+    // (SIZE 409, borsh writes 407 → member sits at 391; VAULT-1 offset note).
+    poolSetLen: d[391],
   };
 }
 
@@ -126,13 +130,20 @@ export function ixLpDepositToken(machine: PublicKey, owner: PublicKey, ownerChip
     data: Buffer.concat([ixDisc("lp_deposit_token"), u64(amount)]),
   });
 }
-export function ixSpinCommitDual(machine: PublicKey, player: PublicKey, randomness: PublicKey, pool: PublicKey, obs: PublicKey, wager: bigint, nonce: bigint): TransactionInstruction {
+export function ixSpinCommitDual(
+  machine: PublicKey, player: PublicKey, randomness: PublicKey, pool: PublicKey, obs: PublicKey,
+  wager: bigint, nonce: bigint, extra: PublicKey[] = [],
+): TransactionInstruction {
+  // `pool`/`obs` are set member 0 (== m.pool/m.observation). For a pool-set vault
+  // (pool_set_len ≥ 1) `extra` carries the remaining accounts read_price_aggregated
+  // expects: [pool_set_pda, pool_1, obs_1, …] — a 1-pool set passes just the PDA.
+  const keys = [
+    meta(machine, false, true), meta(dualSpinPda(machine, player, nonce), false, true), meta(player, true, true),
+    meta(randomness, false, false), meta(pool, false, false), meta(obs, false, false), meta(SYS, false, false),
+    ...extra.map((k) => meta(k, false, false)),
+  ];
   return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      meta(machine, false, true), meta(dualSpinPda(machine, player, nonce), false, true), meta(player, true, true),
-      meta(randomness, false, false), meta(pool, false, false), meta(obs, false, false), meta(SYS, false, false),
-    ],
+    programId: PROGRAM_ID, keys,
     data: Buffer.concat([ixDisc("spin_commit_dual"), u64(wager), u64(nonce)]),
   });
 }

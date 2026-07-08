@@ -14,7 +14,8 @@ export interface Pt { t: number; v: number }
 export interface DashRow {
   pubkey: string; name: string; kind: "single" | "dual";
   tier?: string; topMult?: number; paused?: boolean;                        // single badge
-  priceKind?: "LIVE" | "UNSTABLE" | "STALE"; priceLabel?: string; priceReason?: string; // dual chip
+  priceKind?: import("./clmm.ts").PriceStatusKind; priceLabel?: string; priceReason?: string; // dual chip
+  poolSetLen?: number; eligiblePools?: number; quorum?: number;                             // pool-set summary
   liqLamports: bigint | null;   // SOL-valued liquidity (single pool; dual token@TWAP when LIVE) — null when a dual is stale
   liqTokens?: bigint; liqTokenDecimals?: number;                            // dual CHIP depth
   vol24h: bigint | null;        // null ⇒ indexer off (deferred)
@@ -151,6 +152,7 @@ export function useDashboard(singles: FloorEntry[] | null, duals: DualFloorEntry
     const mm = perMachine(pk, s.tokenDecimals);
     rows.push({ pubkey: pk, name: s.name, kind: "dual",
       priceKind: s.price.kind, priceLabel: s.price.label, priceReason: s.price.reason,
+      poolSetLen: s.poolSetLen, eligiblePools: s.eligiblePools, quorum: s.quorum,
       liqLamports: s.tokenValueLamports, liqTokens: s.tokenBalance, liqTokenDecimals: s.tokenDecimals,
       vol24h: mm.vol, take24h: mm.take, takeGap: mm.gap, aprPct: mm.apr?.aprPct ?? null, windowDays: mm.apr?.windowDays ?? null });
   }

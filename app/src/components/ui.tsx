@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { fmtLamports, fmtSol, shortKey } from "../lib/format.ts";
 import { solscanAcct, solscanTx } from "../lib/constants.ts";
 import { JACKPOT, SEVEN, BELL, BAR, CHERRY, BLANK, SYMBOL_NAME } from "../lib/housemath.ts";
+import type { PriceStatusKind } from "../lib/clmm.ts";
 
 // Typographic reel glyphs — the machine's character comes from its numbers, not
 // stock clip-art, so the symbols are restrained coloured marks.
@@ -32,12 +33,12 @@ export function TierBadge({ tier, topMult, paused }: { tier: string; topMult: nu
   return <span className={`badge ${tier}`}>{tier} · {topMult}× top</span>;
 }
 
-/** The client-side price-status of a dual machine's pool: the SAME gate the
- * on-chain spin_commit_dual applies (staleness → STALE, band → PRICE UNSTABLE).
- * LIVE → sage, PRICE UNSTABLE → amber (warning), STALE → neutral — the only two
- * status colours the OS look allows, used strictly to signal state. */
-export function PriceChip({ kind, label, title }: { kind: "LIVE" | "UNSTABLE" | "STALE"; label: string; title?: string }) {
-  const tone = kind === "LIVE" ? "sage" : kind === "UNSTABLE" ? "amber" : "neutral";
+/** The client-side price-status of a dual machine's pool(s): the SAME gate the
+ * on-chain spin_commit_dual applies. Single pool: LIVE → sage, PRICE UNSTABLE →
+ * amber, STALE → neutral. Pool set: LIVE (quorum met) → sage, QUORUM NOT MET →
+ * amber. Colours signal state only (the two status tones the OS look allows). */
+export function PriceChip({ kind, label, title }: { kind: PriceStatusKind; label: string; title?: string }) {
+  const tone = kind === "LIVE" ? "sage" : kind === "UNSTABLE" || kind === "QUORUM" ? "amber" : "neutral";
   return (
     <span title={title} className={`os-chip ${tone}`}>
       <span className="os-chip-dot" aria-hidden />

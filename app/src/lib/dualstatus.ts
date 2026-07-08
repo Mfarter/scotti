@@ -11,6 +11,8 @@ import {
 import { decodeDualMachine, type DualMachine, dualLpPda, decodeDualLpPosition } from "./dual.ts";
 import { machineIdToLabel, snapshotPayout, snapshotPrice } from "./program.ts";
 import { type PriceStatus, priceStatus } from "./clmm.ts";
+import { aggregate, setPriceStatus } from "./aggregator.ts";
+import { poolSetPda, decodePoolSet } from "./poolset.ts";
 import { pendingSol } from "./dividend.ts";
 
 export interface DualStatus {
@@ -18,6 +20,8 @@ export interface DualStatus {
   tokenMint: string; tokenVault: string; pool: string; observation: string;
   tokenDecimals: number;
   price: PriceStatus;
+  // VAULT-1 pool set: len 0 = legacy single-pool; ≥1 = median+quorum over the set.
+  poolSetLen: number; eligiblePools: number; quorum: number; perPoolPrice: PriceStatus[];
   rtpFloorBp: bigint; rtpMaxBp: bigint;      // the proven band [92, rtp_max]
   bandBp: number; twapWindowSecs: number; maxStalenessSecs: number;
   tier: string; topMult: number; isDeep: boolean | null;
@@ -36,8 +40,23 @@ const DEFAULT_EPOCH = 1_350n;
 
 export function computeDualStatus(
   pubkey: PublicKey, m: DualMachine, poolData: Buffer, obsData: Buffer, now: number, slot: bigint,
+  extraMembers?: { pool: Buffer; obs: Buffer }[],
 ): DualStatus {
-  const price = priceStatus(poolData, obsData, now, m.twapWindowSecs, m.maxStalenessSecs, m.bandBp);
+  // member 0 is m.pool/m.observation (poolData/obsData); a pool-set vault adds
+  // members 1..n via extraMembers. The per-pool gate is the SAME single-pool gate;
+  // the set price is the median of the eligible pools, gated by majority quorum.
+  const member0 = priceStatus(poolData, obsData, now, m.twapWindowSecs, m.maxStalenessSecs, m.bandBp);
+  let price: PriceStatus = member0;
+  let perPoolPrice: PriceStatus[] = [member0];
+  let eligiblePools = member0.commitAllowed ? 1 : 0;
+  let quorum = 1;
+  if (m.poolSetLen >= 1 && extraMembers) {
+    perPoolPrice = [member0, ...extraMembers.map((mm) => priceStatus(mm.pool, mm.obs, now, m.twapWindowSecs, m.maxStalenessSecs, m.bandBp))];
+    const v = aggregate(perPoolPrice, m.poolSetLen);
+    price = setPriceStatus(v);
+    eligiblePools = v.eligible;
+    quorum = v.quorum;
+  }
   const dec = m.tokenDecimals;
   const elen = m.epochLength === 0n ? DEFAULT_EPOCH : m.epochLength;
   const epochNow = slot / elen;
@@ -47,7 +66,8 @@ export function computeDualStatus(
     machine: pubkey.toBase58(), name: machineIdToLabel(m.machineId) || pubkey.toBase58().slice(0, 8),
     tokenMint: m.tokenMint.toBase58(), tokenVault: m.tokenVault.toBase58(),
     pool: m.pool.toBase58(), observation: m.observation.toBase58(), tokenDecimals: dec,
-    price, rtpFloorBp: 9200n, rtpMaxBp: BigInt(m.rtpMaxBp),
+    price, poolSetLen: m.poolSetLen, eligiblePools, quorum, perPoolPrice,
+    rtpFloorBp: 9200n, rtpMaxBp: BigInt(m.rtpMaxBp),
     bandBp: m.bandBp, twapWindowSecs: m.twapWindowSecs, maxStalenessSecs: m.maxStalenessSecs,
     topMult: 0, tier: "—", isDeep: null as boolean | null,
     tokenBalance: m.tokenBalance, reservedTokens: m.reservedTokens, freeTokens,
@@ -96,17 +116,36 @@ export function computeDualStatus(
   };
 }
 
-/** Fetch machine + pool + observation + slot/time and compute status. */
+/** Load members 1..n of a pool-set vault (member 0 is m.pool/m.observation, fetched
+ *  separately). Returns undefined for a legacy single-pool vault, [] for a 1-pool set. */
+export async function loadExtraMembers(conn: Connection, machine: PublicKey, m: DualMachine): Promise<{ pool: Buffer; obs: Buffer }[] | undefined> {
+  if (m.poolSetLen < 1) return undefined;
+  const psInfo = await conn.getAccountInfo(poolSetPda(machine));
+  if (!psInfo) return undefined;
+  const ps = decodePoolSet(Buffer.from(psInfo.data));
+  if (ps.setLen <= 1) return [];
+  const keys: PublicKey[] = [];
+  for (let i = 1; i < ps.setLen; i++) { keys.push(ps.pools[i]); keys.push(ps.observations[i]); }
+  const infos = await conn.getMultipleAccountsInfo(keys);
+  const out: { pool: Buffer; obs: Buffer }[] = [];
+  for (let i = 0; i < ps.setLen - 1; i++) {
+    const p = infos[2 * i], o = infos[2 * i + 1];
+    if (p && o) out.push({ pool: Buffer.from(p.data), obs: Buffer.from(o.data) });
+  }
+  return out;
+}
+
+/** Fetch machine + pool set + members + slot/time and compute status. */
 export async function fetchDualStatus(conn: Connection, pubkey: PublicKey): Promise<DualStatus> {
   const mInfo = await conn.getAccountInfo(pubkey);
   if (!mInfo) throw new Error("dual machine not found");
   const m = decodeDualMachine(Buffer.from(mInfo.data));
-  const [poolInfo, obsInfo, slot] = await Promise.all([
-    conn.getAccountInfo(m.pool), conn.getAccountInfo(m.observation), conn.getSlot("confirmed"),
+  const [poolInfo, obsInfo, slot, extraMembers] = await Promise.all([
+    conn.getAccountInfo(m.pool), conn.getAccountInfo(m.observation), conn.getSlot("confirmed"), loadExtraMembers(conn, pubkey, m),
   ]);
   if (!poolInfo || !obsInfo) throw new Error("pool/observation account not found");
   const now = (await conn.getBlockTime(slot)) ?? Math.floor(Date.now() / 1000);
-  return computeDualStatus(pubkey, m, Buffer.from(poolInfo.data), Buffer.from(obsInfo.data), now, BigInt(slot));
+  return computeDualStatus(pubkey, m, Buffer.from(poolInfo.data), Buffer.from(obsInfo.data), now, BigInt(slot), extraMembers);
 }
 
 // -------------------- LP position (dual) --------------------

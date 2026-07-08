@@ -13,6 +13,10 @@ export function Floor() {
       <header className="stack" style={{ gap: 14 }}>
         <SectionHeader kicker="The floor · live on devnet" title="Find the cold machine." titleSize={38}
           subline="Every machine's odds are a published function of its pool depth. Sorted by live realized RTP — the warmer the wash, the better the odds right now." />
+        <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
+          <Link className="btn gold sm" to="/launch">Launch your own vault →</Link>
+          <Link className="link" to="/docs">Builder docs</Link>
+        </div>
         {stale && entries && <div className="row"><StaleChip lastUpdated={lastUpdated} /></div>}
         <div className="note warn" style={{ maxWidth: 720 }}>
           <b>The mechanic:</b> cold, shallow pools pay closer to the 97% ceiling; deep pools drop to
@@ -71,13 +75,17 @@ function DualMachineCard({ e }: { e: DualFloorEntry }) {
         </>}
         bodyStyle={{ display: "flex", flexDirection: "column", gap: 16, position: "relative", overflow: "hidden" }}>
         <div aria-hidden style={{ position: "absolute", inset: 0, background: `radial-gradient(150px 110px at 88% -10%, ${wash}, transparent 70%)`, pointerEvents: "none" }} />
-        <span className="tag" style={{ color: "var(--ink2)" }}>dual · pays CHIP</span>
+        <span className="tag" style={{ color: "var(--ink2)" }}>
+          {s.poolSetLen >= 1 ? `dual · ${s.poolSetLen}-pool set · pays CHIP` : "dual · pays CHIP"}
+        </span>
         <RtpReadout value={s.realizedRtpBp !== null ? fmtPctBp(s.realizedRtpBp) : "—"} kicker="realized RTP"
           sub={<>band {fmtPctBp(s.rtpFloorBp, 0)}–{fmtPctBp(s.rtpMaxBp, 0)}</>} />
         <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 10 }}>
           <StatCell k="pool depth">{fmtTokens(s.tokenBalance, s.tokenDecimals, 0)} CHIP</StatCell>
           <StatCell k="depth value">{s.tokenValueLamports !== null ? `${fmtSol(s.tokenValueLamports, 3)} SOL` : "—"}</StatCell>
-          <StatCell k="spot">{s.price.spot !== null ? `${s.price.spot.toFixed(1)} CHIP/SOL` : "—"}</StatCell>
+          {s.poolSetLen >= 1
+            ? <StatCell k="pools live">{s.eligiblePools}/{s.poolSetLen} · quorum {s.quorum}</StatCell>
+            : <StatCell k="spot">{s.price.spot !== null ? `${s.price.spot.toFixed(1)} CHIP/SOL` : "—"}</StatCell>}
           <StatCell k="max bet">{s.maxBetLamports !== null ? `${fmtSol(s.maxBetLamports, 5)} SOL` : "—"}</StatCell>
         </div>
         <div className="row" style={{ gap: 6, color: "var(--gold)", fontWeight: 700, fontSize: 12.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>Play this machine →</div>

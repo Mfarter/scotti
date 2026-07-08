@@ -13,6 +13,7 @@ import { Window } from "../components/os/index.ts";
 import { RecentSpins } from "../components/Indexed.tsx";
 import { DualVerifyButton } from "../components/Verify.tsx";
 import { DualStatus } from "../lib/dualstatus.ts";
+import { fetchPoolSet, spinRemaining, type PoolSet } from "../lib/poolset.ts";
 import { useSession } from "../components/SessionProvider.tsx";
 import { SPIN_OVERHEAD } from "../lib/session.ts";
 
@@ -38,15 +39,28 @@ export function DualMachinePage() {
   const [result, setResult] = useState<DualSpinResult | null>(null);
   const [history, setHistory] = useState<DualSpinResult[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [poolSet, setPoolSet] = useState<PoolSet | null>(null);
 
   useEffect(() => {
     if (status?.maxBetLamports && wager === null && status.maxBetLamports > 0n) setWager(status.maxBetLamports / 2n);
   }, [status, wager]);
 
+  // pool-set vaults: load the companion PoolSet for the per-pool breakdown + the
+  // spin's remaining accounts (a legacy single-pool vault leaves this null).
+  useEffect(() => {
+    if (!pubkey || !status || status.poolSetLen < 1) { setPoolSet(null); return; }
+    let alive = true;
+    fetchPoolSet(connection, new PublicKey(pubkey)).then((ps) => { if (alive) setPoolSet(ps); }).catch(() => {});
+    return () => { alive = false; };
+  }, [pubkey, status, connection]);
+
   const busy = phase === "committing" || phase === "revealing" || phase === "settling";
   const player = chips && session ? session.keypair.publicKey : publicKey;
   const canPlay = chips || connected;
-  const gateOpen = !!status && status.price.commitAllowed && !status.paused;
+  // a pool-set vault's commit needs its PoolSet account in remaining_accounts, so
+  // don't open the gate until it's loaded (legacy single-pool vaults skip this).
+  const setReady = !status || status.poolSetLen < 1 || poolSet !== null;
+  const gateOpen = !!status && status.price.commitAllowed && !status.paused && setReady;
 
   async function spin() {
     if (!player || !status || !pubkey || !wager) return;
@@ -61,7 +75,7 @@ export function DualMachinePage() {
         machine: new PublicKey(pubkey),
         pool: new PublicKey(status.pool), observation: new PublicKey(status.observation),
         vault: new PublicKey(status.tokenVault), tokenMint: new PublicKey(status.tokenMint), tokenDecimals: status.tokenDecimals,
-        wager, onStage: setPhase,
+        wager, commitExtra: spinRemaining(new PublicKey(pubkey), poolSet), onStage: setPhase,
       });
       setResult(r); setHistory((h) => [r, ...h]); setPhase("done");
       if (chips) await refreshChips();
@@ -83,6 +97,7 @@ export function DualMachinePage() {
           <h1 style={{ fontSize: 38 }}>{status.name}</h1>
           <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
             <span className="os-chip peach">dual · SOL in → CHIP out</span>
+            {status.poolSetLen >= 1 && <span className="os-chip neutral" title="priced by the median of a pool set, gated by a majority quorum">{status.poolSetLen}-pool set · {status.eligiblePools}/{status.poolSetLen} live</span>}
             <PriceChip kind={status.price.kind} label={status.price.label} title={status.price.reason} />
             <Solscan acct={status.machine} />
           </div>
@@ -117,6 +132,34 @@ export function DualMachinePage() {
           </div>
         )}
       </Window>
+
+      {status.poolSetLen >= 1 && (
+        <Window icon="◈" title="Pool set · median + quorum" right={<PriceChip kind={status.price.kind} label={status.price.label} title={status.price.reason} />}
+          bodyStyle={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="note" style={{ fontSize: 13 }}>
+            Price is the <b>median</b> of the eligible pools' TWAPs, gated by a <b>majority quorum</b> of {status.quorum} of {status.poolSetLen}.
+            Each pool must pass the same freshness + band gate to count. <b>{status.eligiblePools}/{status.poolSetLen}</b> eligible
+            — {status.eligiblePools >= status.quorum ? "quorum met, priced." : "below quorum, spins refused."}
+          </div>
+          <div className="stack" style={{ gap: 8 }}>
+            {status.perPoolPrice.map((p, i) => {
+              const key = i === 0 ? status.pool : poolSet?.pools[i]?.toBase58();
+              return (
+                <div key={i} className="panel pad spread" style={{ flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+                  <div className="row" style={{ gap: 10, alignItems: "center" }}>
+                    <span className="tag">pool {i + 1}</span>
+                    {key ? <Solscan acct={key} /> : <span className="faint mono">—</span>}
+                  </div>
+                  <div className="row" style={{ gap: 14, alignItems: "center" }}>
+                    <span className="mono faint" style={{ fontSize: 12.5 }}>{p.twap !== null ? `twap ${p.twap.toFixed(1)}` : `${p.staleSecs}s stale`}{p.bandBp !== null ? ` · ${p.bandBp}bp` : ""}</span>
+                    <PriceChip kind={p.kind} label={p.commitAllowed ? "eligible" : p.label} title={p.reason} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Window>
+      )}
 
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
         <Stat k="pool depth"><span className="mono">{fmtTokens(status.tokenBalance, dec, 0)}</span> <span className="faint">CHIP</span></Stat>

@@ -23,6 +23,8 @@ const MachinePage = lazy(() => import("./pages/Machine.tsx").then((m) => ({ defa
 const DualMachinePage = lazy(() => import("./pages/DualMachine.tsx").then((m) => ({ default: m.DualMachinePage })));
 const Lp = lazy(() => import("./pages/Lp.tsx").then((m) => ({ default: m.Lp })));
 const Fair = lazy(() => import("./pages/Fair.tsx").then((m) => ({ default: m.Fair })));
+const LaunchWizard = lazy(() => import("./pages/Launch.tsx").then((m) => ({ default: m.LaunchWizard })));
+const Docs = lazy(() => import("./pages/Docs.tsx").then((m) => ({ default: m.Docs })));
 
 const Loading = () => <div className="muted spin-anim" style={{ padding: 20 }}>Loading…</div>;
 
@@ -43,6 +45,8 @@ function Root() {
                 <Route path="dual/:pubkey" element={<Suspense fallback={<Loading />}><DualMachinePage /></Suspense>} />
                 <Route path="lp" element={<Suspense fallback={<Loading />}><Lp /></Suspense>} />
                 <Route path="fair" element={<Suspense fallback={<Loading />}><Fair /></Suspense>} />
+                <Route path="launch" element={<Suspense fallback={<Loading />}><LaunchWizard /></Suspense>} />
+                <Route path="docs" element={<Suspense fallback={<Loading />}><Docs /></Suspense>} />
               </Route>
             </Routes>
           </HashRouter>

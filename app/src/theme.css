@@ -316,3 +316,18 @@ input[type="range"].input { box-shadow: none; accent-color: var(--gold); }
   .page { padding: 20px 0 70px; }
   .os-window-body, .pad { padding: 14px; }
 }
+
+/* VAULT-2 /docs — two-pane builder docs; sidebar collapses to a scroll nav on mobile */
+.docs-layout { display: grid; grid-template-columns: 232px 1fr; gap: 24px; align-items: start; }
+.docs-nav { position: sticky; top: 76px; display: flex; flex-direction: column; gap: 14px; }
+.docs-nav .group { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); padding: 0 8px; }
+.docs-nav a { display: block; padding: 7px 10px; border-radius: 9px; color: var(--ink2); font-size: 13.5px; cursor: pointer; border: 1px solid transparent; }
+.docs-nav a:hover { background: var(--gloss-hi), var(--gloss-silver); }
+.docs-nav a.on { background: var(--gloss-hi), var(--gloss-pink); border-color: var(--line2); box-shadow: var(--inset-top); color: var(--ink); font-weight: 700; }
+.docs-benefits { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+@media (max-width: 780px) {
+  .docs-layout { grid-template-columns: 1fr; }
+  .docs-nav { position: static; flex-direction: row; flex-wrap: nowrap; overflow-x: auto; gap: 6px; padding-bottom: 6px; }
+  .docs-nav .group { display: none; }
+  .docs-nav a { white-space: nowrap; flex: 0 0 auto; }
+}

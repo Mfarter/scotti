@@ -6,7 +6,7 @@ import { PROGRAM_ID } from "./constants.ts";
 import { acctDisc, decodeMachine } from "./program.ts";
 import { computeMachineStatus, MachineStatus, lpStatus, LpStatus } from "./status.ts";
 import { decodeDualMachine } from "./dual.ts";
-import { computeDualStatus, DualStatus, fetchDualStatus, fetchDualLp, DualLpView } from "./dualstatus.ts";
+import { computeDualStatus, DualStatus, fetchDualStatus, fetchDualLp, DualLpView, loadExtraMembers } from "./dualstatus.ts";
 import { PollStore, StoreState, EMPTY_STATE, keyedStore } from "./pollstore.ts";
 
 export interface FloorEntry { pubkey: PublicKey; status: MachineStatus; }
@@ -45,10 +45,15 @@ async function fetchFloor(): Promise<{ singles: FloorEntry[]; duals: DualFloorEn
     const now = (await conn.getBlockTime(slot)) ?? Math.floor(Date.now() / 1000);
     const dms = dualAccts.map((a) => ({ pubkey: a.pubkey, machine: decodeDualMachine(Buffer.from(a.account.data)) }));
     const keys = dms.flatMap((e) => [e.machine.pool, e.machine.observation]);
-    const infos = await conn.getMultipleAccountsInfo(keys);
+    // member 0 (m.pool/m.observation) is in the batched read; pool-set vaults also
+    // fetch their PoolSet + members 1..n (a small extra read for the few set vaults).
+    const [infos, extras] = await Promise.all([
+      conn.getMultipleAccountsInfo(keys),
+      Promise.all(dms.map((e) => loadExtraMembers(conn, e.pubkey, e.machine).catch(() => undefined))),
+    ]);
     dms.forEach((e, i) => {
       const pool = infos[2 * i], obs = infos[2 * i + 1];
-      if (pool && obs) duals.push({ pubkey: e.pubkey, status: computeDualStatus(e.pubkey, e.machine, Buffer.from(pool.data), Buffer.from(obs.data), now, s) });
+      if (pool && obs) duals.push({ pubkey: e.pubkey, status: computeDualStatus(e.pubkey, e.machine, Buffer.from(pool.data), Buffer.from(obs.data), now, s, extras[i]) });
     });
   }
   return { singles, duals };

@@ -50,9 +50,10 @@ export async function runDualSpin(opts: {
   machine: PublicKey;
   pool: PublicKey; observation: PublicKey; vault: PublicKey; tokenMint: PublicKey; tokenDecimals: number;
   wager: bigint;
+  commitExtra?: PublicKey[]; // pool-set vaults: [pool_set_pda, pool_1, obs_1, …]; empty for single-pool
   onStage: (s: SpinStage) => void;
 }): Promise<DualSpinResult> {
-  const { conn, player, sendTransaction, machine, pool, observation, vault, tokenMint, tokenDecimals, wager, onStage } = opts;
+  const { conn, player, sendTransaction, machine, pool, observation, vault, tokenMint, tokenDecimals, wager, commitExtra, onStage } = opts;
   const playerChip = ata(player, tokenMint);
 
   const queue = await getDefaultDevnetQueue(RPC_URL);
@@ -67,7 +68,7 @@ export async function runDualSpin(opts: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [randomness, createIx] = await Randomness.create(sbProgram as any, rngKp, queue.pubkey, player);
   const commitIx = await randomness.commitIx(queue.pubkey, player);
-  const spinCommitIx = ixSpinCommitDual(machine, player, randomness.pubkey, pool, observation, wager, nonce);
+  const spinCommitIx = ixSpinCommitDual(machine, player, randomness.pubkey, pool, observation, wager, nonce, commitExtra ?? []);
   const commitTx = await buildV0(conn, player, [createIx, commitIx, ixCreateAtaIdempotent(player, player, tokenMint), spinCommitIx]);
   const commitSig = await sendTransaction(commitTx, conn, { signers: [rngKp] });
   await confirm(conn, commitSig, "commit");

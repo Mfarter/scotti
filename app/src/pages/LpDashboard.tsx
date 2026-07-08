@@ -53,7 +53,7 @@ function Row({ r, active, onSelect, onDeposit }: { r: DashRow; active: boolean; 
         <span>
           {r.kind === "single"
             ? <TierBadge tier={r.tier!} topMult={r.topMult!} paused={r.paused} />
-            : <span className="row" style={{ gap: 6, flexWrap: "wrap" }}><StatusChip tone="peach" dot={false}>dual</StatusChip><PriceChip kind={r.priceKind!} label={r.priceLabel!} title={r.priceReason} /></span>}
+            : <span className="row" style={{ gap: 6, flexWrap: "wrap" }}><StatusChip tone="peach" dot={false}>{r.poolSetLen && r.poolSetLen >= 1 ? `${r.poolSetLen}-pool set` : "dual"}</StatusChip>{r.poolSetLen && r.poolSetLen >= 1 ? <span className="faint mono" style={{ fontSize: 11 }}>{r.eligiblePools}/{r.poolSetLen}</span> : null}<PriceChip kind={r.priceKind!} label={r.priceLabel!} title={r.priceReason} /></span>}
         </span>
       </Cell>
       <Cell align="right">
