@@ -82,7 +82,7 @@ export function DualMachinePage() {
     } catch (e) { setErr((e as Error).message); setPhase("error"); }
   }
 
-  if (!status) return <div className="muted spin-anim">Loading machine…</div>;
+  if (!status) return <div className="muted spin-anim on-fresco">Loading machine…</div>;
   const live = status.price.kind === "LIVE";
   const heat = status.realizedRtpBp !== null ? rtpHeat(status.realizedRtpBp) : 0.5;
   const glow = live ? heatColor(heat) : "var(--ink-faint)";
@@ -90,7 +90,7 @@ export function DualMachinePage() {
 
   return (
     <div className="stack" style={{ gap: 22 }}>
-      <Link className="link" to="/">← the floor</Link>
+      <Link className="link on-fresco" to="/">← the floor</Link>
 
       <div className="spread" style={{ flexWrap: "wrap", gap: 14 }}>
         <div className="stack" style={{ gap: 6 }}>
@@ -106,7 +106,7 @@ export function DualMachinePage() {
           <div className="num" style={{ fontFamily: "var(--serif)", fontWeight: 700, fontSize: 42, lineHeight: 1, color: "var(--ink)" }}>
             {status.realizedRtpBp !== null ? fmtPctBp(status.realizedRtpBp) : "—"}
           </div>
-          <span className="tag">nominal RTP · band {fmtPctBp(status.rtpFloorBp, 0)}–{fmtPctBp(status.rtpMaxBp, 0)}</span>
+          <span className="tag on-fresco">nominal RTP · band {fmtPctBp(status.rtpFloorBp, 0)}–{fmtPctBp(status.rtpMaxBp, 0)}</span>
         </div>
       </div>
 
@@ -161,7 +161,8 @@ export function DualMachinePage() {
         </Window>
       )}
 
-      <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
+      {/* UI-7: bare stat strip (not in a Window) — halo so labels/units read over the fresco. */}
+      <div className="grid on-fresco" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
         <Stat k="pool depth"><span className="mono">{fmtTokens(status.tokenBalance, dec, 0)}</span> <span className="faint">CHIP</span></Stat>
         <Stat k="depth value">{status.tokenValueLamports !== null ? <Sol lamports={status.tokenValueLamports} dp={3} /> : "—"}</Stat>
         <Stat k="max bet">{status.maxBetLamports !== null ? <Sol lamports={status.maxBetLamports} dp={5} /> : "—"}</Stat>

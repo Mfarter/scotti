@@ -1,4 +1,4 @@
-import { Outlet, Link, useLocation } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 import { Banner } from "./Banner.tsx";
 import { SysBar, StatusBar } from "./os/index.ts";
 import { FrescoBg } from "./FrescoBg.tsx";
@@ -27,12 +27,9 @@ export function Layout() {
       <main className="wrap page">
         <Outlet />
       </main>
-      <footer className="wrap" style={{ padding: "22px 22px 30px", color: "var(--ink2)", fontSize: 12, borderTop: "1px solid var(--line)" }}>
-        <div className="spread" style={{ flexWrap: "wrap", gap: 8 }}>
-          <span>Scotti — a devnet demonstration of verifiable, state-dependent house games. Not a licensed gambling product.</span>
-          <Link className="link" to="/fair">How it works →</Link>
-        </div>
-      </footer>
+      {/* UI-7: footer removed. The devnet / "not a licensed gambling product"
+          disclosure remains on every route via the Banner (top) and the StatusBar
+          "DEVNET DEMONSTRATION ONLY" line (bottom). */}
       <StatusBar />
     </div>
   );

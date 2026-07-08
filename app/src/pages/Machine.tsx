@@ -65,13 +65,13 @@ export function MachinePage() {
     }
   }
 
-  if (!status) return <div className="muted spin-anim">Loading machine…</div>;
+  if (!status) return <div className="muted spin-anim on-fresco">Loading machine…</div>;
   const heat = rtpHeat(status.realizedRtpBp);
   const glow = heatColor(heat);
 
   return (
     <div className="stack" style={{ gap: 22 }}>
-      <Link className="link" to="/">← the floor</Link>
+      <Link className="link on-fresco" to="/">← the floor</Link>
 
       <div className="spread" style={{ flexWrap: "wrap", gap: 14 }}>
         <div className="stack" style={{ gap: 6 }}>
@@ -83,11 +83,12 @@ export function MachinePage() {
         </div>
         <div className="stack" style={{ alignItems: "flex-end", gap: 2 }}>
           <div className="num" style={{ fontFamily: "var(--serif)", fontWeight: 700, fontSize: 42, lineHeight: 1, color: "var(--ink)" }}>{fmtPctBp(status.realizedRtpBp)}</div>
-          <span className="tag">realized RTP · k {status.kBp.toString()}</span>
+          <span className="tag on-fresco">realized RTP · k {status.kBp.toString()}</span>
         </div>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
+      {/* UI-7: bare stat strip (not in a Window) — halo so labels read over the fresco. */}
+      <div className="grid on-fresco" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
         <Stat k="pool depth"><Sol lamports={status.poolValue} dp={3} /></Stat>
         <Stat k="max bet"><Sol lamports={status.maxBet} dp={5} /></Stat>
         <Stat k="reserved"><Sol lamports={status.reservedExposure} dp={5} /></Stat>

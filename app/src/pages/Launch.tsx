@@ -154,7 +154,7 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
           <span key={s} className={`os-chip ${i === step ? "sage" : i < step ? "peach" : "neutral"}`}>{i + 1}. {s}</span>
         ))}
         <span className="os-grow" />
-        <Link className="link" to="/docs">Read the builder docs →</Link>
+        <Link className="link on-fresco" to="/docs">Read the builder docs →</Link>
       </div>
 
       {/* STEP 1 — TOKEN */}

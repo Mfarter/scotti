@@ -192,12 +192,15 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 700; letter-spacing: 0.01em
 .os-sectionheader .kicker { font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.2em; font-size: 11px; font-weight: 700; color: var(--ink2); }
 .os-sectionheader h1 { font-family: var(--serif); }
 .os-sectionheader .subline { font-family: var(--mono); color: var(--ink2); font-size: 13px; }
-/* UI-6: a soft paper halo so bare headings/sublines stay legible as the busy fresco
-   scrolls behind them (the top wash only guards viewport-top; scrolled content can
-   land over the central crowd). Subtle — a paper glow, not an outline. Apply
-   `.on-fresco` to any other bare-over-background text (e.g. the Fair mid-page lead). */
-.os-sectionheader .kicker, .os-sectionheader h1, .os-sectionheader .subline, .on-fresco {
-  text-shadow: 0 1px 2px rgba(253, 252, 250, 0.92), 0 0 7px rgba(253, 252, 250, 0.75);
+/* UI-6/UI-7: a paper halo so bare text stays legible over the (now fully-scrolling)
+   fresco. Big serif titles already read, so they get a MILD halo; small bare mono
+   text (kickers, sublines, nav-group labels, anything tagged `.on-fresco`) gets a
+   DENSER paper glow — a stack of paper-only shadows that lifts it off the busiest
+   regions at any scroll position or tint. Paper only, no new colour; Windows and
+   their contents are untouched. */
+.os-sectionheader h1 { text-shadow: 0 1px 2px rgba(253, 252, 250, 0.9), 0 0 8px rgba(253, 252, 250, 0.6); }
+.os-sectionheader .kicker, .os-sectionheader .subline, .on-fresco {
+  text-shadow: 0 0 3px rgba(253, 252, 250, 0.98), 0 0 6px rgba(253, 252, 250, 0.92), 0 1px 2px rgba(253, 252, 250, 0.95), 0 0 13px rgba(253, 252, 250, 0.55);
 }
 
 /* ==================================================================
@@ -339,8 +342,14 @@ input[type="range"].input { box-shadow: none; accent-color: var(--gold); }
 /* VAULT-2 /docs — two-pane builder docs; sidebar collapses to a scroll nav on mobile */
 .docs-layout { display: grid; grid-template-columns: 232px 1fr; gap: 24px; align-items: start; }
 .docs-nav { position: sticky; top: 76px; display: flex; flex-direction: column; gap: 14px; }
-.docs-nav .group { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); padding: 0 8px; }
-.docs-nav a { display: block; padding: 7px 10px; border-radius: 9px; color: var(--ink2); font-size: 13.5px; cursor: pointer; border: 1px solid transparent; }
+/* UI-7: the sidebar floats over the fresco, so its bare text vanished. Group
+   labels get a darker tone + paper halo; every nav item becomes a paper pill
+   (Remilia OS look) so it reads over any fresco region, tint, or scroll position,
+   in both desktop and mobile-scroll modes. Background/scrim untouched. */
+.docs-nav .group { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink2); padding: 0 8px;
+  text-shadow: 0 0 3px rgba(253, 252, 250, 0.98), 0 0 6px rgba(253, 252, 250, 0.92), 0 1px 2px rgba(253, 252, 250, 0.95), 0 0 13px rgba(253, 252, 250, 0.55); }
+.docs-nav a { display: block; padding: 7px 11px; border-radius: 9px; color: var(--ink); font-size: 13.5px; cursor: pointer;
+  background: var(--paper); border: 1px solid var(--line2); box-shadow: 0 1px 1.5px rgba(58, 39, 51, 0.07), var(--inset-top); }
 .docs-nav a:hover { background: var(--gloss-hi), var(--gloss-silver); }
 .docs-nav a.on { background: var(--gloss-hi), var(--gloss-pink); border-color: var(--line2); box-shadow: var(--inset-top); color: var(--ink); font-weight: 700; }
 .docs-benefits { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }

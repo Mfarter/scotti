@@ -15,7 +15,7 @@ export function Floor() {
           subline="Every machine's odds are a published function of its pool depth. Sorted by live realized RTP — the warmer the wash, the better the odds right now." />
         <div className="row" style={{ gap: 12, flexWrap: "wrap" }}>
           <Link className="btn gold sm" to="/launch">Launch your own vault →</Link>
-          <Link className="link" to="/docs">Builder docs</Link>
+          <Link className="link on-fresco" to="/docs">Builder docs</Link>
         </div>
         {stale && entries && <div className="row"><StaleChip lastUpdated={lastUpdated} /></div>}
         <div className="note warn" style={{ maxWidth: 720 }}>
@@ -28,7 +28,7 @@ export function Floor() {
       {/* Full-panel error only on a cold start (no data). Once we have a list, a
           rate-limit shows the amber chip above and keeps the pools rendered. */}
       {error && !entries && <div className="note bad">Couldn't reach the RPC: {error}. Set <code>VITE_RPC_URL</code> to a devnet endpoint.</div>}
-      {!entries && !error && <div className="muted spin-anim">Reading the floor…</div>}
+      {!entries && !error && <div className="muted spin-anim on-fresco">Reading the floor…</div>}
       {entries && entries.length === 0 && <div className="note">No machines found for this program on devnet.</div>}
 
       <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))" }}>
