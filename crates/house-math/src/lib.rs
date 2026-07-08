@@ -189,6 +189,63 @@ pub fn tier_of_depth(depth: u128, d_mid: u128) -> &'static Tier {
     if depth < d_mid { &SHALLOW } else { &DEEP }
 }
 
+// --- ODDS-1: the normalized cross-machine odds curve -----------------------
+//
+// The per-machine (d_low, d_mid, d_high) reference made odds a function of a
+// machine's OWN reference depth, so two machines never ordered by pool value
+// (a 0.3-SOL machine could pay worse than a 0.999-SOL one). The normalized curve
+// removes the per-machine reference: target RTP is ONE global, monotone function
+// of pool value, so the lowest-value pool in a tier class always has the best
+// odds — cheap pools attract volume until edge accrual grows them and odds
+// converge (the equilibrating property; proofs `k_target_*` / `equilibration_*`).
+//
+// target RTP(value): RTP_MAX at/below REF_D_LOW, linear down to RTP_MIN at/above
+// REF_D_MID (the shallow→deep split, which is also the RTP floor point); deep
+// pools sit at the floor and unlock the 500x paytable. k_target is the scaler
+// that realizes target RTP for the ACTIVE paytable, clamped to that tier's band.
+
+/// Protocol curve reference (single-asset floor), lamports. At/below REF_D_LOW ⇒
+/// best odds (RTP_MAX); at/above REF_D_MID ⇒ RTP floor + DEEP paytable.
+pub const REF_D_LOW: u128 = 100_000_000; // 0.1 SOL
+pub const REF_D_MID: u128 = 2_000_000_000; // 2 SOL — tier split and RTP floor point
+
+/// Tier class as a pure function of pool value against the protocol split.
+pub const fn is_deep_ref(pool_value: u128) -> bool { pool_value >= REF_D_MID }
+
+/// Global target realized RTP (bp), monotone non-increasing in pool value:
+/// RTP_MAX at/below REF_D_LOW, linear to RTP_MIN at/above REF_D_MID.
+pub fn target_rtp_bp(pool_value: u128) -> u128 {
+    if pool_value <= REF_D_LOW { return RTP_MAX_BP; }
+    if pool_value >= REF_D_MID { return RTP_MIN_BP; }
+    RTP_MAX_BP - (RTP_MAX_BP - RTP_MIN_BP) * (pool_value - REF_D_LOW) / (REF_D_MID - REF_D_LOW)
+}
+
+/// The numerator (base-RTP × total) for the paytable active at a pool value.
+const fn tier_num(is_deep: bool) -> u128 { if is_deep { DEEP_NUM } else { SHALLOW_NUM } }
+
+/// Normalized k target: the scaler realizing `target_rtp_bp(value)` for the
+/// active tier's paytable, clamped to that tier's band. Monotone NON-INCREASING
+/// in pool value across the FULL domain — RTP falls with value, and the numerator
+/// rises at the tier split, so k only ever drops or holds as value grows. This is
+/// the single source of truth for odds; the smoothing target is this curve.
+pub fn k_target(pool_value: u128) -> u128 {
+    let is_deep = is_deep_ref(pool_value);
+    let num = tier_num(is_deep);
+    let (k_min, k_max) = k_bounds_const(is_deep);
+    let total = (STOPS * STOPS * STOPS) as u128;
+    let k = target_rtp_bp(pool_value) * total * BP / num;
+    if k < k_min { k_min } else if k > k_max { k_max } else { k }
+}
+
+/// Realized RTP (bp) for a pool value under the normalized curve — for display
+/// and the equilibration model. realized = base_rtp × k (the paytable actually
+/// pays k, so realized may differ from target by the k-rounding, always ≤ 1 bp).
+pub fn realized_rtp_bp(pool_value: u128) -> u128 {
+    let num = tier_num(is_deep_ref(pool_value));
+    let total = (STOPS * STOPS * STOPS) as u128;
+    num * k_target(pool_value) / (total * BP)
+}
+
 /// Solvency-derived max bet: one spin's worst case <= max_exposure_bp of the pool.
 /// max_bet = depth * max_exposure_bp / BP / max_effective_mult
 /// where max_effective_mult = tier.max_mult_bp * k / BP (in bp of wager).
@@ -478,5 +535,157 @@ mod smoothing_proofs {
         assert_eq!(v, 1_000_000, "should land exactly on target after >= one window");
         let v2 = s.update(1_000_000, 2_000_000_000, SMOOTH_WINDOW_SLOTS);
         assert_eq!(v2, 1_000_000, "must not move past a constant target");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ODDS-1 proofs: the normalized odds curve orders by pool value, couples to
+// staker capital, converges under smoothing, and equilibrates across machines.
+#[cfg(test)]
+mod odds_normalized_proofs {
+    use super::*;
+
+    const SOL: u128 = 1_000_000_000;
+
+    /// (a) MONOTONICITY: k_target is non-increasing in pool value across the full
+    /// domain — best odds at the lowest value, in EVERY tier class. Dense sweep
+    /// plus per-integer coverage of the tier split (the only place two rounded
+    /// divisions and a numerator change meet).
+    #[test]
+    fn k_target_monotone_in_pool_value() {
+        let mut prev = k_target(0);
+        // dense sweep 0..3 SOL at 0.001-SOL steps
+        let mut p = 0u128;
+        while p <= 3 * SOL {
+            let k = k_target(p);
+            assert!(k <= prev, "k rose at {} lamports: {} > {}", p, k, prev);
+            prev = k;
+            p += SOL / 1000;
+        }
+        // per-integer coverage around the shallow→deep split
+        let mut prev2 = k_target(REF_D_MID - 5000);
+        for x in (REF_D_MID - 5000)..(REF_D_MID + 5000) {
+            let k = k_target(x);
+            assert!(k <= prev2, "k rose across split at {}: {} > {}", x, k, prev2);
+            prev2 = k;
+        }
+        // clamps: best odds at/below D_LOW, deep floor at/above D_MID
+        assert_eq!(k_target(0), SHALLOW_K.1);
+        assert_eq!(k_target(REF_D_LOW), SHALLOW_K.1);
+        assert_eq!(k_target(REF_D_MID), DEEP_K.0);
+        assert_eq!(k_target(REF_D_MID * 100), DEEP_K.0);
+        // strict drop at the split (shallow floor scaler > deep floor scaler)
+        assert!(k_target(REF_D_MID - 1) > k_target(REF_D_MID));
+    }
+
+    /// Cross-machine: two SHALLOW machines order by pool value alone, regardless
+    /// of any legacy per-machine params. Uses the three live pools.
+    #[test]
+    fn cross_machine_orders_by_pool_value() {
+        let cold = 300_000_000u128;   // Cold Comfort
+        let demo = 999_000_000u128;   // house-demo-1
+        let levi = 1_200_000_000u128; // Leviathan (still < REF_D_MID ⇒ shallow)
+        assert!(is_deep_ref(cold) == false && is_deep_ref(demo) == false && is_deep_ref(levi) == false);
+        // lowest pool ⇒ best odds ⇒ highest k
+        assert!(k_target(cold) > k_target(demo), "0.3 must beat 0.999");
+        assert!(k_target(demo) > k_target(levi), "0.999 must beat 1.2");
+        // realized RTP strictly orders too
+        assert!(realized_rtp_bp(cold) > realized_rtp_bp(demo));
+        assert!(realized_rtp_bp(demo) > realized_rtp_bp(levi));
+    }
+
+    /// (b) STAKER-COUPLING: a deposit (value up) never raises k; a withdrawal
+    /// (value down) never lowers it — and it STRICTLY moves on the interior
+    /// gradient. The curve input is pool value, so staker capital counts.
+    #[test]
+    fn k_target_couples_to_staker_capital() {
+        let bases = [
+            REF_D_LOW / 2, REF_D_LOW, 200_000_000, 500_000_000, 999_000_000,
+            REF_D_MID - 1, REF_D_MID, REF_D_MID + 1, REF_D_MID * 2,
+        ];
+        for &base in &bases {
+            let k = k_target(base);
+            for &d in &[1u128, 1_000, 1_000_000, 50_000_000, 500_000_000] {
+                assert!(k_target(base + d) <= k, "deposit raised k at {}+{}", base, d);
+                if base >= d {
+                    assert!(k_target(base - d) >= k, "withdraw lowered k at {}-{}", base, d);
+                }
+            }
+        }
+        // strict on the gradient (away from either clamp)
+        let mid = (REF_D_LOW + REF_D_MID) / 2;
+        assert!(k_target(mid + 50_000_000) < k_target(mid), "deposit must strictly lower k on the gradient");
+        assert!(k_target(mid - 50_000_000) > k_target(mid), "withdraw must strictly raise k on the gradient");
+    }
+
+    /// (c) CONVERGENCE: under the unchanged anti-snipe smoothing, k reaches within
+    /// 1 bp of the spot's k target in a BOUNDED number of touches, from any start
+    /// (below and above). Worked case: window W, e = W/2 slots per touch.
+    #[test]
+    fn k_target_converges_under_smoothing_bounded() {
+        let w = SMOOTH_WINDOW_SLOTS;
+        let e = w / 2;
+        let spot = 1_500_000_000u128; // 1.5 SOL, mid-shallow gradient
+        let target = k_target(spot);
+        const BOUND: u32 = 40; // pinned convergence bound (touches)
+
+        for &start in &[1u128, REF_D_MID * 2] {
+            let mut sd = SmoothedDepth::new(start, 0);
+            let mut slot = 0u64;
+            let mut touches = 0u32;
+            loop {
+                slot += e;
+                let v = sd.update(spot, slot, w);
+                touches += 1;
+                let k = k_target(v);
+                let diff = if k > target { k - target } else { target - k };
+                if diff <= 1 { break; }
+                assert!(touches <= BOUND, "no convergence from {} within {} touches", start, BOUND);
+            }
+            assert!(touches <= BOUND, "start {} took {} touches", start, touches);
+        }
+    }
+
+    /// (d) EQUILIBRATION: N machines, same tier, different pools; route a fixed
+    /// wager to the best-odds (lowest-value) machine each step, its house edge
+    /// accrues to its pool. The max-min gap STRICTLY shrinks until it is within
+    /// one spin's edge granularity, at which point the pools are equal up to a
+    /// single spin (converged). Worked example: the three live pools.
+    #[test]
+    fn equilibration_gap_strictly_shrinks() {
+        let mut pools = [300_000_000u128, 999_000_000, 1_200_000_000];
+        let wager = 50_000_000u128; // 0.05 SOL routed per step
+        let gap = |p: &[u128; 3]| p.iter().max().unwrap() - p.iter().min().unwrap();
+        let gap0 = gap(&pools);
+        // Largest possible per-spin edge (at the RTP floor). Below ~2x this, one
+        // spin can push the fed (lowest) pool a hair past the max — the discrete
+        // granularity floor; convergence is defined as reaching it.
+        let max_edge = wager * (BP - RTP_MIN_BP) / BP;
+        let granularity = 2 * max_edge;
+
+        let mut prev = gap0;
+        let mut steps = 0u32;
+        // best-odds routing: pick the highest-k machine, breaking ties toward the
+        // strictly-lowest pool so a min-tie is resolved (not re-fed) — the gap is
+        // then non-increasing every step and strictly shrinks over any tie-free
+        // window, converging to the granularity floor.
+        while prev > granularity {
+            let i = (0..3).max_by_key(|&i| (k_target(pools[i]), u128::MAX - pools[i])).unwrap();
+            let rtp = realized_rtp_bp(pools[i]);
+            let edge = wager * (BP - rtp) / BP; // house edge on this spin volume
+            assert!(edge > 0, "positive edge (RTP < 100%) must accrue");
+            pools[i] += edge;
+            let g = gap(&pools);
+            assert!(g <= prev, "gap must be non-increasing (step {}: {} > {})", steps, g, prev);
+            prev = g;
+            steps += 1;
+            assert!(steps <= 1000, "did not converge within horizon");
+        }
+        assert!(prev <= granularity, "converged to within one spin's edge");
+        assert!(prev < gap0, "net strict shrink from the initial gap");
+        // pinned convergence rate for this worked example: the 0.9-SOL gap across
+        // 0.3/0.999/1.2 closes to one-spin granularity in 457 steps (0.05-SOL
+        // spins). A regression tripwire on the equilibration speed.
+        assert_eq!(steps, 457, "equilibration convergence-step count drifted");
     }
 }

@@ -1,0 +1,28 @@
+{
+  "machine": "4Tb4cW8vn4P1aR4Wwnfd1pLZ7hF942FmrLaKWPogzmeD",
+  "label": "Cold Comfort",
+  "player": "5fsq9kVjvV9w8avdurHWmrGmZEyQu3B9v1UDBVcz2DxT",
+  "nonce": "1783475448568",
+  "wager": "28576",
+  "snapshot": {
+    "kBp": "10498",
+    "tierIsDeep": false,
+    "tier": "shallow",
+    "maxPayout": "1499954",
+    "randSeedSlot": "474731333"
+  },
+  "randomnessAccount": "4jUWM5poHWnd9afY7wngSt7mw82BKfcKxeYkFkuTBHNN",
+  "revealedValueHex": "402f492ba0b2321d58bedb6d73e892e82859e69b579b7ba526e00b74203f750d",
+  "reels": [
+    "JACKPOT",
+    "CHERRY",
+    "BAR"
+  ],
+  "payout": "23998",
+  "poolBefore": "300000000",
+  "poolAfter": "300004578",
+  "commitSig": "42uyMkJZ1cYpof2HkXeiMmT1WqgZfvLMoQU4XVdXecoYp9TiBXLLxUbRGKzD4gYyMgLzxJHd3mh2gd7xRU3p3Zhz",
+  "settleSig": "5iTjDBA5xbenK7RTSaiMPLQLitNpmkJWPsJT6EtJUCeAHZAr4zjeTsPp4562hDFN3XAub42j9KJFow1ew5NoDnbV",
+  "commitUrl": "https://solscan.io/tx/42uyMkJZ1cYpof2HkXeiMmT1WqgZfvLMoQU4XVdXecoYp9TiBXLLxUbRGKzD4gYyMgLzxJHd3mh2gd7xRU3p3Zhz?cluster=devnet",
+  "settleUrl": "https://solscan.io/tx/5iTjDBA5xbenK7RTSaiMPLQLitNpmkJWPsJT6EtJUCeAHZAr4zjeTsPp4562hDFN3XAub42j9KJFow1ew5NoDnbV?cluster=devnet"
+}

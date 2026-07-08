@@ -33,11 +33,15 @@ independent recomputation from chain data (see *What's live on devnet*).
   The edge on every spin accrues to the pool, so share price drifts up with
   volume and down with jackpot variance. Yield is share-price appreciation —
   **never a promised APY.**
-- **RTP band by depth.** Realized RTP = `RTP_base × k(D)`, where `k` is a
-  piecewise-linear function of pool depth `D`: cold/shallow machines pay near the
-  ceiling, hot/deep machines compress toward the floor. The band
-  `[92%, 97%]` holds at both curve extremes for both tiers — a proof obligation,
-  not a tuning goal. Player flow is the arbitrage that rebalances machines.
+- **RTP by pool value — a monotone, cross-machine curve.** Realized RTP =
+  `RTP_base × k`, where `k` is ONE global, monotone-decreasing function of pool
+  value against a protocol reference (not a per-machine curve): the
+  **lowest-value pool always has the best odds**, so odds order across machines by
+  pool value alone. Cheap pools pay nearer the 97% ceiling; deep pools compress to
+  the 92% floor and unlock the 500× tier. The band `[92%, 97%]` holds at both
+  extremes — a proof obligation, not a tuning goal. This is **an AMM for luck**:
+  cheap pools pay better until routed volume grows their bankroll and equalizes
+  the odds (proved to converge in `crates/house-math`).
 - **Volatility by depth.** Deeper vaults unlock the higher-multiplier tier; max
   bet is solvency-derived so one spin's worst case is capped at **≤ 1% of the
   pool** (`MAX_EXPOSURE_BP = 100`). Every pending spin escrows its max payout, so
@@ -135,16 +139,16 @@ The program is deployed and live on **devnet** (upgrade authority
 | HouseConfig PDA (`["house-config"]`) | `EdQAnjaMztwffrfDVPszqQDcdkUvw97Qb8Fz9fcVS1yk` |
 | Switchboard On-Demand (devnet) | `Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2` |
 
-**The floor — three single-asset machines** placed at visibly different points on
-their k-curves so the depth↔RTP economics are legible at a glance: two shallow
-(50× frequent-win) at the ceiling and mid-band, one deep (500× jackpot) at the
-floor.
+**The floor — three single-asset machines** on the ONE normalized odds curve, so
+the ordering is monotone by pool value: the lowest pool has the best odds
+(ODDS-1). Cheapest pays nearest the ceiling; volume routed to it grows its
+bankroll and equalizes the odds.
 
-| machine | address | placement |
-|---|---|---|
-| `house-demo-1` | `9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1` | near ceiling · SHALLOW · **~96.7%** |
-| `Cold Comfort` | `4Tb4cW8vn4P1aR4Wwnfd1pLZ7hF942FmrLaKWPogzmeD` | mid-band · SHALLOW · **~94.5%** |
-| `Leviathan` | `6zsjba9sbx7v8fPrnvyrUDoL1dDaaWcXaigq9swsF2uC` | at the floor · DEEP · **~92%** · 500× jackpot |
+| machine | address | pool | placement |
+|---|---|---|---|
+| `Cold Comfort` | `4Tb4cW8vn4P1aR4Wwnfd1pLZ7hF942FmrLaKWPogzmeD` | 0.300 SOL | best odds · SHALLOW · **~96.5%** |
+| `house-demo-1` | `9Ns1oYdSyqxYMfiRVSoTRLtuEGg6GdkSGkhCWapXsfi1` | 0.999 SOL | SHALLOW · **~94.6%** |
+| `Leviathan` | `6zsjba9sbx7v8fPrnvyrUDoL1dDaaWcXaigq9swsF2uC` | 1.200 SOL | worst odds · SHALLOW · **~94.1%** |
 
 `scripts/machines.ts` is the source of truth for each machine's band and founding
 seed; `npm run bootstrap` creates and seeds any that are missing (idempotent). The

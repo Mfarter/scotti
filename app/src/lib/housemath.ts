@@ -62,6 +62,27 @@ export function kOfDepth(depth: bigint, dLow: bigint, dHigh: bigint, kMin: bigin
   if (depth >= dHigh) return kMin;
   return kMax - ((kMax - kMin) * (depth - dLow)) / (dHigh - dLow);
 }
+// ODDS-1: the normalized cross-machine odds curve (mirrors crates/house-math).
+// k is a global, monotone-decreasing function of pool value against a protocol
+// reference, so the lowest pool always has the best odds — no per-machine curve.
+export const REF_D_LOW = 100_000_000n; // 0.1 SOL
+export const REF_D_MID = 2_000_000_000n; // 2 SOL — tier split and RTP floor point
+export const isDeepRef = (poolValue: bigint): boolean => poolValue >= REF_D_MID;
+export function targetRtpBp(poolValue: bigint): bigint {
+  if (poolValue <= REF_D_LOW) return 9700n;
+  if (poolValue >= REF_D_MID) return 9200n;
+  return 9700n - ((9700n - 9200n) * (poolValue - REF_D_LOW)) / (REF_D_MID - REF_D_LOW);
+}
+/** Normalized k target: the scaler realizing target RTP for the active tier's
+ * paytable, clamped to the band. Monotone non-increasing in pool value. */
+export function kTarget(poolValue: bigint): bigint {
+  const isDeep = isDeepRef(poolValue);
+  const num = isDeep ? DEEP_NUM : SHALLOW_NUM;
+  const [kMin, kMax] = kBoundsConst(isDeep);
+  const total = STOPS * STOPS * STOPS;
+  const k = (targetRtpBp(poolValue) * total * BP) / num;
+  return k < kMin ? kMin : k > kMax ? kMax : k;
+}
 export function maxBet(depth: bigint, expoBp: bigint, t: Tier, kBp: bigint): bigint {
   const eff = (maxMultBp(t) * kBp) / BP;
   if (eff === 0n) return 0n;

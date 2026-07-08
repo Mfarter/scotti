@@ -291,10 +291,16 @@ pub mod house {
         let mut sd = hm::SmoothedDepth { value: m.smoothed_value, last_slot: m.smoothed_last_slot };
         let depth = sd.update(m.pool_value as u128, now, m.smooth_window);
 
-        let is_deep = depth >= m.d_mid as u128;
+        // ODDS-1: k and tier come from the NORMALIZED protocol curve — one global,
+        // monotone-in-pool-value function shared by every machine — so the lowest
+        // pool always has the best odds, ordering across machines by pool value
+        // alone. The SMOOTHED value is still the input (anti-snipe lag unchanged),
+        // and the smoothing target is now this normalized curve. The legacy
+        // per-machine (d_low/d_mid/d_high) reference is no longer read (kept in the
+        // account for size; every legacy machine now shares the protocol curve).
+        let is_deep = hm::is_deep_ref(depth);
         let tier = if is_deep { &hm::DEEP } else { &hm::SHALLOW };
-        let (k_min, k_max) = hm::k_bounds_const(is_deep);
-        let k = hm::k_of_depth(depth, m.d_low as u128, m.d_high as u128, k_min, k_max);
+        let k = hm::k_target(depth);
 
         // solvency-derived max bet at this snapshot; wager must not exceed it.
         let max_bet = hm::max_bet(depth, m.max_exposure_bp as u128, tier, k);

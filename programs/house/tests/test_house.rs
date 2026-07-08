@@ -197,12 +197,13 @@ fn spin_closed(svm: &LiteSVM, machine: &Pubkey, player: &Pubkey, nonce: u64) -> 
 // -------------------- house-math mirrors (the single source of truth) --------------------
 
 /// Snapshot the program will compute for a FULLY CONVERGED machine at `depth`.
-/// Returns (is_deep, k_bp, max_bet).
+/// Returns (is_deep, k_bp, max_bet). ODDS-1: the curve is the NORMALIZED protocol
+/// curve (a global monotone function of pool value), not the per-machine
+/// (d_low/d_mid/d_high) reference — the mirror follows the program.
 fn converged_snapshot(depth: u128) -> (bool, u128, u128) {
-    let is_deep = depth >= D_MID as u128;
+    let is_deep = hm::is_deep_ref(depth);
     let tier = if is_deep { &hm::DEEP } else { &hm::SHALLOW };
-    let (kmin, kmax) = hm::k_bounds_const(is_deep);
-    let k = hm::k_of_depth(depth, D_LOW as u128, D_HIGH as u128, kmin, kmax);
+    let k = hm::k_target(depth);
     let max_bet = hm::max_bet(depth, EXPO_BP as u128, tier, k);
     (is_deep, k, max_bet)
 }
@@ -338,7 +339,9 @@ fn c_max_bet_boundary_both_sides() {
 // ============================================================================
 #[test]
 fn d_k_snapshot_survives_pool_change() {
-    let pool = 2_000_000_000; // 2 SOL -> SHALLOW, cold (k near k_max)
+    // 1 SOL: SHALLOW under the ODDS-1 protocol split (< 2 SOL). The whale deposit
+    // below pushes the pool across the split to DEEP, exercising a tier change.
+    let pool = 1_000_000_000;
     let (mut svm, id, _a, _c, lp) = boot_converged(0xD4, pool);
     let m = machine_pda(&id);
     let player = funded(&mut svm);
@@ -430,7 +433,7 @@ fn f_commit_snapshot_uses_smoothed_depth() {
     let m = machine_pda(&id);
 
     // small deposit, converge, and a first commit to seat smoothed == A
-    let a_pool: u64 = 2_000_000_000; // 2 SOL, SHALLOW
+    let a_pool: u64 = 1_000_000_000; // 1 SOL, SHALLOW (< the 2-SOL protocol split)
     assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), a_pool), &lp, &[&lp]));
     let base_slot = window() * 2;
     svm.warp_to_slot(base_slot);
@@ -1209,4 +1212,74 @@ fn redteam_snapshot_cranker_cannot_split_identical_lps() {
     let pay2 = v2 - lamports(&svm, &m);
     assert_eq!(pay1, pay2, "hostile cranker cannot split identical LPs: {pay1} == {pay2}");
     assert_eq!(pay1 as u128, hm::snapshot::payout(s1, snap), "both at the frozen snapshot");
+}
+
+// ============================================================================
+// ODDS-1: the normalized cross-machine odds curve, on-chain
+// ============================================================================
+
+/// Commit one spin and return the snapshot k it froze (a fresh player each call).
+fn committed_k(svm: &mut LiteSVM, id: [u8; 16], nonce: u64) -> u128 {
+    let player = funded(svm);
+    let m = machine_pda(&id);
+    assert!(send(svm, ix_commit(id, &player.pubkey(), Pubkey::new_unique(), 1_000, nonce), &player, &[&player]));
+    read_spin(svm, &m, &player.pubkey(), nonce).k_bp
+}
+
+/// MONOTONICITY across machines: two machines with different pools (each created
+/// with the SAME legacy per-machine params, which the normalized curve ignores)
+/// — the lower pool commits the higher k, i.e. better odds. The live pool pair.
+#[test]
+fn odds1_lower_pool_commits_better_odds() {
+    let cheap = 300_000_000u64; // 0.3 SOL (Cold Comfort)
+    let rich = 999_000_000u64;  // 0.999 SOL (house-demo-1)
+    let (mut a, id_a, ..) = boot_converged(0x51, cheap);
+    let k_cheap = committed_k(&mut a, id_a, 1);
+    let (mut b, id_b, ..) = boot_converged(0x52, rich);
+    let k_rich = committed_k(&mut b, id_b, 1);
+    // both shallow (< 2-SOL split), and the on-chain k matches the normalized mirror
+    assert_eq!(k_cheap, hm::k_target(cheap as u128));
+    assert_eq!(k_rich, hm::k_target(rich as u128));
+    assert!(k_cheap > k_rich, "lower pool must commit better odds: {} !> {}", k_cheap, k_rich);
+}
+
+/// STAKER-COUPLING on-chain: the k TARGET drops the instant a deposit lands, and
+/// the committed k follows once the (unchanged) anti-snipe smoothing catches up —
+/// a deposit cannot open an instant better-odds window.
+#[test]
+fn odds1_deposit_lowers_committed_k() {
+    let pool = 300_000_000u64; // 0.3 SOL, shallow
+    let (mut svm, id, _a, _c, lp) = boot_converged(0x53, pool);
+    let k1 = committed_k(&mut svm, id, 1);
+    assert_eq!(k1, hm::k_target(pool as u128));
+
+    let deposit = 600_000_000u64; // +0.6 SOL -> 0.9 SOL (still shallow)
+    // the target moves DOWN immediately, before any smoothing
+    assert!(hm::k_target((pool + deposit) as u128) < k1, "deposit must lower the k target");
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), deposit), &lp, &[&lp]));
+
+    // committed k does NOT jump this same slot (anti-snipe lag); it converges
+    // once a full window elapses.
+    svm.warp_to_slot(window() * 10);
+    let k2 = committed_k(&mut svm, id, 2);
+    assert!(k2 < k1, "committed k must fall after a deposit: {} !< {}", k2, k1);
+    assert_eq!(k2, hm::k_target((pool + deposit) as u128), "converges to the new target");
+}
+
+/// CONVERGENCE bound on-chain: the smoothing lag is exactly ONE window — after a
+/// deposit, warping a full window makes the smoothed depth (hence k) reach the new
+/// spot target exactly, matching the house-math convergence proof's bound.
+#[test]
+fn odds1_converges_within_one_window() {
+    let pool = 300_000_000u64;
+    let (mut svm, id, _a, _c, lp) = boot_converged(0x54, pool);
+    let _ = committed_k(&mut svm, id, 1); // seat smoothed == pool
+    assert!(send(&mut svm, ix_deposit(id, &lp.pubkey(), 1_200_000_000), &lp, &[&lp])); // -> 1.5 SOL
+    let spot = read_machine(&svm, &id).pool_value as u128;
+    // exactly one window after the last smoothing touch: smoothed == spot
+    let touched = read_machine(&svm, &id).smoothed_last_slot;
+    svm.warp_to_slot(touched + window());
+    let k = committed_k(&mut svm, id, 2);
+    assert_eq!(read_machine(&svm, &id).smoothed_value, spot, "smoothed reaches spot in one window");
+    assert_eq!(k, hm::k_target(spot), "k equals the spot target after one window");
 }

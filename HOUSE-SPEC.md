@@ -44,25 +44,52 @@ Payouts are expressed in **basis points of the wager** (`mult_bp`), so fractiona
 integer-exact. Two paytable **tiers** (see §2.3): SHALLOW (max 50×) and DEEP (max 500×), engineered
 to near-identical base RTP (the crate asserts both, exactly).
 
-### 2.2 The RTP curve — k(D)
-Let `D` = pool depth (internal accounting value, NOT raw lamports — see §6 donation attack).
-Effective payout on a win = `wager × mult_bp × k_bp / 1e8`, where the scaler `k_bp` is a
-piecewise-linear function of D:
+### 2.2 The RTP curve — the normalized, cross-machine odds curve (ODDS-1)
+Let `V` = pool value (internal accounting value, total, incl. staker capital — NOT raw
+lamports; see §6 donation attack). Odds are **one global, monotone function of pool value**,
+shared by every machine — there is no per-machine curve reference. This makes odds order
+across machines by pool value alone: **the lowest-value pool always has the best odds**.
+
+Target realized RTP is a monotone-decreasing function of `V` against a **protocol** reference
+(`REF_D_LOW = 0.1 SOL`, `REF_D_MID = 2 SOL`):
 
 ```
-k(D) = k_max                          for D ≤ D_low        (cold machine: best odds)
-       linear from k_max → k_min      for D_low < D < D_high
-       k_min                          for D ≥ D_high        (deep machine: floor odds)
+target_RTP(V) = RTP_MAX (97%)                     for V ≤ REF_D_LOW   (cheapest pool: best odds)
+                linear 97% → 92%                  for REF_D_LOW < V < REF_D_MID
+                RTP_MIN (92%)                      for V ≥ REF_D_MID   (deep pool: floor odds)
 ```
 
-Per tier, `k_min/k_max` are derived constants: `k_min = floor(RTP_MIN / RTP_base)`,
-`k_max = floor(RTP_MAX / RTP_base)` (in bp), so realized RTP = `RTP_base × k` sits inside
-[92%, 97%] by construction. The crate asserts the band at both extremes for both tiers, and
-asserts k_max × RTP_base < 100% with margin. All curve parameters are on-chain machine state,
-readable by anyone: **the odds are the pool state run through a published function.**
+The scaler `k_bp` is the value that realizes `target_RTP(V)` for the ACTIVE paytable, clamped
+to that tier's band: `k = clamp(target_RTP × 32768 × 1e4 / RTP_base_num, k_min, k_max)`.
+Because RTP falls with `V` and the paytable numerator rises at the tier split, `k` is monotone
+**non-increasing in pool value across the whole domain** — a deposit only ever lowers or holds
+it. Effective payout on a win = `wager × mult_bp × k_bp / 1e8`.
+
+Per tier, `k_min/k_max` are derived constants so realized RTP = `RTP_base × k` sits inside
+[92%, 97%] by construction. The crate (`crates/house-math`, `odds_normalized_proofs`) proves,
+integer-exact: **(a) monotonicity** — `k_target(a) ≥ k_target(b)` for `a < b`; **(b)
+staker-coupling** — a deposit lowers (a withdrawal raises) `k_target` immediately, because the
+input is pool value, not cumulative volume; **(c) convergence** — under the unchanged anti-snipe
+smoothing, `k` reaches within 1 bp of its target in a bounded number of touches; **(d)
+equilibration** (below). All curve parameters are protocol constants, readable by anyone:
+**the odds are the pool state run through one published function.**
+
+The **equilibrating property — an AMM for luck.** Because the cheapest pool always pays best,
+rational volume routes to it; the house edge on that volume accrues to *its* bankroll, growing
+`V` and lowering its odds until another pool is cheaper. Pool values converge; the arbitrage
+loop is: **cheap pools pay better until volume equalizes them.** The proof
+`equilibration_gap_strictly_shrinks` models the three live pools (0.3 / 0.999 / 1.2 SOL): the
+max–min gap is non-increasing every step and closes to one-spin granularity in a pinned 457
+steps.
+
+Legacy: the former per-machine `(d_low, d_mid, d_high)` reference is retained in the account for
+size but is no longer read by the curve — every machine (legacy included) shares the protocol
+curve after the ODDS-1 upgrade, so no migration is required.
 
 ### 2.3 Volatility tiering + exposure cap
-Tier = SHALLOW if `D < D_mid`, DEEP otherwise. Max bet is solvency-derived:
+Tier = SHALLOW if `V < REF_D_MID`, DEEP otherwise (the protocol split, a pure function of pool
+value). Deep pools sit at the RTP floor and unlock the 500× jackpot paytable. Max bet is
+solvency-derived:
 
 ```
 max_bet(D) = D × MAX_EXPOSURE_BP / 10⁴ / max_effective_mult(tier, k(D))

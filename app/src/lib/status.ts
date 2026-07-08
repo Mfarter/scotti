@@ -3,7 +3,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { Buffer } from "buffer";
 import {
-  DEEP, SHALLOW, kBoundsConst, kOfDepth, maxBet, realizedRtpBp, smoothedUpdate, topMultiplier,
+  DEEP, SHALLOW, isDeepRef, kTarget, maxBet, realizedRtpBp, smoothedUpdate, topMultiplier,
 } from "./housemath.ts";
 import { decodeLpPosition, decodeMachine, epochLengthEff, lpPda, Machine, machineIdToLabel, snapshotPayout, snapshotPrice } from "./program.ts";
 
@@ -23,10 +23,11 @@ export interface MachineStatus {
 
 export function computeMachineStatus(machine: PublicKey, m: Machine, slot: bigint): MachineStatus {
   const smoothed = smoothedUpdate(m.smoothedValue, m.smoothedLastSlot, m.poolValue, slot, m.smoothWindow);
-  const isDeep = smoothed >= m.dMid;
+  // ODDS-1: normalized protocol curve — k and tier are a global function of the
+  // (smoothed) pool value, not the legacy per-machine (dLow/dMid/dHigh).
+  const isDeep = isDeepRef(smoothed);
   const tier = isDeep ? DEEP : SHALLOW;
-  const [kMin, kMax] = kBoundsConst(isDeep);
-  const k = kOfDepth(smoothed, m.dLow, m.dHigh, kMin, kMax);
+  const k = kTarget(smoothed);
   const elen = epochLengthEff(m);
   const epochNow = slot / elen;
   return {

@@ -11,7 +11,7 @@ import { asV0Tx, getDefaultDevnetQueue, Randomness } from "@switchboard-xyz/on-d
 import {
   PROGRAM_ID, SOL, connection, convergedSnapshot, decodeMachine, decodePendingSpin,
   ixDisc, loadWallet, machineId, machinePda, reelsFromRandomness, sleep, spinPayout,
-  spinPda, SYMBOL_NAME, DEEP, SHALLOW, smoothedUpdate, kBoundsConst, kOfDepth, maxBet as maxBetFn,
+  spinPda, SYMBOL_NAME, DEEP, SHALLOW, smoothedUpdate, isDeepRef, kTarget, maxBet as maxBetFn,
   solscanTx, u64,
 } from "./common.ts";
 
@@ -42,10 +42,9 @@ async function chooseWager(): Promise<bigint> {
     const m = decodeMachine((await conn.getAccountInfo(machine))!.data);
     const slot = await currentSlot();
     const depth = smoothedUpdate(m.smoothedValue, m.smoothedLastSlot, m.poolValue, slot, m.smoothWindow);
-    const isDeep = depth >= m.dMid;
+    const isDeep = isDeepRef(depth); // ODDS-1: normalized protocol curve
     const tier = isDeep ? DEEP : SHALLOW;
-    const [kMin, kMax] = kBoundsConst(isDeep);
-    const k = kOfDepth(depth, m.dLow, m.dHigh, kMin, kMax);
+    const k = kTarget(depth);
     const mb = maxBetFn(depth, m.maxExposureBp, tier, k);
     if (mb >= 20_000n) {
       const w = mb / 2n;

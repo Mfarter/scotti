@@ -264,6 +264,21 @@ export function maxBet(depth: bigint, expoBp: bigint, t: Tier, kBp: bigint): big
   if (eff === 0n) return 0n;
   return (((depth * expoBp) / BP) * BP) / eff;
 }
+// ODDS-1: normalized cross-machine odds curve (mirrors crates/house-math).
+export const REF_D_LOW = 100_000_000n, REF_D_MID = 2_000_000_000n;
+export const isDeepRef = (poolValue: bigint) => poolValue >= REF_D_MID;
+export function targetRtpBp(poolValue: bigint): bigint {
+  if (poolValue <= REF_D_LOW) return 9700n;
+  if (poolValue >= REF_D_MID) return 9200n;
+  return 9700n - ((9700n - 9200n) * (poolValue - REF_D_LOW)) / (REF_D_MID - REF_D_LOW);
+}
+export function kTarget(poolValue: bigint): bigint {
+  const isDeep = isDeepRef(poolValue);
+  const num = isDeep ? 302_901_000n : 301_132_000n;
+  const [kMin, kMax] = kBoundsConst(isDeep);
+  const k = (targetRtpBp(poolValue) * 32_768n * BP) / num;
+  return k < kMin ? kMin : k > kMax ? kMax : k;
+}
 /** SmoothedDepth.update — returns the advanced value. */
 export function smoothedUpdate(value: bigint, lastSlot: bigint, depthNow: bigint, slotNow: bigint, window: bigint): bigint {
   let elapsed = slotNow > lastSlot ? slotNow - lastSlot : 0n;
@@ -279,10 +294,9 @@ export function smoothedUpdate(value: bigint, lastSlot: bigint, depthNow: bigint
  * smoothing has fully converged (smoothed == poolValue). Mirrors spin_commit. */
 export function convergedSnapshot(m: Machine): { isDeep: boolean; k: bigint; tier: Tier; maxBet: bigint } {
   const depth = m.poolValue;
-  const isDeep = depth >= m.dMid;
+  const isDeep = isDeepRef(depth); // ODDS-1: normalized protocol curve
   const tier = isDeep ? DEEP : SHALLOW;
-  const [kMin, kMax] = kBoundsConst(isDeep);
-  const k = kOfDepth(depth, m.dLow, m.dHigh, kMin, kMax);
+  const k = kTarget(depth);
   return { isDeep, k, tier, maxBet: maxBet(depth, m.maxExposureBp, tier, k) };
 }
 
@@ -325,10 +339,9 @@ export async function machineStatus(conn: Connection, machine: PublicKey): Promi
   const m = decodeMachine(info.data);
   const slot = BigInt(await conn.getSlot("confirmed"));
   const smoothed = smoothedUpdate(m.smoothedValue, m.smoothedLastSlot, m.poolValue, slot, m.smoothWindow);
-  const isDeep = smoothed >= m.dMid;
+  const isDeep = isDeepRef(smoothed); // ODDS-1: normalized protocol curve
   const tier = isDeep ? DEEP : SHALLOW;
-  const [kMin, kMax] = kBoundsConst(isDeep);
-  const k = kOfDepth(smoothed, m.dLow, m.dHigh, kMin, kMax);
+  const k = kTarget(smoothed);
   const elen = epochLengthEff(m);
   const epochNow = slot / elen;
   const sharePrice1e12 = m.totalShares === 0n ? 0n : (m.poolValue * 1_000_000_000_000n) / m.totalShares;
