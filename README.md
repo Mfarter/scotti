@@ -180,6 +180,22 @@ swap filled within ~0.11% of TWAP (fee + near-zero slippage). Re-run after a res
 with `HOUSE_RPC=<devnet> node scripts/devnet-liquidity.ts --sol 1.6` (keep the
 keeper running — `node scripts/keeper.ts` — so the TWAP stays fresh).
 
+**A second wizard-ready pool (`scripts/devnet-pool-b5.ts`, POOL-1).** Stands up one
+more CLMM pool — `B5tR8Tzo…`/WSOL — MIRRORING dual-chip-1: same ammConfig
+(`FZdkW5…`, index 2), same 0.001 WSOL-per-token price (**1000 B5/SOL**), same wide
+range (600–1800 B5/SOL, ticks 63970–74950). It mints B5 to our wallet (we hold the
+mint authority; the 1e6 supply had been moved out), creates the pool, and seeds
+**1.9 WSOL + ~1,685 B5** → `L` **236,267,127,432** (≈ dual-chip-1's 226e9); a 0.002-SOL
+dust swap's price impact is **0.0535%** (dual-chip-1 after LIQ-1 ≈ 0.078%), proving
+it's liquid. The create + seed use the SAME Raydium SDK v2 CLMM path as dual-chip-1
+(no hand-rolled layout); one guard reproduces the SDK's own `getPoolInfoFromRpc`
+poolInfo/poolKeys for a *fresh* empty pool, whose tick-array read the SDK otherwise
+crashes on. State is written to `scripts/pool-b5.json` (dual-chip-1's `pool.json` is
+untouched). Re-run: `HOUSE_RPC=<devnet> node scripts/devnet-pool-b5.ts` (Stage A
+skips if the pool exists). **Pool address for the launch wizard's pool-set step:**
+`FKpemhoD9E7wvoTHR96jgBJevBYxB9s5BmNF5BvcMKJd` — this token + pool are now
+wizard-ready.
+
 ### Verified artifacts (each reconciled to the base unit by independent recompute)
 
 | artifact | proof link | what it proves |
