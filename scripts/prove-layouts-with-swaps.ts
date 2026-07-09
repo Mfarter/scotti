@@ -12,7 +12,7 @@ import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { NATIVE_MINT } from "@solana/spl-token";
 import BN from "bn.js";
 import { decodePool, decodeObs } from "./layouts.ts";
-import { loadRaydium, doSwap } from "./clmm-swap.ts";
+import { loadRaydium, loadPool, doSwap } from "./clmm-swap.ts";
 import { CLMM_POOL, OBSERVATION_STATE, CHIP_MINT } from "./raydium-constants.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -52,12 +52,13 @@ async function main() {
   const owner = wallet();
   const c = new Connection(process.env.HOUSE_RPC ?? "https://api.devnet.solana.com", "confirmed");
   const raydium = await loadRaydium(c, owner);
+  const pool = await loadPool(c, CLMM_POOL);
   const WSOL = NATIVE_MINT, CHIP = CHIP_MINT;
 
   let s = await snap(c, "SNAP 0 (cold, pre-swap)");
 
   console.log("\n>> SWAP 1: WSOL → CHIP, 0.01 SOL in (buying CHIP)");
-  let r = await doSwap(raydium, c, WSOL, new BN(0.01 * 1e9));
+  let r = await doSwap(raydium, c, pool, WSOL, new BN(0.01 * 1e9));
   console.log(`   tx ${r.txId}  amountOut ${(Number(r.amountOut) / 1e9).toFixed(4)} CHIP`);
   await sleep(3000);
   s = await snap(c, "SNAP 1 (after WSOL→CHIP)", s);
@@ -65,7 +66,7 @@ async function main() {
   console.log("\n   … waiting 17s to cross the 15s observation window …");
   await sleep(17000);
   console.log(">> SWAP 2: CHIP → WSOL, 20 CHIP in (selling CHIP)");
-  r = await doSwap(raydium, c, CHIP, new BN(20).mul(new BN(10).pow(new BN(9))));
+  r = await doSwap(raydium, c, pool, CHIP, new BN(20).mul(new BN(10).pow(new BN(9))));
   console.log(`   tx ${r.txId}  amountOut ${(Number(r.amountOut) / 1e9).toFixed(6)} SOL`);
   await sleep(3000);
   s = await snap(c, "SNAP 2 (after CHIP→WSOL, +window)", s);
@@ -73,7 +74,7 @@ async function main() {
   console.log("\n   … waiting 17s …");
   await sleep(17000);
   console.log(">> SWAP 3: WSOL → CHIP, 0.03 SOL in (bigger nudge up)");
-  r = await doSwap(raydium, c, WSOL, new BN(0.03 * 1e9));
+  r = await doSwap(raydium, c, pool, WSOL, new BN(0.03 * 1e9));
   console.log(`   tx ${r.txId}  amountOut ${(Number(r.amountOut) / 1e9).toFixed(4)} CHIP`);
   await sleep(3000);
   s = await snap(c, "SNAP 3 (after bigger WSOL→CHIP, +window)", s);

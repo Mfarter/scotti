@@ -10,9 +10,9 @@ import { appendFileSync, readFileSync } from "node:fs"; import { homedir } from 
 import { Connection, Keypair } from "@solana/web3.js";
 import { NATIVE_MINT } from "@solana/spl-token";
 import BN from "bn.js";
-import { loadRaydium, doSwap } from "./clmm-swap.ts";
+import { loadRaydium, loadPool, doSwap } from "./clmm-swap.ts";
 import { readStatus } from "./twap-status.ts";
-import { CHIP_MINT } from "./raydium-constants.ts";
+import { CHIP_MINT, CLMM_POOL } from "./raydium-constants.ts";
 import { BAND_BP } from "./twap.ts";
 
 const OUT = new URL("./twap-demo-output.txt", import.meta.url).pathname;
@@ -41,6 +41,7 @@ async function main() {
   const owner = wallet();
   const c = new Connection(process.env.HOUSE_RPC ?? "https://api.devnet.solana.com", "confirmed");
   const raydium = await loadRaydium(c, owner);
+  const pool = await loadPool(c, CLMM_POOL);
   const dust = new BN(Math.round(0.002 * 1e9));
   const dustChip = new BN(2).mul(new BN(10).pow(new BN(9)));
   const startBal = await c.getBalance(owner.publicKey);
@@ -51,7 +52,7 @@ async function main() {
   await line(c, "start");
   let live = false;
   for (let i = 0; i < 26 && !live; i++) {
-    await doSwap(raydium, c, i % 2 === 0 ? WSOL : CHIP, i % 2 === 0 ? dust : dustChip, 0.1);
+    await doSwap(raydium, c, pool, i % 2 === 0 ? WSOL : CHIP, i % 2 === 0 ? dust : dustChip, 0.1);
     await sleep(3000);
     const s = await line(c, "A:warmup");
     live = s.twap.status === "LIVE";
@@ -60,21 +61,21 @@ async function main() {
 
   // ---- Phase B: deliberate nudge (big WSOL→CHIP), watch TWAP lag → band OUT ----
   log(`>> NUDGE: 0.06 SOL WSOL→CHIP (move spot down, TWAP should lag)`);
-  await doSwap(raydium, c, WSOL, new BN(Math.round(0.06 * 1e9)), 0.2);
+  await doSwap(raydium, c, pool, WSOL, new BN(Math.round(0.06 * 1e9)), 0.2);
   await sleep(3000);
   for (let i = 0; i < 3; i++) { await line(c, "B:nudged"); await sleep(16000);
     // keep obs fresh during the hold without moving spot much (balanced)
-    await doSwap(raydium, c, i % 2 === 0 ? CHIP : WSOL, i % 2 === 0 ? dustChip : dust, 0.1);
+    await doSwap(raydium, c, pool, i % 2 === 0 ? CHIP : WSOL, i % 2 === 0 ? dustChip : dust, 0.1);
   }
 
   // ---- Phase C: recovery — counter-swap returns spot, band re-enters ----
   log(`>> RECOVER: counter-swap ~60 CHIP → WSOL to bring spot back toward TWAP`);
-  await doSwap(raydium, c, CHIP, new BN(60).mul(new BN(10).pow(new BN(9))), 0.2);
+  await doSwap(raydium, c, pool, CHIP, new BN(60).mul(new BN(10).pow(new BN(9))), 0.2);
   await sleep(3000);
   for (let i = 0; i < 4; i++) { const s = await line(c, "C:recover");
     if (s.twap.status === "LIVE" && s.bandOk) break;
     await sleep(16000);
-    await doSwap(raydium, c, i % 2 === 0 ? WSOL : CHIP, i % 2 === 0 ? dust : dustChip, 0.1);
+    await doSwap(raydium, c, pool, i % 2 === 0 ? WSOL : CHIP, i % 2 === 0 ? dust : dustChip, 0.1);
   }
 
   // ---- Phase D: stop swapping, watch staleness fire ----
