@@ -17,9 +17,10 @@ import { PriceChip, Solscan } from "../components/ui.tsx";
 import { fmtSol, shortKey } from "../lib/format.ts";
 import { solscanAcct } from "../lib/constants.ts";
 import { TOKEN_PROGRAM_ID } from "../lib/dual.ts";
-import { priceStatus, type PriceStatus } from "../lib/clmm.ts";
+import { priceStatus, poolObservationId, type PriceStatus } from "../lib/clmm.ts";
+import { sleep } from "../lib/rpc.ts";
 import {
-  checkPoolMember, poolObservationId, ixCreateVault, vaultMachineId, vaultMachinePda, poolSetPda,
+  checkPoolMember, ixCreateVault, vaultMachineId, vaultMachinePda, poolSetPda,
   fetchMintRegistry, type MemberCheck, MAX_POOLS,
 } from "../lib/poolset.ts";
 import { DEFAULT_PARAMS, CLAMPS, validateParams, quorumOf, type VaultParams, type ParamIssue } from "../lib/vaultspec.ts";
@@ -41,6 +42,23 @@ async function loadToken(conn: import("@solana/web3.js").Connection, mint: strin
 export interface Member {
   poolKey: PublicKey; obsKey: PublicKey | null;
   check: MemberCheck; status: PriceStatus | null; loading: boolean;
+  // FIX-4: an account couldn't be FETCHED (RPC error / not-yet-indexed), which is
+  // NOT the same as a fetched account with the wrong owner. When true the UI shows
+  // a "couldn't verify — retry" affordance, never the ownership rejection.
+  fetchFailed?: boolean;
+}
+
+// FIX-4: resilient single-account fetch. getAccountInfo returns null for a missing
+// account AND (a lagging node) for a freshly-created one, and throws on RPC errors;
+// retry on BOTH null and throw so a transient/lag doesn't masquerade as "wrong
+// owner". Returns the account, or null if it truly can't be read after `tries`.
+async function fetchAccount(conn: import("@solana/web3.js").Connection, key: PublicKey, tries = 4) {
+  for (let i = 0; i < tries; i++) {
+    try { const info = await conn.getAccountInfo(key); if (info) return info; }
+    catch { /* RPC error — retry */ }
+    if (i < tries - 1) await sleep(600 * (i + 1));
+  }
+  return null;
 }
 
 // DEV-ONLY: the screenshot harness injects fabricated wizard state so each step can
@@ -96,6 +114,27 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
     } finally { setTokenBusy(false); }
   }
 
+  // FIX-4: validate one pool with the fetch/owner states kept DISTINCT. A null fetch
+  // (after retries) → fetchFailed ("couldn't verify — retry"), never the ownership
+  // rejection; only a successfully-FETCHED account whose owner ≠ CLMM gets that.
+  async function validatePool(poolKey: PublicKey, already: PublicKey[]): Promise<Member> {
+    const failed = (reason: string, obsKey: PublicKey | null = null): Member => ({
+      poolKey, obsKey, status: null, loading: false, fetchFailed: true,
+      check: { ok: false, clmmOwned: false, pairsMint: false, crossLinked: false, distinct: true, mintA: null, mintB: null, observation: null, reasons: [reason] },
+    });
+    const poolInfo = await fetchAccount(connection, poolKey);
+    if (!poolInfo) return failed("couldn't verify this pool — the RPC returned nothing (rate-limited, or the pool isn't indexed yet). This is a network state, not a rejection — retry.");
+    const poolData = Buffer.from(poolInfo.data);
+    const obsKey = poolData.length >= 233 ? poolObservationId(poolData) : null;
+    const obsInfo = obsKey ? await fetchAccount(connection, obsKey) : null;
+    if (obsKey && !obsInfo) return failed("couldn't verify this pool's observation account — the RPC returned nothing. Retry.", obsKey);
+    const obsData = obsInfo ? Buffer.from(obsInfo.data) : null;
+    const check = checkPoolMember(poolKey, poolInfo.owner, poolData, obsKey ?? PublicKey.default, obsInfo?.owner ?? null, obsData, new PublicKey(token!.mint), already);
+    const now = Math.floor(Date.now() / 1000);
+    const status = obsData ? priceStatus(poolData, obsData, now, DEFAULT_PARAMS.twapWindowSecs, DEFAULT_PARAMS.maxStalenessSecs, DEFAULT_PARAMS.bandBp) : null;
+    return { poolKey, obsKey, check, status, loading: false };
+  }
+
   async function addPool() {
     if (!token?.ok) return;
     setAddBusy(true);
@@ -104,22 +143,16 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
       try { poolKey = new PublicKey(poolInput.trim()); } catch {
         setMembers((m) => [...m, badMember(poolInput.trim(), "not a valid address")]); setPoolInput(""); return;
       }
-      const poolInfo = await connection.getAccountInfo(poolKey);
-      const poolData = poolInfo ? Buffer.from(poolInfo.data) : null;
-      const obsKey = poolData && poolData.length >= 233 ? poolObservationId(poolData) : null;
-      const obsInfo = obsKey ? await connection.getAccountInfo(obsKey) : null;
-      const obsData = obsInfo ? Buffer.from(obsInfo.data) : null;
-      const already = members.map((m) => m.poolKey);
-      const check = checkPoolMember(
-        poolKey, poolInfo?.owner ?? null, poolData,
-        obsKey ?? PublicKey.default, obsInfo?.owner ?? null, obsData,
-        new PublicKey(token.mint), already,
-      );
-      const now = Math.floor(Date.now() / 1000);
-      const status = poolData && obsData ? priceStatus(poolData, obsData, now, DEFAULT_PARAMS.twapWindowSecs, DEFAULT_PARAMS.maxStalenessSecs, DEFAULT_PARAMS.bandBp) : null;
-      setMembers((m) => [...m, { poolKey, obsKey, check, status, loading: false }]);
-      setPoolInput("");
+      const member = await validatePool(poolKey, members.map((m) => m.poolKey));
+      setMembers((m) => [...m, member]); setPoolInput("");
     } finally { setAddBusy(false); }
+  }
+  // FIX-4: re-run validation for a member that couldn't be fetched (the retry affordance).
+  async function retryMember(i: number) {
+    if (!token?.ok) return;
+    setMembers((m) => m.map((x, j) => (j === i ? { ...x, loading: true } : x)));
+    const member = await validatePool(members[i].poolKey, members.filter((_, j) => j !== i).map((m) => m.poolKey));
+    setMembers((m) => m.map((x, j) => (j === i ? member : x)));
   }
   const removeMember = (i: number) => setMembers((m) => m.filter((_, j) => j !== i));
 
@@ -211,13 +244,21 @@ export function LaunchWizard({ initial }: { initial?: WizardInitial } = {}) {
                   <div className="row" style={{ gap: 10, alignItems: "center" }}>
                     <span className="tag">pool {i + 1}</span>
                     <Solscan acct={m.poolKey.toBase58()} />
-                    {m.status && <PriceChip kind={m.status.kind} label={m.status.commitAllowed ? "eligible" : m.status.label} title={m.status.reason} />}
+                    {m.loading ? <span className="os-chip neutral spin-anim">verifying…</span>
+                      : m.fetchFailed ? <span className="os-chip amber">couldn't verify</span>
+                      : m.status ? <PriceChip kind={m.status.kind} label={m.status.commitAllowed ? "eligible" : m.status.label} title={m.status.reason} /> : null}
                   </div>
-                  <button className="btn sm ghost" onClick={() => removeMember(i)}>remove</button>
+                  <div className="row" style={{ gap: 8 }}>
+                    {m.fetchFailed && <button className="btn sm" onClick={() => retryMember(i)} disabled={m.loading}>retry</button>}
+                    <button className="btn sm ghost" onClick={() => removeMember(i)}>remove</button>
+                  </div>
                 </div>
-                {m.check.ok
-                  ? <div className="faint mono" style={{ fontSize: 12 }}>✓ CLMM-owned · pairs the mint · cross-linked · distinct{m.status?.twap != null ? ` · twap ${m.status.twap.toFixed(1)} CHIP/SOL` : ""}</div>
-                  : <div className="note bad" style={{ fontSize: 12.5 }}>{m.check.reasons.join(" · ")}</div>}
+                {m.loading ? <div className="faint" style={{ fontSize: 12 }}>re-reading the pool + observation from the chain…</div>
+                  : m.fetchFailed
+                    ? <div className="note warn" style={{ fontSize: 12.5 }}>{m.check.reasons.join(" · ")}</div>
+                  : m.check.ok
+                    ? <div className="faint mono" style={{ fontSize: 12 }}>✓ CLMM-owned · pairs the mint · cross-linked · distinct{m.status?.twap != null ? ` · twap ${m.status.twap.toFixed(1)} CHIP/SOL` : ""}</div>
+                    : <div className="note bad" style={{ fontSize: 12.5 }}>{m.check.reasons.join(" · ")}</div>}
               </div>
             ))}
           </div>

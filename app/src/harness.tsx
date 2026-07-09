@@ -183,6 +183,14 @@ const okMember = (twap: number): Member => ({ poolKey: uniqKey(), obsKey: uniqKe
   check: { ok: true, clmmOwned: true, pairsMint: true, crossLinked: true, distinct: true, mintA: new PublicKey("So11111111111111111111111111111111111111112"), mintB: new PublicKey(CHIP), observation: uniqKey(), reasons: [] } });
 const badMember: Member = { poolKey: uniqKey(), obsKey: uniqKey(), loading: false, status: null,
   check: { ok: false, clmmOwned: true, pairsMint: false, crossLinked: true, distinct: true, mintA: new PublicKey("So11111111111111111111111111111111111111112"), mintB: uniqKey(), observation: uniqKey(), reasons: ["pool does not pair the payout mint (one side must equal it)"] } };
+// FIX-4: a member whose fetch came back empty (RPC 429 / not-yet-indexed) — the
+// "couldn't verify — retry" state, kept DISTINCT from the ownership rejection above.
+const failedMember: Member = { poolKey: uniqKey(), obsKey: null, loading: false, status: null, fetchFailed: true,
+  check: { ok: false, clmmOwned: false, pairsMint: false, crossLinked: false, distinct: true, mintA: null, mintB: null, observation: null, reasons: ["couldn't verify this pool — the RPC returned nothing (rate-limited, or the pool isn't indexed yet). This is a network state, not a rejection — retry."] } };
+// FIX-4: a genuinely non-CLMM account (fetched fine, wrong owner) — the ownership
+// rejection. This message only appears on a SUCCESSFUL fetch (never a network miss).
+const ownRejectMember: Member = { poolKey: uniqKey(), obsKey: uniqKey(), loading: false, status: null,
+  check: { ok: false, clmmOwned: false, pairsMint: false, crossLinked: false, distinct: true, mintA: null, mintB: null, observation: null, reasons: ["pool/observation must be owned by the Raydium CLMM program"] } };
 const setPools = (kinds: ("live" | "stale")[]): PriceStatus[] => kinds.map((k, i) => k === "live" ? livePS(972 + i * 0.6, 972 + i * 0.6) : stalePS());
 // a 3-of-5 LIVE set and a 2-of-5 QUORUM-NOT-MET set, as floor DualFloorEntries.
 const mkSetStatus = (name: string, live: number): DualStatus => ({
@@ -306,6 +314,10 @@ const SCENES: Record<string, { path: string; el: React.ReactNode }> = {
   "launch-taken": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 0, token: CHIP_TOKEN, takenBy: DUAL }} />} /></Routes> },
   "launch-pools": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)] }} />} /></Routes> },
   "launch-pools-invalid": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), badMember] }} />} /></Routes> },
+  "launch-pools-unverified": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), failedMember] }} />} /></Routes> },
+  // FIX-4: the three distinct member states in one view — eligible (green),
+  // ownership rejection (red, wrong owner), couldn't-verify/retry (amber, null fetch).
+  "launch-pools-states": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 1, token: CHIP_TOKEN, members: [okMember(972.2), ownRejectMember, failedMember] }} />} /></Routes> },
   "launch-params": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 2, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)], label: "my-vault", params: { ...DEFAULT_PARAMS, mBp: 250 } }} />} /></Routes> },
   "launch-review": { path: "/launch", el: <Routes><Route path="/launch" element={<LaunchWizard initial={{ step: 3, token: CHIP_TOKEN, members: [okMember(972.2), okMember(971.8), okMember(972.6)], label: "my-vault" }} />} /></Routes> },
   indexer: { path: "/", el: (

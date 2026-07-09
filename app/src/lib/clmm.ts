@@ -20,6 +20,14 @@ const OBS = { SPAN: 4483, observationIndex: 17, observations: 51, ITEM_STRIDE: 4
 
 function u128LE(b: Buffer, o: number): bigint { return b.readBigUInt64LE(o) + (b.readBigUInt64LE(o + 8) << 64n); }
 
+export const POOL_STATE_SPAN = POOL_SPAN;
+/** The pool's ObservationState address, read from its PoolState at the pinned H6a
+ *  offset. This is the ONE source for deriving a pool's observation account — the
+ *  launch-wizard validation reuses it rather than re-declaring the offset (FIX-4). */
+export function poolObservationId(poolData: Buffer): PublicKey {
+  return new PublicKey(poolData.subarray(POOL.observationId, POOL.observationId + 32));
+}
+
 export interface PoolView { sqrtPriceX64: bigint; tickCurrent: number; price: number; span: number; }
 /** Q64.64 sqrt price → CHIP-per-SOL (mintA = WSOL, mintB = CHIP, equal decimals). */
 export function decodePool(b: Buffer): PoolView {

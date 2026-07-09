@@ -9,7 +9,7 @@ import { Buffer } from "buffer";
 import { PROGRAM_ID } from "./constants.ts";
 import { ixDisc, u64 } from "./program.ts";
 import { ata, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "./dual.ts";
-import { CLMM_PROGRAM_ID } from "./clmm.ts";
+import { CLMM_PROGRAM_ID, poolObservationId } from "./clmm.ts";
 import type { VaultParams } from "./vaultspec.ts";
 
 const SYS = SystemProgram.programId;
@@ -18,8 +18,10 @@ const meta = (pubkey: PublicKey, isSigner: boolean, isWritable: boolean) => ({ p
 export const MAX_POOLS = 5;
 
 // ---- pinned CLMM PoolState / ObservationState offsets (scripts/layouts.ts, ground-truthed) ----
+// The observation-id derivation is NOT re-declared here — it is the shared reader
+// clmm.poolObservationId (one source of truth; FIX-4).
 export const POOL_SPAN = 1544;
-const POOL_MINT_A = 73, POOL_MINT_B = 105, POOL_OBSERVATION_ID = 201;
+const POOL_MINT_A = 73, POOL_MINT_B = 105;
 export const OBS_SPAN = 4483;
 const OBS_POOL_ID = 19;
 
@@ -73,7 +75,9 @@ export function decodePoolSet(d: Buffer): PoolSet {
 
 export const poolMintA = (d: Buffer) => new PublicKey(d.subarray(POOL_MINT_A, POOL_MINT_A + 32));
 export const poolMintB = (d: Buffer) => new PublicKey(d.subarray(POOL_MINT_B, POOL_MINT_B + 32));
-export const poolObservationId = (d: Buffer) => new PublicKey(d.subarray(POOL_OBSERVATION_ID, POOL_OBSERVATION_ID + 32));
+// poolObservationId (the pool → observation derivation) is the shared reader from
+// clmm.ts — imported above for checkPoolMember; other callers import it from clmm
+// directly, so the offset lives in exactly one place (FIX-4).
 export const obsPoolId = (d: Buffer) => new PublicKey(d.subarray(OBS_POOL_ID, OBS_POOL_ID + 32));
 
 export interface MemberCheck {
